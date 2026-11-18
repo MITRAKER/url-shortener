@@ -8,6 +8,7 @@ Usage:
 import http.client
 import json
 import sys
+import time
 from collections.abc import Sequence
 from http import HTTPStatus
 from typing import Any
@@ -17,6 +18,10 @@ TIMEOUT_SECONDS = 5  # every network call has an upper bound (NASA/JPL rule 2)
 TARGET = "https://example.com/smoke-test"
 # Default create limit is 10/minute, so 20 attempts must hit it (bounded loop).
 MAX_CREATE_ATTEMPTS = 20
+# The click worker counts a click a moment after the redirect (app/worker.py),
+# so the stats are asked again until it shows up: every 0.5 s, 15 s at most.
+CLICK_POLLS = 30
+CLICK_POLL_SECONDS = 0.5
 
 
 class SmokeTestError(Exception):
@@ -58,11 +63,24 @@ def run(base_url: str) -> None:
     # Proves Redis is connected: new links are cached on create.
     expect(headers.get("x-cache") == "HIT", f"X-Cache was {headers.get('x-cache')}")
 
-    status, _, body = request(base_url, "GET", f"/api/links/{code}")
-    expect(status == HTTPStatus.OK, f"GET /api/links/{code} returned {status}")
-    expect(json.loads(body)["clicks"] == 1, f"click was not counted: {body!r}")
+    # Proves the click worker runs: it counted the click from the stream.
+    clicks = counted_clicks(base_url, code, 1)
+    expect(clicks == 1, f"expected 1 click, counted {clicks}")
 
     expect(rate_limit_kicks_in(base_url), "never got 429 Too Many Requests")
+
+
+def counted_clicks(base_url: str, code: str, expected: int) -> int:
+    """The link's click count, once it reaches `expected` or time is up."""
+    clicks = 0
+    for _ in range(CLICK_POLLS):  # bounded (NASA/JPL rule 2)
+        status, _, body = request(base_url, "GET", f"/api/links/{code}")
+        expect(status == HTTPStatus.OK, f"GET /api/links/{code} returned {status}")
+        clicks = int(json.loads(body)["clicks"])
+        if clicks >= expected:
+            break
+        time.sleep(CLICK_POLL_SECONDS)
+    return clicks
 
 
 def rate_limit_kicks_in(base_url: str) -> bool:

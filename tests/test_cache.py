@@ -11,6 +11,7 @@ from app.cache import KEY_PREFIX, CachedLink, LinkCache, Lookup
 from app.db import SessionLocal
 from app.models import Link
 from app.redis_client import RedisGateway, make_redis
+from app.worker import ClickWorker
 from tests.fakes import SilentServer
 
 
@@ -80,10 +81,11 @@ def test_cache_hit_does_not_read_the_database(client: TestClient) -> None:
     assert r.headers["location"] == "https://example.com/"  # the old, cached target
 
 
-def test_clicks_are_counted_on_cache_hits(client: TestClient) -> None:
+def test_clicks_are_counted_on_cache_hits(client: TestClient, click_worker: ClickWorker) -> None:
     code = create(client)
     for _ in range(3):
         assert client.get(f"/{code}").headers["x-cache"] == "HIT"
+    click_worker.process_batch()
     assert client.get(f"/api/links/{code}").json()["clicks"] == 3
 
 

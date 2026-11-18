@@ -27,15 +27,18 @@ safety-critical code.
 | – | Quality foundation: CI/CD, strict typing, coverage, security scanning, NASA/JPL rules | ✅ |
 | 2 | Redis cache + distributed rate limiting | ✅ |
 | 3 | Multiple instances behind Nginx, distributed IDs | ✅ |
-| 4 | Async click analytics (Redis Streams + worker) | ⏳ |
+| 4 | Async click analytics (Redis Streams + worker) | ✅ |
 | 5 | Metrics (Prometheus/Grafana), k6 load tests, benchmarks | ⏳ |
 
 ## Architecture
 
 ```
                               ┌──▶ app instance 0 ──┐
-client ──▶ Nginx (port 8000) ─┼──▶ app instance 1 ──┼──▶ Redis       rate limiting (token bucket) and link cache
-           load balancer      └──▶ app instance 2 ──┴──▶ PostgreSQL  links, click counts, instance number leases
+client ──▶ Nginx (port 8000) ─┼──▶ app instance 1 ──┼──▶ Redis       rate limiting (token bucket), link cache,
+           load balancer      └──▶ app instance 2 ──┤                and clicks waiting to be counted (a stream)
+                                                    └──▶ PostgreSQL  links, click counts, instance number leases
+                                                              ▲
+                              click worker ──reads the stream─┘ adds the clicks up, one transaction per batch
 ```
 
 The instances share nothing but Redis and PostgreSQL, so any of them can
@@ -43,10 +46,15 @@ answer any request. Each one makes its own link IDs (Snowflake IDs: time,
 instance number and a counter), unique without asking anyone first; a keyed
 permutation turns each ID into an 8-character code that can't be guessed.
 
+A redirect doesn't write to PostgreSQL: it appends the click to a Redis
+stream, and the click worker counts the clicks in batches, each exactly once.
+Click counts can lag a moment behind; measured back to back, redirects went
+from 583 to 905 per second (16 clients, one popular link).
+
 ## Run it
 
-With Docker (Nginx, three app instances, PostgreSQL and Redis; the database
-migrations run first, once):
+With Docker (Nginx, three app instances, the click worker, PostgreSQL and
+Redis; the database migrations run first, once):
 
 ```bash
 docker compose up --build
@@ -60,7 +68,10 @@ python -m venv .venv && source .venv/bin/activate
 make install
 make migrate                 # create the tables
 uvicorn app.main:app --reload
+make worker                  # only with REDIS_URL set: counts the clicks waiting in Redis
 ```
+
+Without Redis, each click is counted in the database straight away.
 
 Interactive API docs: http://localhost:8000/docs
 
@@ -70,7 +81,7 @@ Interactive API docs: http://localhost:8000/docs
 |--------|------|-------------|
 | `POST` | `/api/links` | Create a link. Body: `{"url": "...", "alias": "optional", "expires_in_days": 30}` |
 | `GET`, `HEAD` | `/{code}` | Redirect (302) to the original URL. 404 if unknown, 410 if expired. `HEAD` shows where a link goes without counting a click |
-| `GET` | `/api/links/{code}` | Link details and click count |
+| `GET` | `/api/links/{code}` | Link details and click count (counted by the click worker, so it can lag a moment behind) |
 | `GET`, `HEAD` | `/health` | Health check, and which instance answered: `{"status": "ok", "instance": 0}` |
 
 Redirects carry an `X-Cache` header: `HIT` (served from Redis), `MISS` (from
@@ -95,7 +106,7 @@ request bodies up to 16 KB (`413 Content Too Large` above that).
 | `BASE_URL` | `http://localhost:8000` | Used to build `short_url` in responses |
 | `CODE_SECRET` | *(a public default)* | Key that scrambles IDs into codes. At least 16 characters, the same on every instance. Set your own in production: the app logs a warning while the default is in use |
 | `TRUSTED_PROXIES` | *(empty)* | IP addresses or networks of your proxies, comma-separated, e.g. `10.89.0.10`. Only requests from these may name the client's address in `X-Forwarded-For`. Empty: trust nobody |
-| `REDIS_URL` | *(empty)* | e.g. `redis://localhost:6379/0`. Empty: no cache, no rate limiting. Checked at startup: a malformed URL stops the app |
+| `REDIS_URL` | *(empty)* | e.g. `redis://localhost:6379/0`. Empty: no cache, no rate limiting, and clicks counted in the database at once. The click worker needs it. Checked at startup: a malformed URL stops the app |
 | `CACHE_TTL_SECONDS` | `3600` | How long a link stays cached (±10% jitter) |
 | `CACHE_NEGATIVE_TTL_SECONDS` | `60` | How long "this code does not exist" is cached |
 | `RATE_LIMIT_CREATE` | `10/minute` | Link creations per client IP |
@@ -138,6 +149,7 @@ A test fails if the models and the migrations ever disagree.
 | Workflow and Dockerfile linting | actionlint, hadolint | pre-commit, CI |
 | The real Docker stack works end to end | `docker compose` + [`scripts/smoke_test.py`](scripts/smoke_test.py) | CI |
 | Nginx spreads requests over all instances; stopping one loses no requests | [`scripts/check_instances.py`](scripts/check_instances.py) | CI |
+| Clicks wait while the worker is stopped, and survive a Redis restart | [`scripts/check_clicks.py`](scripts/check_clicks.py) | CI |
 | Release: image on GHCR with SBOM and signed provenance, GitHub release | [`release.yml`](.github/workflows/release.yml) | on `vX.Y.Z` tags |
 
 See [the coding standard](docs/CODING_STANDARD.md), [CONTRIBUTING](CONTRIBUTING.md)
@@ -146,11 +158,11 @@ and the [CHANGELOG](CHANGELOG.md).
 ## Project layout
 
 ```
-app/        the service (FastAPI routes, business logic, database, IDs)
+app/        the service (FastAPI routes, business logic, database, IDs) and the click worker
 app/migrations/  database migrations (Alembic)
 nginx/      the load balancer's configuration
 tests/      pytest suite
-scripts/    Power of Ten checker, smoke test, instance check, release notes
+scripts/    Power of Ten checker, smoke test, instance and click checks, release notes
 docs/       coding standard
 .github/    CI/CD workflows, Dependabot, issue and PR templates
 ```

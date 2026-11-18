@@ -19,7 +19,7 @@ from sqlalchemy.exc import OperationalError
 from app.db import MIGRATION_LOCK_ID, Base, engine
 
 ROOT = Path(__file__).resolve().parent.parent
-HEAD = "0002"
+HEAD = "0003"
 POSTGRES = engine.dialect.name == "postgresql"
 needs_postgres = pytest.mark.skipif(not POSTGRES, reason="needs PostgreSQL (set TEST_DATABASE_URL)")
 
@@ -35,6 +35,7 @@ def alembic_config(output: io.StringIO | None = None) -> Config:
 
 def drop_everything() -> None:
     with engine.begin() as connection:
+        connection.execute(text("DROP TABLE IF EXISTS click_checkpoints"))
         connection.execute(text("DROP TABLE IF EXISTS links"))
         connection.execute(text("DROP TABLE IF EXISTS alembic_version"))
         if POSTGRES:
@@ -73,6 +74,7 @@ def test_every_migration_can_be_undone() -> None:
     command.upgrade(config, "head")
     command.downgrade(config, "base")
     assert not table_exists("links")
+    assert not table_exists("click_checkpoints")
     # And forward again. Each run takes the migration lock, so this also
     # shows that the run before let go of it.
     command.upgrade(config, "head")
@@ -162,6 +164,7 @@ def test_sql_can_be_printed_instead_of_run() -> None:
     sql = output.getvalue()
     assert "CREATE TABLE links" in sql
     assert "CREATE UNIQUE INDEX ix_links_code" in sql
+    assert "CREATE TABLE click_checkpoints" in sql
     assert f"version_num='{HEAD}'" in sql
     assert ("DROP SEQUENCE IF EXISTS links_id_seq" in sql) is POSTGRES
     assert not table_exists("links")
@@ -171,4 +174,4 @@ def test_alembic_ini_finds_one_line_of_migrations() -> None:
     """What `alembic upgrade head` reads, run from the repository's root."""
     script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
     assert script.get_heads() == [HEAD]  # one head: no two migrations branch off
-    assert [r.revision for r in script.walk_revisions()] == [HEAD, "0001"]
+    assert [r.revision for r in script.walk_revisions()] == [HEAD, "0002", "0001"]

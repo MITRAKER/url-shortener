@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.cache import CachedLink, LinkCache, Lookup
+from app.clicks import ClickStream
 from app.ids import LinkIds
 from app.models import Link
 from app.schemas import ALIAS_PATTERN
@@ -142,6 +143,13 @@ def resolve(
 
 def is_expired(link: Link | CachedLink) -> bool:
     return link.expires_at is not None and link.expires_at <= datetime.now(UTC)
+
+
+def count_click(session: Session, clicks: ClickStream | None, code: str) -> None:
+    """Count a click on `code`: on the stream, for the click worker to add up
+    later, or, when Redis can't take it, in the database right away."""
+    if clicks is None or not clicks.append(code):
+        record_click(session, code)
 
 
 def record_click(session: Session, code: str) -> None:

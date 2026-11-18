@@ -33,12 +33,19 @@ BREAKER_FAILURE_THRESHOLD = 3
 BREAKER_RESET_SECONDS = 5.0
 
 
-def make_redis(url: str) -> redis.Redis:
+def make_redis(url: str, socket_timeout: float = SOCKET_TIMEOUT_SECONDS) -> redis.Redis:
+    """A client with a pool of connections. `socket_timeout` bounds every wait
+    for an answer: short for requests, longer for the click worker, which
+    asks Redis to wait for new clicks (app/worker.py)."""
     return redis.Redis.from_url(
         url,
         decode_responses=True,  # give us str instead of bytes
+        # RESP2, the protocol whose reply shapes our code reads (app/worker.py
+        # parses XREAD replies). Named here, so that a newer redis-py with
+        # another default can't change them under us.
+        protocol=2,
         socket_connect_timeout=SOCKET_TIMEOUT_SECONDS,
-        socket_timeout=SOCKET_TIMEOUT_SECONDS,
+        socket_timeout=socket_timeout,
         max_connections=MAX_CONNECTIONS,
         # Retry once, at once, but only if the connection itself broke, e.g. a
         # pooled connection that Redis closed while it sat idle. Never retry a

@@ -13,7 +13,7 @@ cd url-shortener
 python -m venv .venv && source .venv/bin/activate
 make install        # dependencies + the git pre-commit hook
 make migrate        # create the tables in the local SQLite database
-make up             # optional: the whole stack in Docker (Nginx, 3 app instances, PostgreSQL, Redis)
+make up             # optional: the whole stack in Docker (Nginx, 3 app instances, the click worker, PostgreSQL, Redis)
 ```
 
 `make help` lists every command.
@@ -73,7 +73,7 @@ the `.txt` file.
 | Lint, format, types, Power of Ten | All pre-commit hooks on every file |
 | Tests (SQLite + fake Redis), Tests (PostgreSQL + Redis) | The test suite on both setups; fails below 95% branch coverage |
 | Dependency vulnerability audit | `pip-audit` against the Python vulnerability database |
-| Docker build and smoke test | Builds the image, starts the stack (migrations, Nginx, 3 instances), runs `scripts/smoke_test.py`, checks that Nginx uses all 3 instances, then stops one and checks that no request fails |
+| Docker build and smoke test | Builds the image, starts the stack (migrations, Nginx, 3 instances, the click worker), runs `scripts/smoke_test.py`, checks that clicks wait while the worker is stopped and survive a Redis restart, checks that Nginx uses all 3 instances, then stops one and checks that no request fails |
 | CodeQL | Security analysis of the Python code and of the workflows |
 
 ## Releasing

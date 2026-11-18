@@ -10,6 +10,8 @@ with **exercises** so you can practise building it yourself.
 - [Lesson 3: Caching and rate limiting](#lesson-3-caching-and-rate-limiting) (step 2)
 - [Lesson 4: Many instances, one service](#lesson-4-many-instances-one-service) (step 3:
   load balancing, distributed IDs, migrations)
+- [Lesson 5: Counting clicks without slowing redirects](#lesson-5-counting-clicks-without-slowing-redirects)
+  (step 4: asynchronous processing, Redis Streams, exactly-once counting)
 
 ---
 
@@ -1577,3 +1579,436 @@ docker compose run --rm migrate alembic upgrade head --sql | less
 **Next:** step 4 takes click counting off the redirect path: each click
 becomes an event on a Redis stream, and a separate worker writes the counts
 to PostgreSQL in batches.
+
+---
+
+## Lesson 5: Counting clicks without slowing redirects
+
+Until step 3, every redirect counted its click with an `UPDATE` in
+PostgreSQL. Step 4 takes that write off the request path: a redirect only
+appends a small **event** ("a click on `abc`") to a **Redis stream**, and a
+separate **worker** process adds the events up and writes the totals to
+PostgreSQL in batches. The hard part is not speed but correctness: every
+click must be counted **exactly once**, even when the worker, Redis or
+PostgreSQL fails halfway through.
+
+### What we built
+
+```
+GET /abc1234 ─▶ Nginx ─▶ app ── XADD clicks:v1 * code abc1234 ──▶ Redis stream
+                 ◀── 302 ──┘    (well under a millisecond)          │
+                                                                    │ XREAD, up to 1000 at a time
+                                                                    ▼
+                                            click worker: abc1234 +3, xyz9876 +1, ...
+                                                                    │
+                                     one transaction per batch:     ▼
+                                       UPDATE click_checkpoints SET last_id = <last entry read>
+                                         WHERE last_id = <where this batch started>
+                                       UPDATE links SET clicks = clicks + 3 WHERE code = 'abc1234'
+                                       UPDATE links SET clicks = clicks + 1 WHERE code = 'xyz9876'
+                                     COMMIT, then XTRIM: forget what is counted
+```
+
+| File | What's new |
+|------|------------|
+| `app/clicks.py` | `ClickStream.append()`: one `XADD`, through the Redis gateway |
+| `app/service.py` | `count_click()`: the stream, or PostgreSQL straight away when Redis can't take the click |
+| `app/worker.py` | The click worker: read a batch, add it up, count it with its checkpoint in one transaction |
+| `app/heartbeat.py` | The worker's health check: was its last round recent? |
+| `app/models.py`, migration `0003` | `click_checkpoints`: how far the worker got |
+| `docker-compose.yml` | The `worker` service; Redis keeps the stream on disk and never evicts it |
+| `scripts/check_clicks.py` | For CI: clicks wait while the worker is stopped, and survive a Redis restart |
+| `tests/test_clicks.py`, `tests/test_worker.py` | 32 tests: the redirect path, batching, every failure in between, two workers at once |
+
+### Part 1: Why take work off the request path?
+
+#### What a click used to cost
+
+In step 3, every redirect ran `UPDATE links SET clicks = clicks + 1` in a
+transaction of its own. Two costs hide in that line:
+
+- **A commit is a disk write.** PostgreSQL makes a commit durable by flushing
+  its write-ahead log (WAL) before it answers. One click, one flush.
+- **A popular link is a hot row.** An `UPDATE` locks the row until the
+  transaction ends, so concurrent clicks on the same link wait in line. The
+  more popular the link, the longer the line. Viral links are exactly the
+  ones that get clicked at the same moment.
+
+The fix follows a general rule: **on the request path, do only what the
+response needs.** The browser needs the target URL, not an updated counter.
+Anything else can happen a moment later, in the background. That is
+**asynchronous processing**, and it's how most systems count views, likes and
+clicks.
+
+#### The price: eventual consistency
+
+The count you read from `GET /api/links/{code}` may now lag a moment behind
+the clicks. Normally the lag is milliseconds (the worker wakes up as soon as
+a click arrives); while the worker is down, it grows until it comes back.
+Nothing is lost, but nothing is instant either. The count is **eventually
+consistent**: stop clicking, and it catches up to the truth.
+
+For analytics, that's fine. For a bank balance it would not be: always ask
+"who reads this, and what happens if they read it a second late?" before
+moving a write off the request path.
+
+#### Measured
+
+Same machine (4 cores, everything in Docker, the benchmark client too), step 3
+and step 4 back to back, rate limits raised for the test, every request a
+redirect to the same link (a cache hit):
+
+| | Step 3 | Step 4 |
+|---|---|---|
+| One client: median (p50) | 4.44 ms | 2.55 ms |
+| One client: p99 | 7.58 ms | 4.04 ms |
+| 16 clients: throughput | 583 redirects/s | 905 redirects/s |
+| 16 clients: p50 / p99 | 22.8 / 87.1 ms | 14.2 / 55.4 ms |
+
+All 10,200 clicks of the run were counted by the time the benchmark asked for
+the count. On a cache hit, a redirect no longer touches PostgreSQL at all;
+what's left is mostly Python handling HTTP on 4 shared cores.
+
+### Part 2: A log of events
+
+#### Queue or log?
+
+Where should the clicks wait? Two families of tools:
+
+- A **queue** (a Redis list with `LPUSH`/`BRPOP`, RabbitMQ, SQS): a message
+  is handed to one consumer and removed. If the consumer crashes after taking
+  it and before finishing, the message is gone, unless the queue has
+  acknowledgements and redelivery.
+- A **log** (Kafka, Redis Streams): entries are appended and *stay*, each
+  with a position. Consumers don't remove what they read; each one remembers
+  how far it got, called its **offset**. Read it again after a crash, replay
+  history, let two different consumers read the same events.
+
+We use a log, **Redis Streams**, because Redis is already there, and because
+"remember how far you got" turns out to be exactly what exactly-once
+counting needs (Part 3).
+
+#### Redis Streams in four commands
+
+```bash
+XADD clicks:v1 * code abc1234        # append; "*" lets Redis choose the ID
+#  → "1795042446927-0": milliseconds since 1970, then a sequence number
+XREAD COUNT 1000 BLOCK 1000 STREAMS clicks:v1 1795042446927-0
+#  → up to 1000 entries *after* that ID, waiting up to 1 s for one to arrive
+XTRIM clicks:v1 MINID 1795042446927-1  # drop the entries before that ID
+XLEN clicks:v1                         # how many are waiting
+```
+
+IDs only grow, so "everything after ID x" is a well-defined question, and an
+ID is all a reader needs to remember. The worker asks for up to 1000 entries
+and waits at most a second; it gets whatever has arrived. So batches adapt to
+the load by themselves: one click a second makes batches of one, with no
+waiting for a batch to fill; ten thousand a second make full batches.
+
+Redis also has **consumer groups** (`XREADGROUP`, `XACK`), which share a
+stream among several workers and remember, in Redis, what each one has
+acknowledged. We don't use them, and the reason is the heart of this lesson:
+our progress must be remembered *in PostgreSQL*, next to the counts.
+
+### Part 3: Exactly once, without a distributed transaction
+
+#### Three delivery guarantees
+
+A worker does two things for each batch: it **writes the counts**, and it
+**records its progress**. They live in two different systems, Redis and
+PostgreSQL, and a crash can strike between any two steps. The order decides
+what a crash costs:
+
+| Order | A crash in between... | Guarantee |
+|-------|-----------------------|-----------|
+| Record progress, then write | ...loses the batch | **at most once** |
+| Write, then record progress | ...counts the batch again on restart | **at least once** |
+| Both in one transaction | ...can't happen: both or neither | **exactly once** (in effect) |
+
+Exactly-once *delivery* across a network is impossible in general (a lost
+reply leaves the sender guessing). Exactly-once *effect* is not: deliver at
+least once, and make the effect happen only once. Two ways to get there:
+make the write **idempotent** (doing it twice equals doing it once), or
+**store the progress with the result, in one transaction**. `clicks = clicks
++ 3` is not idempotent, so we take the second way.
+
+#### The checkpoint
+
+`click_checkpoints` has one row: the stream's name, and the ID of the last
+entry already counted. The worker moves it in the same transaction that
+adds the counts:
+
+```python
+moved = session.connection().execute(
+    update(ClickCheckpoint)
+    .where(ClickCheckpoint.stream == STREAM, ClickCheckpoint.last_id == batch.after)
+    .values(last_id=batch.last_id)
+)
+if moved.rowcount != 1:
+    session.rollback()  # someone else counted these: throw the batch away
+    return False
+session.connection().execute(ADD_CLICKS, [...])  # clicks = clicks + n, per link
+session.commit()  # the counts and the checkpoint, together
+```
+
+Now walk through the crashes:
+
+- **Before the commit** (the worker dies, PostgreSQL refuses): the transaction
+  rolls back, the checkpoint hasn't moved, and the next round reads the same
+  entries again. Nothing counted, nothing lost.
+- **After the commit, before `XTRIM`**: the entries are still in the stream,
+  but behind the checkpoint, so they are never read again. The next batch
+  trims them along with its own.
+- **During the commit, reply lost** (did it commit?): the worker doesn't need
+  to know. It reads the checkpoint from the database, which knows.
+
+Kafka consumers do the same when they store their offsets in the database
+that receives their results; Kafka's own "exactly-once" transactions are this
+idea, built into the broker.
+
+#### Compare-and-set: a second worker can't double count
+
+`WHERE last_id = :after` makes the update a **compare-and-set**: "move the
+checkpoint from where I started to where I ended, *if it's still where I
+started*." If a second worker counted the same entries first, the checkpoint
+has moved, the update changes no row, and this worker rolls back. One worker
+is plenty (it counted 100,000 clicks in 2.3 seconds, start-up included), but
+two can't break anything: the second only wastes work.
+
+This is **optimistic concurrency control**, the same idea as a version column
+that an `UPDATE ... WHERE version = 7` checks, and a cousin of lesson 4's
+fencing tokens. PostgreSQL makes it safe: the second worker's `UPDATE` waits
+for the first one's row lock, then checks its `WHERE` again on the committed
+row.
+
+The `UPDATE`s on `links` always run in the same order, sorted by code. A
+transaction that locks several rows in an arbitrary order can deadlock with
+another one locking them in another order; one global order prevents that.
+(Here the checkpoint's row lock, taken first, already makes workers take
+turns, but the habit costs nothing.)
+
+#### Adding up: the hot row disappears
+
+A batch of 1000 clicks on one viral link becomes **one** `UPDATE ... + 1000`
+and **one** commit, instead of 1000 of each. That's **write coalescing**:
+batching turns a thousand row locks and WAL flushes into one. All the
+`UPDATE`s of a batch go to PostgreSQL in one go (an *executemany*, which
+psycopg 3 sends as a pipeline, without waiting for each answer).
+
+#### Junk in the stream: poison messages
+
+Anyone who can write to Redis can write to the stream. An entry that is not a
+click on a valid code (a missing field, a code with spaces) is **skipped and
+logged**, but the checkpoint still moves past it. The alternative, stopping
+at it, would make it a **poison message**: the worker would read it, fail,
+read it again, forever, and no click behind it would ever be counted.
+
+#### The stream holds only what is left to count
+
+After each batch, `XTRIM ... MINID <the ID right after the last one counted>`
+removes the counted entries. So the stream's length is exactly the
+**backlog**, and memory stays bounded by how far behind the worker is, not by
+how many clicks there ever were.
+
+#### Fail loudly, not quietly
+
+`parse_entries()` raises an error when Redis's reply has an unexpected shape,
+instead of treating it as "no clicks". We found out why while building it:
+redis-py speaks two protocols, and under the newer one, RESP3, `XREAD`
+returns a dict instead of a list. A parser that silently returned "no clicks"
+for that would make a worker that runs, passes its health check, and never
+counts anything again. So `make_redis()` now asks for RESP2 by name, and an
+unexpected shape shows up in the log every second. **A silent failure is the
+worst kind**: it is found by a customer, weeks later.
+
+### Part 4: When things fail
+
+#### Redis down or full: fall back, don't drop
+
+`count_click()` appends to the stream; if Redis can't take the click (not
+configured, down, circuit breaker open, or out of memory), the click is
+counted the old way, with an `UPDATE`. The system degrades to step 3's
+speed instead of losing clicks or failing redirects.
+
+Redis has a fixed memory budget (64 MB), so the stream is a **bounded
+buffer**. That matters: a buffer without a bound turns a slow consumer into
+an out-of-memory crash. When it fills up, something must give, and the
+choices are the classic three:
+
+- **Drop** the oldest (`XADD ... MAXLEN 1000000`): quiet data loss. No.
+- **Block** the producer until there is room: a redirect waiting on the
+  worker. No.
+- **Push back**: refuse the write and let the producer take another path.
+  That's our fallback, and it's called **backpressure**.
+
+Measured: 100,000 waiting clicks take 2.53 MB, about 25 bytes each, so 64 MB
+holds up to some 2.5 million of them (cache entries are evicted first to
+make room, see below).
+
+#### The eviction policy that would have lost clicks
+
+Step 2's Redis was a pure cache: `maxmemory-policy allkeys-lfu`, "when full,
+evict the least frequently used keys, any of them". With the stream in the
+same Redis, that policy could evict the stream itself, and every click
+waiting in it would vanish without an error. Step 4 switches to
+`volatile-lfu`: evict only keys that have an expiry time anyway (cache
+entries, rate limit buckets). The stream never expires, so it is never
+evicted; when nothing else is left to evict, Redis refuses the `XADD` with an
+out-of-memory error, and the fallback above takes over.
+
+#### Redis restarts: persistence
+
+A cache can start empty; a buffer of uncounted clicks can't. So Redis now
+writes every change to an **append-only file** (AOF), on a Docker volume:
+
+- `appendfsync everysec`: Redis hands each write to the operating system at
+  once, and the OS flushes to disk every second. If the Redis *process*
+  crashes, nothing is lost: the writes are already in the kernel. If the
+  whole *machine* crashes, up to about a second of clicks is.
+- `appendfsync always` flushes on every write: no loss, but far slower.
+  `no` leaves flushing to the OS (often 30 seconds).
+
+CI proves the restart part on every pull request: it stops the worker, clicks
+5 times, restarts Redis, starts the worker, and waits for all 5 clicks to be
+counted (`scripts/check_clicks.py`). It also checks that the 5 clicks were
+*not* counted before the restart: had they gone straight to PostgreSQL
+through the fallback, the test would prove nothing.
+
+#### Ambiguous failures
+
+A timeout on `XADD` doesn't say whether the click landed. We count it in
+PostgreSQL to be safe, so if it did land, the worker counts it a second time.
+That's a choice, not an accident: when you can't know, decide which way to
+be wrong. For click counts, a rare double count beats a lost click. (The
+**two generals problem** says no protocol removes this doubt over an
+unreliable network; idempotency keys only move it somewhere you can deal
+with it.)
+
+#### The worker: crash-only, and alive is not the same as working
+
+- **It crashes**: Docker starts it again (`restart: unless-stopped`), and it
+  carries on from the checkpoint. It has no shutdown procedure that must run
+  for the data to be right, which is lesson 4's **crash-only design** again.
+- **It's stopped** (`docker stop` sends SIGTERM): it finishes the round it is
+  in and exits. Uncounted clicks wait in the stream.
+- **PostgreSQL or Redis is down**: it logs the error and tries again every
+  second. Restarting it wouldn't help, so its health check must not fail.
+
+That's why the health check asks "is the worker going round its loop?" and
+not "is it making progress?". The worker touches a **heartbeat** file on
+every round; `python -m app.heartbeat` checks that the last touch is less
+than 30 seconds old. Every wait inside a round has a limit (2 seconds for
+Redis; for PostgreSQL, 10 to get a connection and 5 per statement), so in
+practice only a stuck loop misses it. **Progress** is
+a different signal: the backlog (`XLEN`) and the age of its oldest entry (its
+ID is a timestamp). That's a metric to graph and alert on, which is step 5.
+
+The health check imports nothing but the standard library, on purpose: our
+first version ran `python -m app.worker --alive`, which imports SQLAlchemy,
+Pydantic and redis-py, and took 1.0 second of CPU every 10 seconds. The
+heartbeat module takes 0.15 s.
+
+### Going further
+
+- **Partitions.** One stream and one worker counted 100,000 clicks in 2.3 s.
+  Past that, split the stream (`clicks:v1:0` ... `clicks:v1:7`, by a hash of
+  the code), with one checkpoint row and one worker per partition; the
+  table's primary key (`stream`) already allows it. That is how Kafka
+  scales: partitions, each read by one consumer of a group.
+- **The outbox pattern**, the same problem the other way round: to publish an
+  event *because* a database row changed, write the event into an `outbox`
+  table in the same transaction, and let a relay copy it to the stream. Never
+  "commit, then publish": a crash in between loses the event.
+- **Kafka or Redis Streams?** Kafka for retention measured in days, replay by
+  many teams, and volumes beyond one machine; Redis Streams when Redis is
+  already there and the stream is a short buffer.
+
+### Testing it
+
+- **Failure injection.** To fail the transaction halfway, a test swaps the
+  `UPDATE` for one on a table that doesn't exist: the checkpoint must not
+  move, and the same clicks must be counted once when the database is "back".
+  To crash after the commit, `xtrim` raises: the clicks stay in the stream but
+  are never counted again.
+- **A race, made deterministic.** Worker B reads a batch, worker A counts the
+  same entries, then B tries to count its batch: the compare-and-set refuses.
+  No threads, no timing, the same result every run.
+- **A race, made likely.** Two threads drain 300 clicks with a batch size of
+  7, so they collide again and again: every link must end up at exactly 100.
+- **The checkpoint's birth.** Two workers starting together both find no
+  checkpoint and both insert one. A SQLAlchemy `before_flush` event inserts
+  the row from "another worker" just before ours: one row, no error.
+- **Shapes and junk.** Replies of other shapes (RESP3's dict, a broken entry)
+  raise; entries that aren't clicks are skipped without blocking the clicks
+  behind them.
+- **The real stack, in CI.** The smoke test waits for its click to be counted;
+  `scripts/check_clicks.py` checks clicks across a Redis restart.
+
+### Try it yourself
+
+```bash
+docker compose up --build
+code=$(curl -s -X POST localhost:8000/api/links -H 'content-type: application/json' \
+       -d '{"url":"https://example.com"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])')
+curl -s -o /dev/null localhost:8000/$code
+curl -s localhost:8000/api/links/$code                   # "clicks": 1
+docker compose exec redis redis-cli XLEN clicks:v1        # 0: counted, and forgotten
+
+# Stop the worker: the clicks wait in the stream.
+docker compose stop worker
+for i in 1 2 3; do curl -s -o /dev/null localhost:8000/$code; done
+docker compose exec redis redis-cli XRANGE clicks:v1 - +  # three entries
+curl -s localhost:8000/api/links/$code                   # still 1
+docker compose restart redis                             # they survive this too
+docker compose start worker
+curl -s localhost:8000/api/links/$code                   # 4, a moment later
+
+docker compose exec db psql -U app -d shortener -c "SELECT * FROM click_checkpoints"
+docker compose exec redis redis-cli CONFIG GET maxmemory-policy   # volatile-lfu
+```
+
+### Exercises
+
+1. **Watch the lag.** Write a script that prints, every second, how many
+   clicks are waiting and how old the oldest one is (hint: its ID). Stop and
+   start the worker while clicking. What would you alert on, and after how
+   long?
+2. **Batch size.** Measure the time to drain 100,000 clicks with batch sizes
+   of 10, 100, 1,000 and 10,000. Explain the curve: what does each transaction
+   cost, and what does each row cost?
+3. **Back off.** During an outage the worker logs a failure every second:
+   3,600 lines an hour. Add capped exponential backoff with jitter, and log
+   only when the state changes ("database unreachable", "back"). Test it with
+   a fake clock.
+4. **Partitions.** Split the stream into 4 by a hash of the code, with a
+   checkpoint row and a worker each. Counting would be correct with any split
+   (sums don't care about order), so why split by code at all? (Think about
+   two workers updating the same row.)
+5. **Consumer groups.** Rewrite the worker with `XREADGROUP` and `XACK`.
+   Where does a crash between `COMMIT` and `XACK` leave you, and what would
+   you need to add to keep exactly-once?
+6. **Unique visitors.** Count distinct visitors per link with HyperLogLog
+   (`PFADD`, `PFCOUNT`: at most 12 KB per link, about 0.81% error). What
+   identifies a visitor, and what does privacy law say about storing it?
+7. **Durability, measured.** Under load, kill Redis with
+   `docker compose kill -s SIGKILL redis`, with `appendfsync everysec` and
+   then `always`. Count the clicks lost each time, and the throughput. Can you
+   lose clicks without crashing the whole machine?
+
+### Interview questions this lesson prepares you for
+
+- "Design a view counter for a site with 100,000 views a second."
+- "What's the difference between a message queue and a log? Kafka or RabbitMQ?"
+- "At-most-once, at-least-once, exactly-once: how do you get exactly-once?"
+- "Your consumer crashed after writing its results but before committing its offset. What happens?"
+- "How do you stop two consumers from processing the same message twice?"
+- "What is a hot row (or hot key), and how do you deal with one?"
+- "What happens when the producer is faster than the consumer? What's backpressure?"
+- "Redis persistence: RDB or AOF? What does `appendfsync everysec` risk?"
+- "Which Redis eviction policy would you choose, and what can go wrong with `allkeys-lru`?"
+- "How do you health-check a background worker? Liveness, readiness and progress."
+- "What is eventual consistency? When is it not acceptable?"
+- "What is the outbox pattern, and what problem does it solve?"
+
+**Next:** step 5 measures it all: metrics (Prometheus and Grafana, including
+the click backlog), a k6 load test, and benchmarks across every step.

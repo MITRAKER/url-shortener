@@ -20,6 +20,7 @@ from app.main import app
 from app.models import Link
 from app.schemas import MAX_URL_LENGTH
 from app.service import MAX_ATTEMPTS
+from app.worker import ClickWorker
 from tests.conftest import TEST_CODE_SECRET
 
 
@@ -43,19 +44,25 @@ def test_create_and_redirect(client: TestClient) -> None:
     assert r.headers["location"] == "https://example.com/page"
 
 
-def test_clicks_are_counted(client: TestClient) -> None:
+def test_clicks_are_counted(client: TestClient, click_worker: ClickWorker) -> None:
     code = client.post("/api/links", json={"url": "https://example.com"}).json()["code"]
     for _ in range(3):
         client.get(f"/{code}")
+    # The click worker counts them a moment later (app/worker.py).
+    assert client.get(f"/api/links/{code}").json()["clicks"] == 0
+    assert click_worker.process_batch() == 3
     assert client.get(f"/api/links/{code}").json()["clicks"] == 3
 
 
-def test_head_shows_the_target_without_counting_a_click(client: TestClient) -> None:
+def test_head_shows_the_target_without_counting_a_click(
+    client: TestClient, click_worker: ClickWorker
+) -> None:
     code = client.post("/api/links", json={"url": "https://example.com/x"}).json()["code"]
     r = client.head(f"/{code}")
     assert r.status_code == 302
     assert r.headers["location"] == "https://example.com/x"
     assert r.content == b""
+    assert click_worker.process_batch() == 0  # nothing to count
     assert client.get(f"/api/links/{code}").json()["clicks"] == 0
     assert client.head("/doesnotexist").status_code == 404
 

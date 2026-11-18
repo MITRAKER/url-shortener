@@ -7,6 +7,41 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-18
+
+### Added
+
+- Clicks are counted off the redirect path. A redirect appends the click to
+  a Redis stream (`clicks:v1`) instead of updating PostgreSQL, and a new
+  click worker (`python -m app.worker`, the `worker` service in Docker
+  Compose, `make worker`) adds the clicks up per link and writes them in
+  batches of up to 1000.
+- Each click is counted exactly once. The worker stores how far it got (a
+  checkpoint, in the new `click_checkpoints` table, migration `0003`) in the
+  same transaction as the counts, and moves it with a compare-and-set, so a
+  crash at any moment, or a second worker, can't count a click twice or
+  lose one. Counted clicks are then removed from the stream.
+- When Redis can't take a click (not configured, down, or full), it is
+  counted in PostgreSQL at once, as before.
+- A health check for the worker: it touches a heartbeat file on every round,
+  and `python -m app.heartbeat` checks that the last one is recent.
+- CI checks that clicks wait while the worker is stopped, and survive a
+  Redis restart (`scripts/check_clicks.py`). The smoke test waits for the
+  worker to count its click.
+- Lesson 5 in LEARNING.md: asynchronous processing, streams, and exactly-once
+  counting.
+
+### Changed
+
+- Redis keeps the click stream on disk (append-only file, written every
+  second, on a `redisdata` volume), and when memory is full evicts only keys
+  that expire anyway (`volatile-lfu` instead of `allkeys-lfu`), never the
+  stream.
+- Click counts in `GET /api/links/{code}` can lag a moment behind, while the
+  worker catches up.
+- The app asks redis-py for the RESP2 protocol by name, so a new default in
+  a later redis-py can't change the shape of the replies it reads.
+
 ## [0.3.0] - 2026-11-18
 
 ### Added
@@ -132,7 +167,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - GitHub Actions CI running the tests on SQLite and PostgreSQL.
 - Lesson 1 in LEARNING.md.
 
-[Unreleased]: https://github.com/MITRAKER/url-shortener/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/MITRAKER/url-shortener/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/MITRAKER/url-shortener/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/MITRAKER/url-shortener/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MITRAKER/url-shortener/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MITRAKER/url-shortener/releases/tag/v0.1.0

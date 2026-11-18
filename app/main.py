@@ -16,6 +16,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app import __version__, instances, service
 from app.cache import LinkCache
+from app.clicks import ClickStream
 from app.config import DEFAULT_CODE_SECRET, settings
 from app.db import engine, get_session
 from app.ids import CodeCipher, LinkIds, RetiredError, Snowflake
@@ -74,6 +75,10 @@ def get_cache(gateway: Annotated[RedisGateway | None, Depends(get_redis)]) -> Li
     return LinkCache(gateway, settings.cache_ttl_seconds, settings.cache_negative_ttl_seconds)
 
 
+def get_clicks(gateway: Annotated[RedisGateway | None, Depends(get_redis)]) -> ClickStream | None:
+    return None if gateway is None else ClickStream(gateway)
+
+
 def get_ids(request: Request) -> LinkIds:
     ids: LinkIds = request.app.state.ids  # made in lifespan(), at startup
     return ids
@@ -82,6 +87,7 @@ def get_ids(request: Request) -> LinkIds:
 # "Annotated" dependencies: declared once, reused by every route that needs them.
 SessionDep = Annotated[Session, Depends(get_session)]
 CacheDep = Annotated[LinkCache | None, Depends(get_cache)]
+ClicksDep = Annotated[ClickStream | None, Depends(get_clicks)]
 IdsDep = Annotated[LinkIds, Depends(get_ids)]
 
 # Creating links is the expensive, abusable operation, so it gets a strict
@@ -128,7 +134,8 @@ def create(body: LinkCreate, session: SessionDep, cache: CacheDep, ids: IdsDep) 
 
 @app.get("/api/links/{code}", dependencies=[limit_read])
 def stats(code: str, session: SessionDep) -> LinkOut:
-    # Not cached on purpose: the click count changes on every redirect.
+    # Not cached on purpose: the click count keeps changing. It may lag a
+    # second or two behind the clicks, while the click worker catches up.
     link = service.get_link(session, code)
     if link is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Link not found")
@@ -137,7 +144,9 @@ def stats(code: str, session: SessionDep) -> LinkOut:
 
 @app.head("/{code}", dependencies=[limit_read], include_in_schema=False)
 @app.get("/{code}", dependencies=[limit_read])
-def redirect(code: str, request: Request, session: SessionDep, cache: CacheDep) -> RedirectResponse:
+def redirect(
+    code: str, request: Request, session: SessionDep, cache: CacheDep, clicks: ClicksDep
+) -> RedirectResponse:
     # Reject impossible codes before touching Redis or Postgres, so junk
     # requests can't fill the cache with "not found" entries.
     if not service.CODE_PATTERN.fullmatch(code):
@@ -151,10 +160,10 @@ def redirect(code: str, request: Request, session: SessionDep, cache: CacheDep) 
         raise HTTPException(status.HTTP_410_GONE, "Link has expired", headers=headers)
     # HEAD asks "where does this go?" without going there: a link checker or a
     # chat app's preview, not a person clicking. Only GET counts as a click.
-    # (Still a database write on every click, even on a cache hit; step 4
-    # moves click counting off this path.)
+    # The click goes to a Redis stream: on a cache hit, a redirect doesn't
+    # touch PostgreSQL at all (app/clicks.py).
     if request.method == "GET":
-        service.record_click(session, code)
+        service.count_click(session, clicks, code)
     # 302 (temporary) instead of 301 (permanent): browsers cache 301s forever,
     # so later clicks would never reach us and could not be counted.
     return RedirectResponse(link.target_url, status_code=status.HTTP_302_FOUND, headers=headers)
