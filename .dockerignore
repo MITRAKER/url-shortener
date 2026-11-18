@@ -1,6 +1,7 @@
 .git
-__pycache__
-*.db
+**/__pycache__
+**/*.pyc
+**/*.db
 tests
 .venv
 venv

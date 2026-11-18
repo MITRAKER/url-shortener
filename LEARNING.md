@@ -5,6 +5,8 @@ was built, **why** it was designed that way, the **key concepts**, and ends
 with **exercises** so you can practise building it yourself.
 
 - [Lesson 1: The core service](#lesson-1-the-core-service)
+- [Lesson 2: Engineering like a professional team](#lesson-2-engineering-like-a-professional-team)
+  (CI/CD, code quality, security scanning, NASA/JPL's Power of Ten)
 
 ---
 
@@ -66,8 +68,8 @@ There are three classic strategies:
 The important detail is **how** we check for collisions. A naive version is:
 
 ```python
-if not exists(code):   # request A and B both see "free"...
-    insert(code)       # ...and both insert → duplicate!
+if not exists(code):  # request A and B both see "free"...
+    insert(code)  # ...and both insert → duplicate!
 ```
 
 This is a **race condition** (check-then-act). Instead we rely on the
@@ -83,8 +85,8 @@ taken is `n / 62^7`. Even with 10 million links that is `0.0003%`.
 Counting clicks the naive way:
 
 ```python
-link.clicks = link.clicks + 1   # read 5 ... another request also reads 5
-session.commit()                # both write 6 → one click lost
+link.clicks = link.clicks + 1  # read 5 ... another request also reads 5
+session.commit()  # both write 6 → one click lost
 ```
 
 We instead send `UPDATE links SET clicks = clicks + 1 WHERE code = ...`. The
@@ -182,5 +184,405 @@ from the code.
 - "301 or 302?"
 - "Why does an index make lookups fast?"
 
-**Next:** Lesson 2 adds a Redis cache in front of the database and rate
-limiting that works across servers.
+**Next:** Lesson 2 puts professional quality gates around this code before
+we add more features.
+
+---
+
+## Lesson 2: Engineering like a professional team
+
+### What we built
+
+A **quality foundation**: checks that run automatically at three moments,
+so mistakes are caught by machines instead of by users.
+
+```
+ you type `git commit`          you open a pull request           you push a tag v1.2.3
+          │                                │                                │
+          ▼                                ▼                                ▼
+  pre-commit hooks (seconds)      CI on GitHub (minutes)            CD: release workflow
+  - Ruff lint + format            - the same hooks, all files        - full CI again
+  - mypy --strict                 - tests on SQLite + PostgreSQL     - Docker image → ghcr.io
+  - Power of Ten checker          - coverage gate (95%)                + SBOM + signed provenance
+  - actionlint, hadolint          - pip-audit (vulnerabilities)      - GitHub release with notes
+  - whitespace, YAML, secrets     - Docker build + smoke test          from CHANGELOG.md
+                                  - CodeQL security analysis
+```
+
+The idea is called **shifting left**: the earlier a bug is caught, the cheaper
+it is. A typo caught by a pre-commit hook costs a second; the same typo found
+in production costs an incident.
+
+New files, and why each exists:
+
+| File | Purpose |
+|------|---------|
+| `pyproject.toml` | Project metadata and the configuration of every tool, in one place |
+| `.pre-commit-config.yaml` | The hooks that run on every commit |
+| `.github/workflows/ci.yml` | Continuous integration: every PR, every push to `main`, daily |
+| `.github/workflows/codeql.yml` | Security analysis |
+| `.github/workflows/release.yml` | Continuous delivery on version tags |
+| `.github/dependabot.yml` | Automatic dependency update PRs |
+| `scripts/check_power_of_ten.py` | Our own static analyzer for the NASA/JPL rules |
+| `scripts/smoke_test.py` | End-to-end test of the real Docker containers |
+| `scripts/release_notes.py` | Pulls a version's notes out of the changelog |
+| `docs/CODING_STANDARD.md` | The rules we follow, and which tool enforces each |
+| `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md` | How to contribute, report vulnerabilities, behave |
+| `.github/ISSUE_TEMPLATE/`, `pull_request_template.md`, `CODEOWNERS` | Structured issues and PRs, automatic reviewers |
+| `CHANGELOG.md` | Human-readable history of every release |
+| `Makefile`, `.editorconfig` | Short commands; consistent editor settings |
+
+### The tools, one by one
+
+#### Ruff: linter and formatter
+
+A **linter** reads code without running it and flags likely bugs and bad
+patterns. A **formatter** rewrites code into one consistent style, so nobody
+argues about spaces in code review. Ruff does both. It replaces older tools
+such as flake8, isort and black, re-implements most of Bandit's security
+checks, and is written in Rust, so it checks the whole project in milliseconds.
+
+We switched on a broad set of rule families (listed with comments in
+`pyproject.toml`). Things they made us fix in the step 1 code:
+
+- `B904`: inside `except`, write `raise HTTPException(...) from exc`, so the
+  original error stays attached to the new one for debugging.
+- `N818`: exception names end in `Error` (`AliasTakenError`).
+- `B008`: FastAPI's `session = Depends(get_session)` default argument became
+  the modern `SessionDep = Annotated[Session, Depends(get_session)]`.
+- `UP017`: use `datetime.UTC`, the modern spelling.
+- `S` rules (from Bandit) look for security problems: `eval`, hard-coded
+  passwords, `subprocess` with `shell=True`, insecure randomness, and more.
+
+#### mypy --strict: static type checking
+
+Type hints (`def get_link(...) -> Link | None`) are checked before the code
+ever runs. `--strict` is the most demanding mode: every function must be typed,
+and nothing may silently become `Any`.
+
+The most valuable thing it catches is the forgotten `None`. Our old step 1
+code did this:
+
+```python
+return to_out(service.get_link(session, link.code))
+#             ^ get_link returns Link | None, but to_out needs a Link
+```
+
+mypy rejects it: *Argument 1 to "to_out" has incompatible type "Link | None"*.
+That is exactly NASA/JPL rule 7 ("check every return value"), enforced by a
+machine.
+
+#### pytest, coverage and "warnings are errors"
+
+- **Coverage** measures which code the tests executed. We use **branch
+  coverage**: for `if x:` it checks that the tests took *both* the true and the
+  false path, not just that the line ran. CI fails below 95%. We're at about 99%.
+- 100% coverage does not mean bug-free: it shows what was *run*, not what was
+  *checked*. It is a floor, not a goal.
+- `filterwarnings = ["error"]` turns every warning during the tests into a
+  failure. It caught a real one right away: Starlette's test client warned
+  that using `httpx` is deprecated, so we moved to `httpx2`.
+
+#### pre-commit: the same checks, before every commit
+
+`pre-commit install` registers a git hook. From then on, `git commit` first
+runs the hooks on the files you changed, and refuses the commit if one fails
+(many, like the formatter, fix the problem for you; just `git add` again).
+CI runs `pre-commit run --all-files` with the very same tool versions (they
+are locked in `requirements-dev.txt`), so **your laptop and CI run the same
+checks**. "The same" takes care: actionlint also checks the shell scripts
+inside workflows, but only if it can find a program called `shellcheck`.
+GitHub's runners have one; a laptop usually doesn't, and actionlint then
+skips that check without a word. So `shellcheck-py` is pinned too.
+
+Extra hooks: `actionlint` checks the GitHub workflow files, `hadolint` checks
+the Dockerfile, `detect-private-key` stops you committing a secret key.
+
+#### Supply-chain security: pip-audit, Dependabot, pinned actions
+
+Most code we run, we didn't write: it comes from dependencies. A **supply-chain
+attack** hides malicious code in one of them.
+
+- **Lock files with hashes.** `requirements.in` lists the 6 packages the app
+  imports. Those need about 18 more (Starlette, anyio, h11, ...). Pinning only
+  the 6, as this repo first did, still lets pip pick the newest version of the
+  other 18 at install time, so CI, the Docker build and your laptop could each
+  get different code. `pip-compile` (from pip-tools) resolves the whole tree
+  once and writes `requirements.txt`: every package at an exact version, plus
+  the SHA-256 hash of every file pip may download for it. `pip install
+  --require-hashes` refuses any file whose hash differs, so a package that was
+  tampered with, or quietly re-uploaded, cannot get in. You edit the `.in`
+  files and run `make lock`; Dependabot does the same for updates.
+- **The base image pinned by digest:** `FROM python:3.13-slim@sha256:e48f…`.
+  `3.13-slim` is a moving name: Docker rebuilds it for every Python patch and
+  every Debian security fix. The digest is the hash of one exact image, so the
+  same Dockerfile always starts from the same bytes. Dependabot proposes the
+  new digest when the tag moves.
+- **pip-audit** checks those versions against a database of known
+  vulnerabilities (CVEs). It runs on every PR *and daily*, because new
+  vulnerabilities are published about code that didn't change.
+- **Dependabot** opens PRs to update dependencies; CI then tells us whether the
+  update is safe to merge.
+- **Actions pinned to commit SHAs**: `actions/checkout@3d3c42e…  # v7.0.1`
+  instead of `@v7`. A tag can be moved to point to different code; a commit SHA
+  cannot. In March 2025 attackers did exactly that to the popular
+  `tj-actions/changed-files` action: they moved its tags to a malicious commit,
+  and repositories that referenced it by tag ran the attacker's code, which
+  printed their secrets into the build logs. Dependabot updates the SHAs for us.
+- **Least privilege**: `permissions: contents: read` means a compromised step
+  can't push code; only the release job may write, and only what it needs.
+
+#### CodeQL: following data through the program
+
+CodeQL turns the code into a database and asks questions like "can text from
+an HTTP request reach a database query, a shell command or a file path without
+being checked?" (called **taint tracking**). Linters look at one line at a
+time; CodeQL follows data across functions and files. Ours also scans the
+workflows themselves for mistakes such as untrusted input inside a `run:`
+script. Findings appear in the repository's **Security** tab.
+
+#### The Docker smoke test
+
+Unit tests check the code. The smoke test checks the thing we actually ship:
+CI builds the image, starts the real stack with
+`docker compose up --wait` (which waits for every container's health check),
+and `scripts/smoke_test.py` creates a link, follows the redirect and checks the
+click count over real HTTP. A broken Dockerfile, a missing dependency in
+`requirements.txt` or a container that can't reach the database all pass the
+unit tests, and all fail here.
+
+The Dockerfile itself got hardened: the app runs as a **non-root user**, has a
+`HEALTHCHECK`, and the code is owned by root, so even a compromised app can't
+modify it.
+
+Health checks must test what the next service really needs. The database's
+check is `pg_isready -h 127.0.0.1`, over TCP, the way the app connects. On its
+very first start, the Postgres image runs a temporary server that listens only
+on a Unix socket while it creates the database, then restarts. A socket check
+(`pg_isready` without `-h`) can call that temporary server healthy, Compose
+starts the app, and the app's first connection is refused. Rare, but exactly
+the kind of failure that makes CI fail one run in fifty.
+
+#### CD: versions, changelog, releases
+
+- **Semantic Versioning**, `MAJOR.MINOR.PATCH`: bump PATCH for bug fixes,
+  MINOR for new features that don't break anyone, MAJOR for breaking changes.
+  Before 1.0.0, anything may change.
+- **Keep a Changelog** (`CHANGELOG.md`): an *Unreleased* section collects
+  changes, grouped as Added / Changed / Fixed / Security; a release renames
+  it to the version number.
+- **Conventional Commits**: `feat: ...`, `fix: ...`, `docs: ...`. Readable
+  history, and tools can generate changelogs and version bumps from it.
+- **The release workflow**: pushing tag `v0.2.0` runs the full CI again, checks
+  that the tag equals `app.__version__` (a test checks the changelog has notes
+  for that version), pushes the Docker image to `ghcr.io`, and creates the
+  GitHub release. The image comes with an **SBOM** (a list of every package
+  inside it) and a **signed provenance attestation**: anyone can verify that
+  this exact image was built by this workflow from this commit.
+
+### NASA/JPL's "Power of Ten"
+
+In 2006, Gerard Holzmann of NASA's Jet Propulsion Laboratory published ten
+rules for safety-critical code (*IEEE Computer*, "The Power of Ten: Rules for
+Developing Safety-Critical Code"). JPL's coding standard for C builds on them,
+and it was used for the flight software of the Curiosity Mars rover. The goal
+is not style: it's code **so simple that tools can prove things about it**, for
+example that a loop ends or that the stack can't overflow. When your software
+is on Mars, hundreds of millions of kilometres away, nobody can walk over and
+restart it.
+
+The rules were written for C. Here is what each one means and how we adapted
+it to Python. The full table, including which tool enforces each rule, is in
+[docs/CODING_STANDARD.md](docs/CODING_STANDARD.md).
+
+**Rule 1: simple control flow, no recursion.** Recursion makes stack depth
+depend on the input, so you can't bound memory use. (Python stops at about
+1000 nested calls with `RecursionError`.) Any recursion can be rewritten as a
+loop with an explicit, bounded work list. We also cap cyclomatic complexity
+(the number of independent paths through a function) at 8.
+
+**Rule 2: every loop has a fixed upper bound.** A tool must be able to see that
+the loop ends. We ban `while` loops entirely; loops are `for` over a finite
+range. You already met one in lesson 1:
+
+```python
+for _ in range(MAX_ATTEMPTS):  # at most 5 tries, provably
+    if _insert(session, link):
+        return link
+raise CodeSpaceExhaustedError
+```
+
+`base62.encode` used `while num:`. It did end, but proving it takes math a
+checker can't do. The new version states the bound in the code:
+
+```python
+MAX_VALUE = 2**64 - 1  # we only encode 64-bit numbers...
+MAX_LENGTH = 11  # ...and 62**11 > 2**64, so 11 digits always suffice
+
+if not 0 <= num <= MAX_VALUE:
+    raise ValueError(...)
+for _ in range(MAX_LENGTH):
+    num, remainder = divmod(num, BASE)
+    digits.append(ALPHABET[remainder])
+    if num == 0:
+        break
+```
+
+The distributed-systems version of this rule: **every wait has a timeout**.
+A network call without a timeout is an unbounded loop in disguise. Talking to
+Postgres involves four different waits, and each needs its own limit
+(see `app/db.py`):
+
+| Wait | Limit | What happens without it |
+|------|-------|-------------------------|
+| Opening a connection | `connect_timeout` = 5 s | A server that doesn't answer blocks the request forever |
+| Getting a connection from our pool | `pool_timeout` = 10 s | Under load, requests queue without end |
+| Running one SQL statement | `statement_timeout` = 5 s (Postgres cancels it) | One slow query holds a connection forever |
+| Waiting for a row lock | `lock_timeout` = 2 s | A transaction that holds a lock freezes everyone behind it |
+| A dead network | TCP keepalives and `tcp_user_timeout` | The server vanished, but we keep waiting for its answer |
+
+Our first version only had the first two. An independent review caught the
+gap: once a connection is open, nothing stopped a query from waiting forever
+for a lock. That is a lesson in itself: "we have timeouts" is not the same as
+"every wait has a timeout". Every CI job also has `timeout-minutes`.
+
+**Rule 3: no dynamic memory allocation after start-up.** In C, `malloc` can
+fail or fragment memory at the worst moment. Python allocates constantly, so we
+keep the *purpose*: **resources are bounded**. The connection pool has a fixed
+size, and every input has a maximum: URLs up to 2048 characters (new, with a
+test), aliases up to 32. Without a limit, one request with a 50 MB "URL" would
+be stored, and later cached, forever.
+
+There is a catch: Pydantic checks the URL only *after* FastAPI has read and
+parsed the whole request body. A 200 MB request would fill the server's memory
+before any check runs. So the outermost input gets a limit too:
+`app/limits.py` refuses any body over 16 KB with `413 Content Too Large`,
+before reading it. Check sizes at the door, not after the guest is inside.
+
+**Rule 4: functions fit on one page (60 lines).** Short functions can be
+understood, tested and reviewed. Our checker enforces 60 lines; Ruff also
+limits statements (30), branches (8), returns (4) and arguments (6).
+
+**Rule 5: assertions, on average at least two per function.** Holzmann asks
+for an *assertion density* of at least two per function on average, with no
+side effects, and a recovery action when one fails. Assertions check that what
+"can't happen" really doesn't. Python's `assert` disappears when Python runs
+with `-O`, so in app code we write real checks instead:
+`if not 0 <= num <= MAX_VALUE: raise ValueError(...)`. All input from outside
+is validated by Pydantic before our code sees it. (Ruff rule `S101` forbids
+`assert` outside tests.)
+
+**Rule 6: smallest possible scope.** No `global` or `nonlocal`: a variable
+that anything can change from anywhere is impossible to reason about. Python
+has no block scope, so we keep functions small instead (rule 4) and prefer
+immutable data: `frozenset` for `RESERVED`, frozen dataclasses later.
+
+**Rule 7: check return values; validate parameters.** In Python, errors are
+exceptions, so the rule becomes: never swallow an exception (no bare `except:`,
+no `except Exception: pass`), and let `mypy --strict` force every possible
+`None` to be handled, as shown above. Watch out for one trap: for
+`try: ... except Exception: pass`, Ruff suggests `contextlib.suppress(Exception)`,
+which swallows exactly the same errors but passes every Ruff rule. Our checker
+reports it (R7).
+
+**Rule 8: limit the preprocessor.** C macros can make code mean something
+different from what it looks like. Python's equivalent is code that writes or
+loads code at run time: `eval`, `exec`, `compile`, `__import__`,
+`importlib.import_module`. Banned, because no tool can analyze code that
+doesn't exist yet.
+
+**Rule 9: restrict pointers.** Python has references instead of pointers. The
+danger is the same: two parts of the program changing one object through
+different references. Hence no mutable default arguments (`def f(x=[])` is a
+classic Python bug), immutable data where possible, and no function pointers
+except framework hooks like FastAPI's `Depends`.
+
+**Rule 10: all warnings on from day one, zero warnings, daily analysis.** This
+is the whole lesson in one rule: Ruff with a broad rule set, `mypy --strict`,
+warnings as test failures, CodeQL, and a CI run every day. "Zero" matters:
+with 200 old warnings nobody notices the 201st.
+
+### Our own static analyzer
+
+Ruff and mypy can't check rules 1, 2, 4, 6 and 8 the way JPL meant them (nor
+the `suppress` trap of rule 7), so we wrote
+[`scripts/check_power_of_ten.py`](scripts/check_power_of_ten.py), about 500
+lines. It uses Python's `ast` module, which turns source code into a tree:
+
+```python
+>>> import ast
+>>> print(ast.dump(ast.parse("while True: pass")))
+Module(body=[While(test=Constant(value=True), body=[Pass()], orelse=[])], ...)
+```
+
+Each rule is a function that walks the tree looking for a node type: `While`
+for rule 2, `Global` and `Nonlocal` for rule 6, calls to `eval` for rule 8.
+Imports are resolved first, so `import itertools as it; it.count()` is caught
+as surely as `itertools.count()`.
+
+Rule 1 is the interesting one. The checker builds a **call graph** (which
+function may call which) and reports every function that can reach itself.
+To know what a name like `walk` refers to, it applies Python's own scoping
+rule, **LEGB**: Local, then Enclosing functions, then Global (the module),
+then Builtins. Class bodies are skipped, which is why a method `sleep` that
+calls `sleep(1)` calls `time.sleep`, not itself. It also follows `self.m()`,
+`ClassName.m()`, `super().m()`, `ClassName(...)` (which runs `__init__`), and
+functions passed as values, as in `map(walk, nodes)`. The checker follows its
+own rules, so even that graph search is a bounded `for` loop instead of the
+usual recursive depth-first search.
+
+It is still an approximation, like every static analyzer for a dynamic
+language: it cannot see calls through other objects (`node.walk()`), across
+modules, or through `getattr`. Knowing what your tool can't see is part of
+using it well. The first version was simpler, and an independent review found
+seven kinds of recursion it missed; each one is now a test case.
+
+Rules sometimes need breaking. A waiver must name the rule and give a reason,
+right on the line, so a reviewer can judge it:
+
+```python
+while True:  # p10-waiver: R2 server loop, runs until the process stops
+```
+
+The checker has its own tests (`tests/test_power_of_ten.py`), including one
+that runs it over this whole repository, so a rule violation also fails `pytest`.
+
+### Try it yourself
+
+```bash
+make install    # once: tools + git hook
+make check      # what CI runs, except Docker and the PostgreSQL tests
+```
+
+Then break a rule on purpose: add `while True: pass` to `app/service.py` and
+try to commit. The hook stops you with
+``app/service.py:NN: R2 `while` loop has no fixed upper bound; use `for _ in range(MAX_...)` ``. Open the
+**Actions** tab on GitHub to watch the CI jobs of a pull request.
+
+### Exercises
+
+1. **A new rule.** Unbounded caches break rule 3: add a check that reports
+   `@functools.cache` and `@lru_cache(maxsize=None)`. Write the tests first.
+2. **Watch CI fail.** On a branch, add an unused import and push. Read the CI
+   log, fix it with `make format`, push again.
+3. **Protect `main`.** In the repository settings, require pull requests and
+   the CI checks to pass before merging (see CONTRIBUTING.md). Then try to
+   push directly to `main`.
+4. **Cut a release** on a fork: bump the patch number of `__version__` in
+   `app/__init__.py` (for example `0.1.0` becomes `0.1.1`), move the changelog
+   section, tag `v` plus that version, push the tag, and verify the published
+   image with
+   `gh attestation verify oci://ghcr.io/<you>/url-shortener:<version> --repo <you>/url-shortener`.
+5. **Coverage is not correctness.** Write a test that reaches 100% coverage of
+   `base62.encode` but would still pass if the function were wrong. What makes
+   a test actually *check* something?
+
+### Interview questions this lesson prepares you for
+
+- "What's the difference between CI and CD?"
+- "Linting, type checking and testing: what does each catch that the others don't?"
+- "Line coverage versus branch coverage? Is 100% coverage enough?"
+- "What is a supply-chain attack, and how do you defend against one?"
+- "Why pin GitHub Actions to a commit SHA rather than a tag?"
+- "Why would safety-critical code ban recursion and unbounded loops?"
+- "What does a MAJOR version bump mean in SemVer?"

@@ -1,0 +1,118 @@
+# Project metadata and the configuration of every quality tool, in one place.
+# Dependencies are listed in requirements*.in and locked, with hashes, in requirements*.txt.
+
+[project]
+name = "url-shortener"
+dynamic = ["version"]
+description = "A URL shortener built step by step to learn caching, load balancing and distributed systems."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13"
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = { attr = "app.__version__" }
+
+[tool.setuptools]
+packages = ["app"]
+
+# ---------------------------------------------------------------- Ruff ----
+# Linter + formatter. Every rule family below is explained in
+# docs/CODING_STANDARD.md and LEARNING.md (lesson 2).
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # pycodestyle: PEP 8 style errors and warnings
+    "F",       # Pyflakes: unused imports/variables, undefined names
+    "I",       # isort: import order
+    "N",       # pep8-naming
+    "UP",      # pyupgrade: modern Python syntax
+    "B",       # flake8-bugbear: likely bugs and design problems
+    "A",       # don't shadow builtins
+    "C4",      # comprehensions
+    "C90",     # mccabe: cyclomatic complexity (JPL rule 1)
+    "S",       # flake8-bandit: security issues
+    "BLE",     # no blind `except Exception` (JPL rule 7)
+    "T20",     # no print() left in code
+    "RET",     # return statements
+    "SIM",     # simplifications
+    "ARG",     # unused arguments
+    "PTH",     # use pathlib
+    "ERA",     # no commented-out code
+    "PL",      # Pylint: size limits (JPL rule 4), `global` (JPL rule 6), ...
+    "TRY",     # exception handling
+    "PERF",    # performance anti-patterns
+    "FURB",    # refurb: modernisations
+    "PIE", "ISC", "LOG", "G",
+    "DTZ",     # only timezone-aware datetimes
+    "PT",      # pytest style
+    "RUF",     # Ruff's own rules
+]
+ignore = [
+    "TRY003",  # long messages in exceptions are fine for this project
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 8  # JPL rule 1: simple control flow
+
+[tool.ruff.lint.pylint]
+# JPL rule 4: small functions. These limits are checked per function.
+max-args = 6
+max-branches = 8
+max-returns = 4
+max-statements = 30
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",     # tests are made of `assert`
+    "PLR2004",  # tests compare against literal values
+]
+"scripts/**" = ["T20"]  # command-line scripts print their results
+
+# ---------------------------------------------------------------- mypy ----
+# JPL rule 10: the most pedantic setting, zero warnings.
+[tool.mypy]
+python_version = "3.13"
+files = ["app", "scripts", "tests"]
+strict = true
+warn_unreachable = true
+enable_error_code = [
+    "ignore-without-code",
+    "redundant-expr",
+    "truthy-bool",
+    "possibly-undefined",
+    "redundant-self",
+]
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+# -------------------------------------------------------------- pytest ----
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+# JPL rule 10 again: a warning during the tests fails the tests.
+filterwarnings = ["error"]
+
+# ------------------------------------------------------------ coverage ----
+[tool.coverage.run]
+branch = true
+source = ["app", "scripts"]
+# Needs a running server: the CI "docker" job runs it against the real containers.
+omit = ["scripts/smoke_test.py"]
+
+[tool.coverage.report]
+fail_under = 95
+show_missing = true
+skip_covered = true
+exclude_also = ['if __name__ == "__main__":']

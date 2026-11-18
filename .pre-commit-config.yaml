@@ -1,0 +1,61 @@
+# Checks that run on every `git commit` once you have run `pre-commit install`.
+# CI runs exactly the same hooks with `pre-commit run --all-files`.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-added-large-files
+        # --enforce-all: also check files already committed. Without it, the
+        # hook only looks at newly staged files, so in CI it checks nothing.
+        args: [--maxkb=500, --enforce-all]
+      - id: detect-private-key
+
+  # These tools are pinned in requirements-dev.in (locked, with hashes, in
+  # requirements-dev.txt), so your laptop, the pre-commit hook and CI run the
+  # very same versions. That includes shellcheck, which actionlint uses to
+  # check the shell scripts inside workflows.
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff (lint)
+        entry: ruff check --fix
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: ruff-format
+        name: ruff (format)
+        entry: ruff format
+        language: system
+        # Markdown too: Ruff formats the Python examples in the docs.
+        types_or: [python, pyi, markdown]
+        require_serial: true
+      - id: mypy
+        name: mypy (strict types)
+        entry: mypy
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+      - id: power-of-ten
+        name: NASA/JPL Power of Ten
+        entry: python scripts/check_power_of_ten.py app scripts tests
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: actionlint
+        name: actionlint (GitHub workflows)
+        entry: actionlint
+        language: system
+        files: ^\.github/workflows/.*\.ya?ml$
+      - id: hadolint
+        name: hadolint (Dockerfile)
+        entry: hadolint
+        language: system
+        types: [dockerfile]
