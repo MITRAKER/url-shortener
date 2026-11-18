@@ -1182,6 +1182,42 @@ seconds: they went to the stopped instance, waited out the connect timeout,
 and were retried on another. CI repeats a shorter version on every pull
 request.
 
+#### A race we found later: the list changes under a retry
+
+CI's version found what our measurement missed. CI sends its requests
+*after* `docker stop` has finished, so there is no moment when the stopping
+instance still refuses connections at once: every request sent its way
+waits out the 2-second connect timeout. If `resolve` asks DNS again during
+that wait, the list of instances changes under the request. Nginx then
+doesn't pick the retry from the new list: it answers 502, and its log says
+`no live upstreams`, although two instances are up. We ran CI's sequence 8
+times: 7 runs had one 502 each.
+
+The fix is a second chance for what is safe to ask twice:
+
+```nginx
+location / {
+    proxy_pass http://app_instances;
+    error_page 502 = @once_more;   # a 502 made by Nginx: it reached no instance
+}
+location @once_more {
+    if ($request_method !~ ^(GET|HEAD)$) {
+        return 502;                # a POST is never asked twice
+    }
+    proxy_pass http://app_instances;   # a fresh try, with the new list
+}
+```
+
+The proxy settings moved up to the `server` block, so both locations share
+them. After the fix, CI's sequence ran 11 times without a single 502. And to
+be sure the changing list was the trigger, we ran the old configuration with
+DNS asked only every 5 minutes (`valid=300s`): 4 runs, no 502 either. Two
+lessons in one: the same failure can be harmless or not depending on
+*when* requests arrive, so test more than one timing; and a second chance is
+only for requests that are safe to repeat. (Is a `GET` safe? In HTTP's terms,
+yes. Ours counts a click, the one side effect we accept repeating: a click
+counted twice when an instance dies mid-answer.)
+
 #### Keepalive, and a race at the edge of a timeout
 
 A new TCP connection per request costs a round trip, so Nginx keeps
