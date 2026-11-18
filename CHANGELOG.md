@@ -7,8 +7,24 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-18
+
 ### Added
 
+- Redis cache in front of PostgreSQL for redirects (cache-aside reads,
+  write-through on create, negative caching of unknown codes, TTL with
+  jitter). Responses carry an `X-Cache: HIT | MISS | BYPASS` header.
+- Distributed rate limiting with a token bucket in Redis (an atomic Lua
+  script): 10 link creations and 300 reads per minute per client IP by
+  default, answered with `429 Too Many Requests` and `Retry-After`.
+- Redis is optional (`REDIS_URL`). When it is down or hangs, the app keeps
+  working without cache or limits instead of failing (fail open): each Redis
+  call waits at most 0.25 s, a timeout is never retried, and after 3 failures
+  in a row a circuit breaker skips Redis for 5 seconds.
+- `REDIS_URL` is checked at startup, so a malformed URL stops the app instead
+  of failing every request.
+- Redis in Docker Compose (64 MB, LFU eviction) and in CI.
+- Lesson 3 in LEARNING.md: caching, rate limiting and graceful degradation.
 - CI pipeline on every pull request: Ruff lint and format, strict mypy, the
   NASA/JPL Power of Ten checker, tests on SQLite and PostgreSQL with a 95%
   coverage gate, a dependency vulnerability audit, and a Docker build with an
@@ -32,6 +48,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- Redirects reject impossible codes (not 3 to 32 of `A-Z a-z 0-9 _ -`) with
+  `404` before touching Redis or the database.
 - URLs longer than 2048 characters are rejected with `422`.
 - Every wait on the database now has a timeout: connecting (5 s), waiting
   for a pooled connection (10 s), each SQL statement (5 s), each lock wait
@@ -46,6 +64,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   shell scripts with a pinned shellcheck, locally as in CI.
 - Exceptions renamed to `AliasTakenError` and `CodeSpaceExhaustedError`.
 
+### Fixed
+
+- The database health check in Docker Compose and CI probes over TCP, so the
+  app no longer starts while Postgres is still initialising; the app container
+  restarts if it fails at startup.
+- The large-file check now looks at every file in CI, not only newly staged ones.
+
 ## [0.1.0] - 2026-11-17
 
 ### Added
@@ -57,12 +82,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - GitHub Actions CI running the tests on SQLite and PostgreSQL.
 - Lesson 1 in LEARNING.md.
 
-### Fixed
-
-- The database health check in Docker Compose and CI probes over TCP, so the
-  app no longer starts while Postgres is still initialising; the app container
-  restarts if it fails at startup.
-- The large-file check now looks at every file in CI, not only newly staged ones.
-
-[Unreleased]: https://github.com/MITRAKER/url-shortener/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/MITRAKER/url-shortener/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/MITRAKER/url-shortener/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MITRAKER/url-shortener/releases/tag/v0.1.0

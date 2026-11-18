@@ -47,17 +47,21 @@ jobs:
       - run: pre-commit run --all-files --show-diff-on-failure
 
   test:
-    name: Tests (${{ matrix.database }})
+    name: Tests (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
-          - database: SQLite
+          # Fast and dependency-free: SQLite and an in-memory fake Redis.
+          - name: SQLite + fake Redis
             database-url: ""
-          - database: PostgreSQL
+            redis-url: ""
+          # The real thing, as in production.
+          - name: PostgreSQL + Redis
             database-url: postgresql+psycopg://app:app@localhost:5432/shortener_test
+            redis-url: redis://localhost:6379/0
     services:
       postgres:
         image: postgres:16-alpine
@@ -68,6 +72,12 @@ jobs:
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -h 127.0.0.1 -U app -d shortener_test"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -84,13 +94,14 @@ jobs:
         run: pytest --cov --cov-report=term-missing --cov-report=xml
         env:
           TEST_DATABASE_URL: ${{ matrix.database-url }}
+          TEST_REDIS_URL: ${{ matrix.redis-url }}
       - name: Coverage summary
         if: ${{ !cancelled() }}
         run: coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
-          name: coverage-${{ matrix.database }}
+          name: coverage-${{ strategy.job-index }}
           path: coverage.xml
           if-no-files-found: ignore
 

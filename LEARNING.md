@@ -7,6 +7,7 @@ with **exercises** so you can practise building it yourself.
 - [Lesson 1: The core service](#lesson-1-the-core-service)
 - [Lesson 2: Engineering like a professional team](#lesson-2-engineering-like-a-professional-team)
   (CI/CD, code quality, security scanning, NASA/JPL's Power of Ten)
+- [Lesson 3: Caching and rate limiting](#lesson-3-caching-and-rate-limiting) (step 2)
 
 ---
 
@@ -303,9 +304,9 @@ the Dockerfile, `detect-private-key` stops you committing a secret key.
 Most code we run, we didn't write: it comes from dependencies. A **supply-chain
 attack** hides malicious code in one of them.
 
-- **Lock files with hashes.** `requirements.in` lists the 6 packages the app
+- **Lock files with hashes.** `requirements.in` lists the 7 packages the app
   imports. Those need about 18 more (Starlette, anyio, h11, ...). Pinning only
-  the 6, as this repo first did, still lets pip pick the newest version of the
+  the direct ones, as this repo first did, still lets pip pick the newest version of the
   other 18 at install time, so CI, the Docker build and your laptop could each
   get different code. `pip-compile` (from pip-tools) resolves the whole tree
   once and writes `requirements.txt`: every package at an exact version, plus
@@ -586,3 +587,456 @@ try to commit. The hook stops you with
 - "Why pin GitHub Actions to a commit SHA rather than a tag?"
 - "Why would safety-critical code ban recursion and unbounded loops?"
 - "What does a MAJOR version bump mean in SemVer?"
+
+**Next:** Lesson 3 adds a Redis cache and rate limiting, held to these standards.
+
+---
+
+## Lesson 3: Caching and rate limiting
+
+Step 2 puts **Redis**, an in-memory data store, in front of PostgreSQL. It
+does two jobs: it remembers where short codes point (a **cache**), and it
+counts how fast each client is sending requests (a **rate limiter**).
+
+### What we built
+
+The path of a redirect now looks like this:
+
+```
+GET /abc1234
+  │
+  ├─ 1. rate limiter: one atomic script in Redis ───── bucket empty? → 429 Too Many Requests
+  ├─ 2. does "abc1234" even look like a code? ──────── no → 404, touching nothing
+  ├─ 3. Redis: GET link:v1:abc1234
+  │       ├─ found ─────────────────────────────────── redirect, X-Cache: HIT
+  │       ├─ not found → PostgreSQL SELECT → save in Redis → redirect, X-Cache: MISS
+  │       └─ Redis down → PostgreSQL SELECT ──────────── redirect, X-Cache: BYPASS
+  └─ 4. count the click (still a PostgreSQL write; step 4 moves it off this path)
+```
+
+| File | What's new |
+|------|------------|
+| `app/redis_client.py` | `RedisGateway`: the one door to Redis, with strict timeouts and a circuit breaker |
+| `app/breaker.py` | The circuit breaker: after 3 Redis failures in a row, skip Redis for 5 seconds |
+| `app/cache.py` | `LinkCache`: get, set, and "remember that this code does not exist" |
+| `app/ratelimit.py` | The token bucket (a Lua script) and the `RateLimit` FastAPI dependency |
+| `app/service.py` | `resolve()` (cache first, then database), write-through on create |
+| `app/main.py` | Rate limits on the routes, the `X-Cache` header, the code-shape check |
+| `app/config.py` | `REDIS_URL`, checked when the app starts |
+| `docker-compose.yml` | A `redis` container with a 64 MB memory budget |
+| `tests/test_cache.py`, `test_ratelimit.py`, `test_redis_client.py`, `test_breaker.py`, `test_config.py` | 78 new tests |
+| `tests/fakes.py` | `SilentServer`: a fake Redis that accepts connections and never answers |
+
+### Part 1: Caching
+
+#### Why cache at all?
+
+Two reasons: speed, and protecting the database.
+
+On the development machine, both on localhost, with 100,000 links:
+
+| Lookup | Median | 99th percentile |
+|--------|--------|-----------------|
+| PostgreSQL `SELECT` by indexed code (through SQLAlchemy) | 269 µs | 798 µs |
+| Redis `GET` | 61 µs | 119 µs |
+
+About 4 times faster in the median and almost 7 times faster at the 99th
+percentile ("p99": 99% of requests are faster than this). Those *tail
+latencies* are what users notice. The bigger win shows under load: the
+database is the one component that's hard to scale, and every request the
+cache answers is a request the database never sees.
+
+URL shorteners are a perfect case: they are **read-heavy** (a link is created
+once and clicked many times), and popularity is **skewed** (a few viral links
+get most of the clicks), so a small cache answers most requests.
+
+#### Caching patterns
+
+| Pattern | Reads | Writes | Used here |
+|---------|-------|--------|-----------|
+| **Cache-aside** (lazy loading) | App checks the cache; on a miss it reads the DB and fills the cache | App writes the DB only | ✅ for redirects |
+| **Read-through** | Like cache-aside, but the cache library loads from the DB itself | – | |
+| **Write-through** | – | App writes DB *and* cache together | ✅ on create |
+| **Write-behind** | – | App writes the cache; the DB is updated later, in the background | (step 4, for click counts) |
+
+Why write-through on create? A new short link is usually shared and clicked
+right away, so we cache it immediately instead of making the first visitor
+pay for a miss.
+
+#### TTL and jitter
+
+Every cache entry gets a **TTL** (time to live): Redis deletes it after about
+an hour. That bounds memory and bounds how long a stale entry can live.
+
+But if 10,000 links are cached in the same second (say, after a deploy),
+they would all expire in the same second, and 10,000 requests would hit the
+database at once. That is a **cache avalanche**. The fix is **jitter**: each
+entry gets a random TTL between 54 and 66 minutes (`ttl_with_jitter`), so
+expiries spread out.
+
+#### Negative caching
+
+What about codes that don't exist? Without care, every request for
+`/doesnotexist` misses the cache *and* queries the database. An attacker can
+send millions of made-up codes, and the cache doesn't help at all. That is
+**cache penetration**. Two defenses:
+
+1. **Validate first.** A code must look like a code: 3 to 32 characters of
+   `A-Z a-z 0-9 _ -`. `/../../etc/passwd` or a 10 KB string is rejected with
+   404 before touching Redis or the database.
+2. **Cache the absence.** If the database says "not found", we store an empty
+   string under that key for 60 seconds. Repeated lookups now hit Redis.
+
+(A third defense, for huge systems, is a **Bloom filter**: a compact
+structure that can say "definitely not present" without storing every code.)
+
+#### Cache stampede
+
+When one *very* popular entry expires, many requests miss at the same moment
+and all query the database for the same row. That's a **cache stampede** (or
+"thundering herd"). For us it's cheap, one indexed lookup per request, so we
+accept it. Big systems use a **lock** (only the first request refills the
+entry; the others wait or get the old value) or **early refresh** (refill
+shortly *before* expiry). The exercises include building the lock.
+
+> Penetration, stampede and avalanche are a classic interview trio. You now
+> know all three and a defense for each.
+
+#### Invalidation, and a race we closed
+
+> "There are only two hard things in Computer Science: cache invalidation and
+> naming things." (Phil Karlton)
+
+A cache is a *copy*. When the original changes, the copy is wrong until it is
+updated or deleted. `test_cache_hit_does_not_read_the_database` shows this on
+purpose: it changes a link's target directly in the database, and the
+redirect still goes to the old target, because the cache answered. So every
+code path that changes a link must also update or delete its cache entry. Our
+links never change after creation, which keeps this easy. (Lesson 1's
+"delete endpoint" exercise would need to delete the cache entry too.)
+
+One subtle **race condition** remained, between "not found" and "create":
+
+```
+time │ request A: GET /promo                  request B: POST alias=promo
+  1  │ cache miss
+  2  │ database: not found
+  3  │                                        database: insert promo ✓
+  4  │                                        cache: set promo → URL (write-through)
+  5  │ cache: set promo → "not found"   ✗ overwrites B's entry!
+```
+
+For 60 seconds, `/promo` would answer 404 although it exists. The fix is one
+flag: A writes "not found" with `SET ... NX` ("only if the key doesn't exist").
+At step 5 the key exists, so nothing happens. If the steps happen in the other
+order, B's write simply replaces A's. Both orders are now correct, and
+`test_not_found_never_overwrites_a_real_entry` checks it.
+
+#### What we deliberately don't cache
+
+Click counts change on every redirect, so the stats endpoint always reads the
+database. The cache holds only what a redirect needs: the target URL and the
+expiry time. (We store the expiry time and check it on every hit, so an
+expired link answers 410 even when it comes from the cache.)
+
+#### Key design and eviction
+
+Keys look like `link:v1:abc1234`. The prefix keeps cache keys apart from
+rate-limit keys, and the `v1` lets a future version change the stored format
+by switching to `v2`, without reading old entries it can't understand.
+
+Redis gets a fixed memory budget in `docker-compose.yml` (64 MB, NASA/JPL rule
+3). When it's full, Redis must **evict** something. We chose `allkeys-lfu`:
+evict the **least frequently used** key. The more common LRU (least
+*recently* used) has a weakness here: a crawler visiting 100,000 old links
+once each would push the viral links out. LFU remembers that the viral links
+are used constantly.
+
+#### When Redis is down: graceful degradation
+
+The cache is an optimization, so its failure must not become our failure. If
+Redis is down, a redirect still works: it reads the database and answers with
+`X-Cache: BYPASS`, and the rate limiter lets the request through. This is
+called **failing open**, or **graceful degradation**.
+
+Every Redis call goes through one door, `RedisGateway.call` in
+`app/redis_client.py`. It runs the operation; if Redis raises an error, it
+logs a warning and returns a fallback value instead ("unavailable" for the
+cache, "no decision" for the rate limiter). One door means one place decides
+what a Redis failure costs, instead of a `try/except` in every caller. Errors
+that are *not* Redis errors still raise: a bug in our own code must never be
+mistaken for "Redis is down".
+
+Failing open only works if failure is **fast**, and two kinds of "down"
+behave very differently:
+
+| Redis is... | A call gets | After |
+|-------------|-------------|-------|
+| **stopped** (nothing listening) | "connection refused" | about 0 ms |
+| **hung** (frozen, overloaded, network cut) | silence | the full timeout |
+
+The hung Redis is the dangerous one. Every call waits for its timeout, and a
+redirect makes up to three Redis calls: the rate limiter, the cache read and
+the cache write. An independent review measured the first version of this
+step against a hung Redis: **1.5 seconds per redirect**, and 120 concurrent
+redirects took 6.2 s instead of 0.8 s. Three defenses fixed it:
+
+1. **Every wait has a bound** (NASA/JPL rule 2): connecting and each command
+   give up after 0.25 s.
+2. **Don't wait twice in one request.** If the cache read failed, `resolve()`
+   doesn't write the answer back to Redis: that would only wait for another
+   timeout.
+3. **A circuit breaker** (`app/breaker.py`), named after the one in a fuse
+   box. After 3 failures in a row it **opens**: for the next 5 seconds, every
+   call skips Redis at once instead of waiting. Then it lets **one** trial
+   call through (**half-open**). If the trial works, the breaker **closes**
+   and traffic flows again; if not, it stays open for another 5 seconds.
+
+```
+ closed ──(3 failures in a row)──► open ──(5 s later)──► half-open
+   ▲                                 ▲                        │
+   │                                 └─────(trial fails)──────┤
+   └───────────────────────(trial works)──────────────────────┘
+```
+
+Now a hung Redis costs three timeouts in total, then nothing, plus one
+0.25 s trial every 5 seconds to notice when Redis is back.
+`test_survives_a_hung_redis_quickly` proves it with a fake Redis that
+accepts connections and never answers: once the circuit is open, five
+redirects take well under a second and don't touch Redis at all. The breaker
+is shared by every request in the process and protected by a lock, because
+requests run on many threads at once; `test_only_one_of_many_concurrent_callers_gets_the_trial`
+lets 50 threads race for the trial call, and exactly one wins.
+
+#### Retries, and a lesson about measuring
+
+The first version of this step said: "redis-py's default settings retry 10
+times with growing pauses: 3.4 seconds per call." The review checked that
+against the library's source, and it was wrong for our code. That default
+belongs to the `Redis(host=..., port=...)` constructor (we measured 4.4 s
+with Redis stopped). `make_redis` uses `Redis.from_url`, which **doesn't
+retry at all** by default, so our "fix" had *added* a retry. And the test
+meant to catch a slow outage couldn't, because it only tried a stopped
+Redis, where every attempt fails instantly. Two habits to take away: measure
+the code you actually run, and check that your test fails without your fix.
+
+Should a failed call be retried at all? It depends on the error:
+
+- A **connection error** usually means the command never reached Redis (for
+  example, Redis restarted and dropped the connection). One retry on a fresh
+  connection is cheap and often succeeds.
+- A **timeout** means "no answer yet". The command may well have run; only
+  the reply is missing. Retrying runs it **again**. For a `GET` that's
+  harmless. For the rate limiter's script it is not: the review showed a slow
+  reply making one request pay **two** tokens.
+
+An operation that has the same effect however many times it runs is
+**idempotent**: `GET`, or `SET key value`. "Take a token" is not. So
+`make_redis` retries once, at once, and only on a `ConnectionError`; a
+timeout is never retried (`test_only_a_broken_connection_is_retried`).
+Strictly, even a connection error can hide a command that ran: Redis may run
+the script and then lose the connection before the reply arrives. That
+window is tiny and costs one token, so we accept it. Knowing exactly which
+risk you accepted, and why, is the difference between a decision and an
+accident.
+
+#### A typo should stop the app, not every request
+
+`REDIS_URL=localhost:6379` (no `redis://`) used to start without complaint and
+report itself healthy, then answer every request that touched Redis with a
+500, because the URL was first parsed on the first request. Now `Settings`
+checks it at startup (`app/config.py`): building a connection pool parses the
+URL without connecting, and a malformed URL stops the app with a clear error.
+The rule: check configuration when the process starts (**fail fast**), so a
+bad deploy never looks healthy.
+
+#### Making the cache visible
+
+The `X-Cache` header is borrowed from CDNs: `HIT` (answered from Redis),
+`MISS` (read from the database and now cached) or `BYPASS` (Redis not used:
+not configured, down, or the circuit is open). It costs nothing, and
+`curl -i` tells you at once what happened.
+
+### Part 2: Rate limiting
+
+#### Why
+
+Without limits, one client can create millions of links (spam, phishing) or
+flood redirects until the service is slow for everybody. A **rate limiter**
+gives each client a budget: here 10 link creations and 300 reads per minute
+per IP address. Over the budget, the answer is `429 Too Many Requests`.
+
+#### The algorithms
+
+| Algorithm | How it works | Weakness |
+|-----------|--------------|----------|
+| **Fixed window** | Count requests per clock minute; reset at :00 | 10 requests at 0:59 and 10 more at 1:00: 20 in two seconds |
+| **Sliding log** | Store each request's timestamp; count those in the last 60 s | Exact, but stores one entry per request |
+| **Sliding window counter** | Weighted mix of the current and previous window's counts | An approximation, but cheap |
+| **Token bucket** (ours) | A bucket holds up to N tokens; each request takes one; tokens refill at a steady rate | Needs a little arithmetic |
+| **Leaky bucket** | Requests queue and leave at a fixed rate | Smooth output, but adds waiting |
+
+The **token bucket** allows short bursts (a full bucket of 10) but enforces
+the average (one new token every 6 seconds for 10/minute). It needs just two
+numbers per client: the tokens left, and when we last looked.
+
+```
+capacity 10, refill 1 token / 6 s
+
+tokens  10 ██████████  a new client starts full
+         7 ███████     after a burst of 3 requests
+         8 ████████    6 seconds later: one token earned
+         0             after 8 more requests → the next one gets 429, Retry-After: 6
+```
+
+#### Why the bucket lives in Redis
+
+In step 3 we will run three copies of the app behind a load balancer. If each
+copy counted in its own memory, a client would get three buckets, and three
+times the limit. The bucket must live in one shared place: Redis.
+
+#### Atomicity: why a Lua script
+
+The obvious Python version has a race:
+
+```python
+tokens = redis.get(key)  # two app instances both read 1 token...
+if tokens >= 1:
+    redis.set(key, tokens - 1)  # ...both allow the request, both write 0
+```
+
+Redis runs a **Lua script** as one indivisible step: no other command can run
+in the middle. So `RATE_LIMIT_LUA` reads the bucket, refills it, takes a token
+and writes it back, atomically. `test_exactly_limit_requests_win_under_concurrency`
+proves it: 50 threads race for 10 tokens, and exactly 10 win.
+
+Details worth noticing in the script:
+
+- **Whose clock?** Refilling needs "how much time passed?". App servers'
+  clocks can differ by a few milliseconds or more; there is one Redis. So the
+  script asks Redis for the time (`redis.call('TIME')`), and all instances
+  agree.
+- **Lua numbers come back as integers.** Redis truncates numbers returned
+  from a script, so the script rounds the token count itself with `math.floor`.
+- **Idle buckets are deleted.** `EXPIRE` removes a client's bucket once it
+  would be full again anyway, so memory doesn't grow with every IP that ever
+  visited.
+- `register_script` sends the script's SHA-1 hash (`EVALSHA`) instead of the
+  whole script on every call; Redis caches scripts by hash.
+
+#### Speaking HTTP properly
+
+A blocked request gets:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 6
+X-RateLimit-Limit: 10
+X-RateLimit-Remaining: 0
+```
+
+`Retry-After` tells a well-behaved client exactly how long to wait, so it
+doesn't keep hammering.
+
+#### Who is "a client"?
+
+We use the client's IP address. That's simple but imperfect: everyone behind
+one office or mobile-carrier network (NAT) shares an IP. And in step 3,
+behind the Nginx load balancer, every request will come from *Nginx's* IP,
+so all users would share one bucket. We'll fix that by reading the
+`X-Forwarded-For` header, but only when it was set by our own proxy, because
+anyone can send a fake `X-Forwarded-For`.
+
+#### Fail open or fail closed?
+
+If Redis is down, the limiter **fails open**: requests are allowed, with a
+warning in the log. For a URL shortener, availability matters more than strict
+limits for a few minutes. A login endpoint protecting against password
+guessing might choose to **fail closed** (refuse requests) instead. Neither is
+always right; it's a decision you make on purpose, per endpoint.
+
+Failing open has a price: while Redis is unavailable there are no limits at
+all. That's why the gateway and the circuit breaker log a warning, and why
+step 5 turns those warnings into a metric with an alert.
+
+### Testing it
+
+- **Two Redis setups.** Locally, tests use **fakeredis**, an in-memory Redis
+  written in Python, including Lua scripting (through the `lupa` package): no
+  server needed. CI runs the same tests a second time against a real Redis and
+  PostgreSQL, because a fake is only as good as its imitation.
+- **Clean state.** Every test gets an empty Redis (`flushdb`) and an empty
+  database, so tests can't affect each other.
+- **Dependency overrides.** `app.dependency_overrides[get_redis] = ...` swaps
+  the real Redis for the test one, the same mechanism FastAPI recommends for
+  any external service.
+- **Testing failure on purpose.** `client_with_redis_down` points at a port
+  where nothing listens, and `client_with_redis_hung` at `SilentServer`
+  (`tests/fakes.py`): a socket that accepts connections and never answers.
+  The operating system completes each connection, and nobody ever reads from
+  it, which is exactly what a frozen Redis looks like from outside.
+  `connections_made()` counts how often the app tried. Both clients are built
+  with the production settings, to prove the app degrades gracefully *and*
+  fast.
+- **A clock you control.** The circuit breaker takes its clock as a
+  parameter, so `tests/test_breaker.py` moves time forward by hand instead of
+  sleeping for 5 seconds.
+- **Configuration.** `tests/test_config.py` checks that a malformed
+  `REDIS_URL` is refused when the settings are read, before any request.
+
+### Try it yourself
+
+```bash
+docker compose up --build
+curl -s -X POST localhost:8000/api/links -H 'content-type: application/json' -d '{"url":"https://example.com"}'
+curl -si localhost:8000/<code> | grep -i x-cache           # HIT (cached on create)
+docker compose exec redis redis-cli --scan                   # see the keys
+docker compose exec redis redis-cli ttl link:v1:<code>       # about 3600, with jitter
+for i in $(seq 12); do curl -s -o /dev/null -w "%{http_code} " -X POST localhost:8000/api/links \
+  -H 'content-type: application/json' -d '{"url":"https://example.com"}'; done   # ... 201 201 429 429
+docker compose stop redis && curl -si localhost:8000/<code> | grep -i x-cache   # BYPASS, still works
+docker compose start redis
+
+# A hung Redis: "pause" freezes the container, but connections still open.
+docker compose pause redis
+for i in 1 2 3 4 5; do curl -s -o /dev/null -w "%{time_total}s " localhost:8000/<code>; done
+# the first requests wait for timeouts, then the circuit opens and the rest are fast
+docker compose logs app | grep -i circuit     # "Redis failed 3 times in a row, circuit open"
+docker compose unpause redis
+```
+
+### Exercises
+
+1. **Stampede lock.** In `resolve()`, on a miss, take a short lock with
+   `SET lock:<code> 1 NX EX 2`. Only the winner queries the database; the
+   others wait briefly (a *bounded* number of times!) and re-check the cache.
+   How would you test it?
+2. **Sliding window.** Implement a sliding-window-counter limiter as a second
+   Lua script and compare its behaviour at the minute boundary with the token
+   bucket.
+3. **Rate-limit headers everywhere.** Send `X-RateLimit-Remaining` on
+   *successful* responses too, so clients can slow down before hitting 429.
+   (Hint: FastAPI dependencies can declare a `response: Response` parameter.)
+4. **Which errors should trip the breaker?** Today every Redis error counts as
+   a failure, even `WRONGTYPE` (Redis answered, but the key holds the wrong
+   kind of value). Redis is clearly up in that case. Change `RedisGateway.call`
+   so only `ConnectionError` and `TimeoutError` count, write the test first,
+   and think about who could exploit the current behaviour.
+5. **Measure it.** Use `curl -w "%{time_total}\n"` to compare `X-Cache: HIT`
+   and `MISS` response times on your machine.
+
+### Interview questions this lesson prepares you for
+
+- "Where would you add a cache to this system, and what would you cache?"
+- "Cache-aside, write-through, write-behind: what's the difference?"
+- "Explain cache penetration, cache stampede and cache avalanche, and how to prevent each."
+- "How do you keep a cache consistent with the database?"
+- "LRU or LFU?"
+- "Design a rate limiter. Which algorithm, and where does its state live when
+  you have many servers?"
+- "What happens to your system when the cache goes down? And when it hangs?"
+- "What is a circuit breaker? What are its three states?"
+- "Which requests are safe to retry? What does idempotent mean?"
+
+**Next:** step 3 runs three instances of the app behind an Nginx load
+balancer, and replaces random codes with distributed, collision-free IDs.

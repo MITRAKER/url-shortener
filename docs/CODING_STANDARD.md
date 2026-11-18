@@ -38,7 +38,12 @@ while True:  # p10-waiver: R2 server loop, runs until the process stops
 ```
 
 A `# noqa: CODE` for Ruff or a `# type: ignore[code]` for mypy needs a reason
-in a comment too. There are none in the codebase today.
+in a comment too. Today there are four, all for Ruff:
+
+| Where | Rule | Why |
+|-------|------|-----|
+| `app/cache.py` | `S311` (non-cryptographic random) | The cache TTL jitter doesn't need to be unpredictable, only spread out |
+| `tests/conftest.py`, 3 imports | `E402` (import not at the top) | The app reads its settings on import, so the test settings must be set first |
 
 ## Other rules
 

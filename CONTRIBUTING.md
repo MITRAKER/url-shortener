@@ -51,7 +51,7 @@ the `.txt` file.
 | Job | What it does |
 |-----|--------------|
 | Lint, format, types, Power of Ten | All pre-commit hooks on every file |
-| Tests (SQLite), Tests (PostgreSQL) | The test suite on both databases; fails below 95% branch coverage |
+| Tests (SQLite + fake Redis), Tests (PostgreSQL + Redis) | The test suite on both setups; fails below 95% branch coverage |
 | Dependency vulnerability audit | `pip-audit` against the Python vulnerability database |
 | Docker build and smoke test | Builds the image, starts the stack, runs `scripts/smoke_test.py` |
 | CodeQL | Security analysis of the Python code and of the workflows |
