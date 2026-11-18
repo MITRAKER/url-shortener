@@ -850,6 +850,11 @@ URL without connecting, and a malformed URL stops the app with a clear error.
 The rule: check configuration when the process starts (**fail fast**), so a
 bad deploy never looks healthy.
 
+One more detail: that error ends up in the logs, and a URL can hold a password
+(`redis://:password@host`). By default, Pydantic's error message repeats the
+value it rejected, so `Settings` sets `hide_input_in_errors=True`: the message
+names the setting and the problem, never the value.
+
 #### Making the cache visible
 
 The `X-Cache` header is borrowed from CDNs: `HIT` (answered from Redis),

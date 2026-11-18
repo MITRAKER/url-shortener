@@ -9,7 +9,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # hide_input_in_errors: a bad setting stops the app with an error message,
+    # and that message must not repeat the value, which may hold a password
+    # (redis://:password@host).
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     database_url: str = "sqlite:///./dev.db"
     # Public base used to build short links, e.g. https://sho.rt

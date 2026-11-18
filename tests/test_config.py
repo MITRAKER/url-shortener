@@ -38,3 +38,18 @@ def test_malformed_redis_url_stops_the_app_at_startup(monkeypatch: pytest.Monkey
     monkeypatch.setenv("REDIS_URL", "localhost:6379")
     with pytest.raises(ValidationError, match="redis_url"):
         Settings()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "redis//:hunter2@redis:6379/0",  # missing colon
+        "http://:hunter2@redis:6379/0",  # wrong scheme
+        "redis://:hunter2@redis:port/0",  # port is not a number
+    ],
+)
+def test_error_for_a_malformed_redis_url_does_not_show_the_password(url: str) -> None:
+    """The error is printed when the app stops, so it ends up in the logs."""
+    with pytest.raises(ValidationError, match="redis_url") as error:
+        Settings(redis_url=url)
+    assert "hunter2" not in str(error.value)
