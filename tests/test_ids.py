@@ -1,6 +1,7 @@
 """Snowflake IDs and the code cipher (app/ids.py). A fake clock stands in for
 time, so the tests can cross seconds, and run out of IDs, without waiting."""
 
+import itertools
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -25,9 +26,9 @@ from app.ids import (
     Snowflake,
     parse_id,
 )
+from tests.conftest import TEST_CODE_SECRET as SECRET
 from tests.fakes import FakeClock
 
-SECRET = "a-secret-for-the-tests-only"
 START_SECOND = 1_000  # seconds after 2026-01-01 when each test begins
 
 
@@ -185,7 +186,7 @@ def test_codes_of_neighbouring_ids_look_unrelated() -> None:
     neighbours share their first character 1 time in 62."""
     cipher = CodeCipher(SECRET)
     codes = [cipher.encode(n) for n in range(10_000, 16_200)]
-    same_start = sum(a[0] == b[0] for a, b in zip(codes, codes[1:], strict=False))
+    same_start = sum(a[0] == b[0] for a, b in itertools.pairwise(codes))
     assert same_start < 3 * len(codes) / 62  # about 100 expected
     assert codes != sorted(codes)
 
@@ -214,7 +215,7 @@ def test_numbers_outside_the_code_space_are_refused(number: int) -> None:
 
 @pytest.mark.parametrize("code", ["abc", "abcdefghi", "abc!efgh"])
 def test_malformed_codes_are_refused(code: str) -> None:
-    with pytest.raises(ValueError, match="characters|not a base62"):
+    with pytest.raises(ValueError, match=r"characters|not a base62"):
         CodeCipher(SECRET).decode(code)
 
 

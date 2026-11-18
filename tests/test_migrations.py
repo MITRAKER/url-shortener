@@ -21,9 +21,7 @@ from app.db import MIGRATION_LOCK_ID, Base, engine
 ROOT = Path(__file__).resolve().parent.parent
 HEAD = "0002"
 POSTGRES = engine.dialect.name == "postgresql"
-needs_postgres = pytest.mark.skipif(
-    not POSTGRES, reason="needs PostgreSQL (set TEST_DATABASE_URL)"
-)
+needs_postgres = pytest.mark.skipif(not POSTGRES, reason="needs PostgreSQL (set TEST_DATABASE_URL)")
 
 
 def alembic_config(output: io.StringIO | None = None) -> Config:
@@ -123,8 +121,11 @@ def test_going_back_to_a_counter_starts_above_the_largest_id() -> None:
     with engine.begin() as connection:
         connection.execute(
             links.insert().values(
-                id=snowflake_id, code="new", target_url="https://a.com",
-                created_at=sa.func.now(), clicks=0,
+                id=snowflake_id,
+                code="new",
+                target_url="https://a.com",
+                created_at=sa.func.now(),
+                clicks=0,
             )
         )
     command.downgrade(config, "0001")
