@@ -139,6 +139,12 @@ jobs:
         run: docker compose up --build --detach --wait --wait-timeout 180
       - name: Smoke test against the running containers
         run: python scripts/smoke_test.py http://localhost:8000
+      - name: Nginx spreads requests over all 3 instances
+        run: python -m scripts.check_instances http://localhost:8000 3
+      - name: Losing an instance loses no requests
+        run: |
+          docker stop "$(docker compose ps --quiet app | head -n 1)"
+          python -m scripts.check_instances http://localhost:8000 2
       - name: Show container logs
         if: failure()
         run: docker compose logs

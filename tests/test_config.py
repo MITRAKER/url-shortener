@@ -53,3 +53,48 @@ def test_error_for_a_malformed_redis_url_does_not_show_the_password(url: str) ->
     with pytest.raises(ValidationError, match="redis_url") as error:
         Settings(redis_url=url)
     assert "hunter2" not in str(error.value)
+
+
+def test_a_short_code_secret_stops_the_app_without_showing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODE_SECRET", "hunter2-hunter2")  # 15 characters, one short
+    with pytest.raises(ValidationError, match="code_secret") as error:
+        Settings()
+    assert "hunter2" not in str(error.value)
+
+
+def test_the_code_secret_is_hidden_when_settings_are_printed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODE_SECRET", "a-long-and-private-secret")
+    settings = Settings()
+    assert "a-long-and-private-secret" not in repr(settings)
+    assert settings.code_secret.get_secret_value() == "a-long-and-private-secret"
+
+
+@pytest.mark.parametrize(
+    ("value", "proxies"),
+    [
+        ("", []),  # no proxy in front: trust nobody
+        ("10.89.0.10", ["10.89.0.10"]),
+        ("10.89.0.0/24", ["10.89.0.0/24"]),  # a whole network
+        (" 10.0.0.1 ,, fd00::/8 ", ["10.0.0.1", "fd00::/8"]),  # IPv6 too; blanks skipped
+    ],
+)
+def test_trusted_proxies_are_addresses_or_networks(value: str, proxies: list[str]) -> None:
+    assert Settings(trusted_proxies=value).trusted_proxy_list == proxies
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "*",  # trust everyone: anyone could choose their own address
+        "nginx",  # a host name: not resolved, so it would never match
+        "10.89.0.300",  # a typo
+        "10.89.0.0/33",
+    ],
+)
+def test_anything_else_in_trusted_proxies_is_rejected(value: str) -> None:
+    with pytest.raises(ValidationError, match="trusted_proxies"):
+        Settings(trusted_proxies=value)

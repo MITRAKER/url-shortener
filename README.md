@@ -26,23 +26,31 @@ safety-critical code.
 | 1 | Core API (FastAPI + PostgreSQL), tests | ✅ |
 | – | Quality foundation: CI/CD, strict typing, coverage, security scanning, NASA/JPL rules | ✅ |
 | 2 | Redis cache + distributed rate limiting | ✅ |
-| 3 | Multiple instances behind Nginx, distributed IDs | ⏳ |
+| 3 | Multiple instances behind Nginx, distributed IDs | ✅ |
 | 4 | Async click analytics (Redis Streams + worker) | ⏳ |
 | 5 | Metrics (Prometheus/Grafana), k6 load tests, benchmarks | ⏳ |
 
 ## Architecture
 
 ```
-client ──▶ FastAPI app ──▶ Redis       rate limiting (token bucket) and link cache
-                     └───▶ PostgreSQL  source of truth: links and click counts
+                              ┌──▶ app instance 0 ──┐
+client ──▶ Nginx (port 8000) ─┼──▶ app instance 1 ──┼──▶ Redis       rate limiting (token bucket) and link cache
+           load balancer      └──▶ app instance 2 ──┴──▶ PostgreSQL  links, click counts, instance number leases
 ```
+
+The instances share nothing but Redis and PostgreSQL, so any of them can
+answer any request. Each one makes its own link IDs (Snowflake IDs: time,
+instance number and a counter), unique without asking anyone first; a keyed
+permutation turns each ID into an 8-character code that can't be guessed.
 
 ## Run it
 
-With Docker:
+With Docker (Nginx, three app instances, PostgreSQL and Redis; the database
+migrations run first, once):
 
 ```bash
 docker compose up --build
+for i in 1 2 3 4 5 6; do curl -s localhost:8000/health; echo; done   # watch Nginx take turns
 ```
 
 Without Docker (uses a local SQLite file, and no Redis unless you set `REDIS_URL`):
@@ -50,6 +58,7 @@ Without Docker (uses a local SQLite file, and no Redis unless you set `REDIS_URL
 ```bash
 python -m venv .venv && source .venv/bin/activate
 make install
+make migrate                 # create the tables
 uvicorn app.main:app --reload
 ```
 
@@ -62,7 +71,7 @@ Interactive API docs: http://localhost:8000/docs
 | `POST` | `/api/links` | Create a link. Body: `{"url": "...", "alias": "optional", "expires_in_days": 30}` |
 | `GET`, `HEAD` | `/{code}` | Redirect (302) to the original URL. 404 if unknown, 410 if expired. `HEAD` shows where a link goes without counting a click |
 | `GET` | `/api/links/{code}` | Link details and click count |
-| `GET`, `HEAD` | `/health` | Health check |
+| `GET`, `HEAD` | `/health` | Health check, and which instance answered: `{"status": "ok", "instance": 0}` |
 
 Redirects carry an `X-Cache` header: `HIT` (served from Redis), `MISS` (from
 PostgreSQL, now cached) or `BYPASS` (Redis not used: not configured, down, or
@@ -84,7 +93,8 @@ request bodies up to 16 KB (`413 Content Too Large` above that).
 |----------|---------|---------|
 | `DATABASE_URL` | `sqlite:///./dev.db` | SQLAlchemy database URL |
 | `BASE_URL` | `http://localhost:8000` | Used to build `short_url` in responses |
-| `CODE_LENGTH` | `7` | Length of random codes (3 to 32) |
+| `CODE_SECRET` | *(a public default)* | Key that scrambles IDs into codes. At least 16 characters, the same on every instance. Set your own in production: the app logs a warning while the default is in use |
+| `TRUSTED_PROXIES` | *(empty)* | IP addresses or networks of your proxies, comma-separated, e.g. `10.89.0.10`. Only requests from these may name the client's address in `X-Forwarded-For`. Empty: trust nobody |
 | `REDIS_URL` | *(empty)* | e.g. `redis://localhost:6379/0`. Empty: no cache, no rate limiting. Checked at startup: a malformed URL stops the app |
 | `CACHE_TTL_SECONDS` | `3600` | How long a link stays cached (±10% jitter) |
 | `CACHE_NEGATIVE_TTL_SECONDS` | `60` | How long "this code does not exist" is cached |
@@ -101,6 +111,18 @@ make help      # all commands
 
 Tests run on SQLite and an in-memory fake Redis by default. To use the real ones:
 `TEST_DATABASE_URL=postgresql+psycopg://app:app@localhost:5432/shortener_test TEST_REDIS_URL=redis://localhost:6379/0 pytest`.
+Some tests (instance number leases, the migration lock) need PostgreSQL and are
+skipped on SQLite.
+
+The database schema changes only through migrations in `app/migrations/`
+([Alembic](https://alembic.sqlalchemy.org/)). After changing `app/models.py`:
+
+```bash
+alembic revision --autogenerate -m "add a column for ..."   # then read and fix the new file
+make migrate
+```
+
+A test fails if the models and the migrations ever disagree.
 
 ## Quality and CI/CD
 
@@ -115,6 +137,7 @@ Tests run on SQLite and an in-memory fake Redis by default. To use the real ones
 | Semantic security analysis | CodeQL | CI (weekly too) |
 | Workflow and Dockerfile linting | actionlint, hadolint | pre-commit, CI |
 | The real Docker stack works end to end | `docker compose` + [`scripts/smoke_test.py`](scripts/smoke_test.py) | CI |
+| Nginx spreads requests over all instances; stopping one loses no requests | [`scripts/check_instances.py`](scripts/check_instances.py) | CI |
 | Release: image on GHCR with SBOM and signed provenance, GitHub release | [`release.yml`](.github/workflows/release.yml) | on `vX.Y.Z` tags |
 
 See [the coding standard](docs/CODING_STANDARD.md), [CONTRIBUTING](CONTRIBUTING.md)
@@ -123,9 +146,11 @@ and the [CHANGELOG](CHANGELOG.md).
 ## Project layout
 
 ```
-app/        the service (FastAPI routes, business logic, database)
+app/        the service (FastAPI routes, business logic, database, IDs)
+app/migrations/  database migrations (Alembic)
+nginx/      the load balancer's configuration
 tests/      pytest suite
-scripts/    Power of Ten checker, smoke test, release notes
+scripts/    Power of Ten checker, smoke test, instance check, release notes
 docs/       coding standard
 .github/    CI/CD workflows, Dependabot, issue and PR templates
 ```
