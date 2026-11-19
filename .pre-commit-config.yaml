@@ -2,7 +2,8 @@
 # CI runs exactly the same hooks with `pre-commit run --all-files`.
 #
 # Every hook is `repo: local` with `language: system`: it runs a program that
-# requirements-dev.txt installs, locked to an exact version with its hash.
+# requirements-dev.txt installs, locked to an exact version with its hash, or a
+# script in this repository (the Power of Ten checker).
 # A remote hook repository is usually named by a tag, which can be moved, and
 # pre-commit installs it with pip, without hashes, taking whatever versions of
 # its dependencies are newest at that moment.
@@ -10,7 +11,8 @@ repos:
   # File hygiene, from the pre-commit-hooks package. Each hook copies the
   # settings of the hook with the same id in that package's
   # .pre-commit-hooks.yaml (version 6.0.0), except `language`, so it runs on
-  # the same files. The `args` are our own.
+  # the same files. The `args` are our own. When pre-commit-hooks is updated,
+  # compare these hooks with the new version's .pre-commit-hooks.yaml.
   - repo: local
     hooks:
       - id: trailing-whitespace

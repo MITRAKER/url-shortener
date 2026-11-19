@@ -452,14 +452,17 @@ Postgres involves several different waits, and each needs its own limit
 | Running one SQL statement | `statement_timeout` = 5 s (Postgres cancels it) | One slow query holds a connection forever |
 | Waiting for a row lock | `lock_timeout` = 2 s | A transaction that holds a lock freezes everyone behind it |
 | A dead network | TCP keepalives and `tcp_user_timeout` | The server vanished, but we keep waiting for its answer |
-| A server that is alive but stuck (a paused container or VM, a hung pooler) | **None** in the app | The request's thread and its pooled connection wait until the server answers |
+| A server that is alive but stuck (a paused container, a hung pooler or proxy) | **None** in the app | The request's thread and its pooled connection wait until the server answers |
 
 Each limit covers only its own case. `statement_timeout` and `lock_timeout`
 are enforced by Postgres itself, so they need a server that answers.
 Keepalives and `tcp_user_timeout` only notice a dead peer or network: they
 fire when the other machine stops acknowledging our packets, and the kernel of
-a machine whose Postgres is frozen still acknowledges them. libpq, the C
-library under psycopg, has no client-side read timeout. So nothing in the app
+a machine whose Postgres is frozen still acknowledges them. (A paused VM is
+different: its own kernel stops too, nothing acknowledges our packets, and
+`tcp_user_timeout` ends the wait as it does for a dead network, unless a port
+forwarder on the host keeps answering for it.) libpq, the C library under
+psycopg, has no client-side read timeout. So nothing in the app
 bounds a query sent on an open connection to a server that is alive but stuck.
 (Opening a new connection to it still fails after 5 s: `connect_timeout`
 covers the whole handshake.)
@@ -573,15 +576,33 @@ Reading `self.x` runs a property's getter, `__getattribute__`, and
 setter and `__setattr__`, `del self.x` its deleter and `__delattr__`, and
 `self(...)` runs `__call__`. So a setter that does `self.x = v` calls itself,
 though no line says `x(...)`. The checker follows these calls on `self`.
+"Nothing defines `x`" is a judgment: the checker looks for `x` in the class
+bodies and for code that sets it on `self` (`self.x = v`,
+`setattr(self, "x", v)`, `self.__dict__["x"] = v`). When a class gets
+attributes from code it cannot read (a base class from another module, such
+as `dict` or `Exception`, a metaclass, or `setattr(self, key, v)` with a name
+known only at run time), it assumes `x` may be there and says nothing.
 
 It is still an approximation, like every static analyzer for a dynamic
 language: it only knows the classes of one module, and it cannot see calls
-through other objects (`node.walk()`), across modules, through `getattr`,
-`setattr` or metaclasses, or through descriptors other than decorated methods.
+through other objects (`node.walk()`, `self.__class__(...)`), across modules,
+through `getattr`, `setattr` or metaclasses, through descriptors other than
+decorated methods, or through the special methods that operators and
+built-ins run (`len(self)`, `self == other`, `self[k]`, `with self`,
+`str(self)`). It takes `super().m` to mean `m` in the bases of the class that
+calls it, though with multiple inheritance Python picks the next class in the
+instance's method resolution order (MRO). It can also be wrong the other way:
+`self` and `cls` stand for every subclass in the module, so a factory such as
+`Base.make()`, which runs `cls(...)`, is reported when a subclass's `__init__`
+calls it, though `cls` is `Base` there. Code like that needs a waiver,
+`# p10-waiver: R1 <reason>` (see below).
+
 Knowing what your tool can't see is part of using it well. The first version
 was simpler, and an independent review found seven kinds of recursion it
 missed; a later review found six more, through properties, special methods
-and subclasses. Each one is now a test case.
+and subclasses. A third review found the opposite mistake: false alarms on
+classes whose attributes come from outside the module. Each one is now a test
+case.
 
 Rules sometimes need breaking. A waiver must name the rule and give a reason,
 right on the line, so a reviewer can judge it:

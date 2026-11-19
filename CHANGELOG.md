@@ -21,8 +21,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Ruff and mypy do not cover (recursion, unbounded loops, function length,
   widened scope, swallowed errors, dynamic code). Recursion is found with a
   call graph that follows Python's scoping rules, overrides in subclasses,
-  and the methods Python runs for you, such as property setters,
-  `__setattr__`, `__getattr__` and `__call__`.
+  and some of the methods Python runs for you: property getters, setters and
+  deleters, `__getattribute__`, `__getattr__`, `__setattr__`, `__delattr__`,
+  `__call__`, and `__init__` and `__new__` through `cls(...)`. The script's
+  docstring lists what it cannot see.
 - `HEAD` requests on short links and `/health`. A `HEAD` shows where a link
   goes without counting a click.
 - Request bodies over 16 KB are refused with `413 Content Too Large` before
@@ -35,13 +37,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Changed
 
 - URLs longer than 2048 characters are rejected with `422`. The length is
-  measured on the normalized URL that is stored and redirected to, where an
-  `é` in the path takes 6 characters (`%C3%A9`).
+  checked on the input as sent, in UTF-8 bytes, and on the normalized URL that
+  is stored and redirected to, where an `é` in the path takes 6 characters
+  (`%C3%A9`).
 - Waits on the database now have timeouts: connecting (5 s), waiting for a
   pooled connection (10 s), each SQL statement (5 s), each lock wait (2 s),
   and a dead network (TCP keepalives and `tcp_user_timeout`). They do not
-  cover a server that is alive but stuck (a paused container or VM, a hung
-  pooler): the statement and lock limits need a server that answers, the
+  cover a server that is alive but stuck (a paused container, a hung pooler
+  or proxy): the statement and lock limits need a server that answers, the
   keepalives only notice a dead peer or network, and libpq has no client-side
   read timeout, so a query on an open connection waits until the server
   answers.

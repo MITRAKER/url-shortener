@@ -47,7 +47,8 @@ edit them by hand. To add or change a dependency, edit the `.in` file, run
 the `.txt` file.
 
 The pre-commit hooks follow the same rule: each one is a `repo: local` hook
-that runs a tool pinned in `requirements-dev.in`. Add a new hook the same way,
+that runs a tool pinned in `requirements-dev.in` or a script in this
+repository. Add a new hook the same way,
 not as a remote hook repository, which pre-commit would install without
 hashes.
 

@@ -13,7 +13,7 @@ from app.config import settings
 # the server, so they need a server that answers. Limits 4 and 4b only notice a
 # dead peer or network: when Postgres is stuck, the kernel of its machine still
 # acknowledges our packets. And libpq has no client-side read timeout. So when
-# the server is alive but stuck (a paused container or VM, a hung pooler), a
+# the server is alive but stuck (a paused container, a hung pooler or proxy), a
 # query on an open connection waits until the server answers, and so does the
 # request that sent it.
 CONNECT_TIMEOUT_SECONDS = 5  # 1. opening a new connection

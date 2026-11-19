@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Annotated
 
 from pydantic import AfterValidator, BaseModel, Field, HttpUrl, UrlConstraints
+from pydantic_core import PydanticCustomError
 
 ALIAS_PATTERN = r"^[A-Za-z0-9_-]{3,32}$"
 # Every input has a maximum size (NASA/JPL rule 3: bounded resources).
@@ -20,7 +21,12 @@ def _at_most_max_length(url: HttpUrl) -> HttpUrl:
     mostly of emoji and store it as more than 6000 characters.
     """
     if len(str(url)) > MAX_URL_LENGTH:
-        raise ValueError(f"URL should have at most {MAX_URL_LENGTH} characters")
+        # The error type and message of UrlConstraints, so clients see one kind of error.
+        raise PydanticCustomError(
+            "url_too_long",
+            "URL should have at most {max_length} characters",
+            {"max_length": MAX_URL_LENGTH},
+        )
     return url
 
 

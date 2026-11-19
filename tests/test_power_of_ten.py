@@ -163,6 +163,26 @@ def test_clean_code_passes() -> None:
             def __getattr__(self, name):
                 return self.target
         """,
+        # a base from this module, or `object`, does not define it either
+        """
+        class Base(object):
+            pass
+
+        class Proxy(Base):
+            def __getattr__(self, name):
+                return self.target
+        """,
+        # nor does setting another name, or an attribute of another object
+        """
+        class Proxy:
+            def __init__(self, inner):
+                object.__setattr__(self, "_target", inner)
+                setattr(inner, "target", 1)
+                inner.__dict__.update(target=1)
+
+            def __getattr__(self, name):
+                return self.target
+        """,
         # every read of an attribute runs __getattribute__
         """
         class Logged:
@@ -320,6 +340,62 @@ def test_recursion_is_rejected(source: str) -> None:
                 if name in self.__dict__ or self.retries < 0:
                     return None
                 return getattr(self.target, name)
+        """,
+        # ... or from a base or metaclass that this module does not define
+        """
+        from plugins import Registry
+
+        class Settings(dict):
+            pass
+
+        class Env(Settings):
+            def __getattr__(self, name):
+                return self.get(name)
+
+        class ApiError(Exception):
+            def __getattr__(self, name):
+                return self.args[0][name]
+
+        class Plugin(metaclass=Registry):
+            def __getattr__(self, name):
+                return self.registry[name]
+        """,
+        # ... or set by name, with a constant or one known only at run time
+        """
+        class Proxy:
+            def __init__(self, target, log):
+                object.__setattr__(self, "_target", target)
+                setattr(self, "_log", log)
+                super().__setattr__("_hits", 0)
+                self.__dict__["_misses"] = 0
+                vars(self)["_name"] = "proxy"
+
+            def __getattr__(self, name):
+                self._log.append(self._name)
+                return getattr(self._target, name, self._hits + self._misses)
+        """,
+        """
+        class Record:
+            def __init__(self, fields):
+                self.__dict__.update(fields)
+
+            def __getattr__(self, name):
+                return self.defaults[name]
+
+        class Options:
+            def __init__(self, **values):
+                for key, value in values.items():
+                    setattr(self, key, value)
+
+            def __getattr__(self, name):
+                return self.fallback
+
+        class Snapshot:
+            def __init__(self, fields):
+                self.__dict__ = dict(fields)
+
+            def __getattr__(self, name):
+                return self.default
         """,
         """
         class Logged:
