@@ -1589,8 +1589,8 @@ PostgreSQL. Step 4 takes that write off the request path: a redirect only
 appends a small **event** ("a click on `abc`") to a **Redis stream**, and a
 separate **worker** process adds the events up and writes the totals to
 PostgreSQL in batches. The hard part is not speed but correctness: every
-click must be counted **exactly once**, even when the worker, Redis or
-PostgreSQL fails halfway through.
+click in the stream must be counted **exactly once**, even when the worker,
+Redis or PostgreSQL fails halfway through.
 
 ### What we built
 
@@ -1908,13 +1908,22 @@ through the fallback, the test would prove nothing.
 
 #### Ambiguous failures
 
-A timeout on `XADD` doesn't say whether the click landed. We count it in
+A timeout on the append doesn't say whether the click landed. We count it in
 PostgreSQL to be safe, so if it did land, the worker counts it a second time.
-That's a choice, not an accident: when you can't know, decide which way to
-be wrong. For click counts, a rare double count beats a lost click. (The
-**two generals problem** says no protocol removes this doubt over an
+A connection can also break after Redis ran the `XADD`, before the reply
+arrived. The client then retries once, as it does on any broken connection
+([lesson 3](#retries-and-a-lesson-about-measuring)), and the click lands
+twice. That's a choice, not an accident: when you can't know, decide which
+way to be wrong. For click counts, a rare double count beats a lost click.
+(The **two generals problem** says no protocol removes this doubt over an
 unreliable network; idempotency keys only move it somewhere you can deal
 with it.)
+
+So "exactly once" is a promise about the worker: it counts each click in
+the stream once, whatever fails. Around it, a click can still be counted
+twice: after an ambiguous failure, or when Nginx retries a redirect on
+another instance (lesson 4). And a crash of the whole machine can lose up to
+about a second of clicks (see "Redis restarts" above).
 
 #### The worker: crash-only, and alive is not the same as working
 

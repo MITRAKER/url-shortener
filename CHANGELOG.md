@@ -16,11 +16,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   click worker (`python -m app.worker`, the `worker` service in Docker
   Compose, `make worker`) adds the clicks up per link and writes them in
   batches of up to 1000.
-- Each click is counted exactly once. The worker stores how far it got (a
-  checkpoint, in the new `click_checkpoints` table, migration `0003`) in the
-  same transaction as the counts, and moves it with a compare-and-set, so a
-  crash at any moment, or a second worker, can't count a click twice or
-  lose one. Counted clicks are then removed from the stream.
+- The worker counts each click in the stream exactly once. It stores how
+  far it got (a checkpoint, in the new `click_checkpoints` table, migration
+  `0003`) in the same transaction as the counts, and moves it with a
+  compare-and-set, so a crash at any moment, or a second worker, can't
+  count a click twice or lose one. Counted clicks are then removed from the
+  stream. Around the stream, a click can still be counted twice: when Nginx
+  retries a redirect, or when the click reached Redis but the reply didn't
+  (a timeout, or a broken connection, which the client retries once). A
+  crash of the whole machine can lose up to about a second of clicks.
 - When Redis can't take a click (not configured, down, or full), it is
   counted in PostgreSQL at once, as before. So is a click that finds a
   million clicks already waiting: the stream stops there (about 21 MB), so

@@ -1,12 +1,13 @@
 """The click worker: counts the clicks waiting in the Redis stream into
 PostgreSQL, a batch at a time. Run it with `python -m app.worker`.
 
-Each click is counted exactly once, without a distributed transaction. The
-worker keeps a *checkpoint* in PostgreSQL: the ID of the last stream entry it
-has counted. It moves the checkpoint in the same transaction that adds the
-counts, so either both happen or neither does. After a crash it carries on
-from where the database says, and no click is counted twice or lost. (Kafka
-consumers that store their offsets together with their results do the same.)
+Each click in the stream is counted exactly once, without a distributed
+transaction. The worker keeps a *checkpoint* in PostgreSQL: the ID of the
+last stream entry it has counted. It moves the checkpoint in the same
+transaction that adds the counts, so either both happen or neither does.
+After a crash it carries on from where the database says, and no click is
+counted twice or lost. (Kafka consumers that store their offsets together
+with their results do the same.)
 
 Moving the checkpoint is a compare-and-set: "from where I started reading, to
 the end of my batch". If another worker moved it first, the update changes no

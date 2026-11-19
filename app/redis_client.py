@@ -56,7 +56,10 @@ def make_redis(url: str, socket_timeout: float = SOCKET_TIMEOUT_SECONDS) -> redi
         # Retry once, at once, but only if the connection itself broke, e.g. a
         # pooled connection that Redis closed while it sat idle. Never retry a
         # timeout: the command may already have run, and running the rate
-        # limiter's script twice would charge the client twice.
+        # limiter's script twice would charge the client twice. A connection
+        # can break after the command ran, too: that window is tiny, and we
+        # accept its cost, a token charged twice or a click added twice
+        # (LEARNING.md, lessons 3 and 5).
         retry=Retry(NoBackoff(), retries=1, supported_errors=(redis.ConnectionError,)),
     )
 

@@ -47,9 +47,13 @@ instance number and a counter), unique without asking anyone first; a keyed
 permutation turns each ID into an 8-character code that can't be guessed.
 
 A redirect doesn't write to PostgreSQL: it appends the click to a Redis
-stream, and the click worker counts the clicks in batches, each exactly once.
-Click counts can lag a moment behind; measured back to back, redirects went
-from 583 to 905 per second (16 clients, one popular link).
+stream, and the click worker counts the clicks in batches, each click in the
+stream exactly once. Click counts can lag a moment behind; measured back to
+back, redirects went from 583 to 905 per second (16 clients, one popular
+link). Around the stream, a click can still be counted twice (when Nginx
+retries a redirect, or when the click reached Redis but the reply didn't),
+and a crash of the whole machine can lose up to about a second of clicks
+(LEARNING.md, lesson 5).
 
 ## Run it
 
