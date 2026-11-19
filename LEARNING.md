@@ -1091,7 +1091,7 @@ POST /api/links, answered by instance 1:
 | `app/service.py` | `create_link` uses the IDs; the retry loop is now only a safety net |
 | `app/config.py` | `CODE_SECRET` and `TRUSTED_PROXIES` |
 | `scripts/check_instances.py` | For CI: does Nginx use every instance, and does losing one lose requests? |
-| `tests/test_ids.py`, `test_instances.py`, `test_migrations.py`, `test_proxy.py` | 63 more tests than step 2 |
+| `tests/test_ids.py`, `test_instances.py`, `test_migrations.py`, `test_proxy.py` | 64 more tests than step 2 |
 
 ### Part 1: Load balancing
 
@@ -1352,10 +1352,18 @@ SELECT pg_try_advisory_lock(1970433139, 1);   -- false would mean "taken": try t
 An **advisory lock** is a lock on numbers we choose; PostgreSQL attaches no
 meaning to them. The first number is a namespace, "urls" in ASCII
 (0x75726C73, which is 1970433139), so our locks never clash with another
-app's. The lock belongs to the database **session**: when the connection
-closes (a clean shutdown, a crash, a machine losing power) PostgreSQL releases
-it. No expiry to tune, no clean-up job. ZooKeeper's ephemeral nodes and etcd's
-leases are the same idea.
+app's. The lock belongs to the database **session**, and PostgreSQL releases
+it when the session ends: no clean-up job. A clean shutdown or a crash closes
+the connection, and the number is free at once. A machine that loses power, or
+a network that fails, closes nothing: PostgreSQL learns of it only through TCP
+**keepalives**, probes it sends on a connection that has gone quiet. Its
+defaults are the operating system's: on Linux, 2 hours of silence, then 9
+probes 75 s apart, about 2 h 11 min in all, while the number stays taken. So
+every session the app opens asks for a probe after 10 s of silence, then one
+every 5 s, and for the session to end after 3 go unanswered (`app/db.py`):
+about 25 s. That is the lease's real expiry. ZooKeeper's ephemeral nodes and
+etcd's leases are the same idea, with the expiry in plain sight: a session
+timeout, a TTL.
 
 Two details from building it:
 
@@ -1377,7 +1385,11 @@ seconds (`watch` in `app/instances.py`). When the check fails, it retires its
 `Snowflake` (no more IDs, so creating a link answers 503), and sends itself
 `SIGTERM`, the signal `docker stop` sends. uvicorn finishes the requests in
 progress and exits, and Docker starts it again (`restart: unless-stopped`)
-with a fresh lease.
+with a fresh lease. The same check covers a network that fails between an
+instance and PostgreSQL: the instance gives up within about 15 s (its next
+check, plus 10 s of `tcp_user_timeout`), before the server's keepalives free
+its number. We cut one off the network: it noticed after 14 s, and its number
+was free after 23.
 
 That's **crash-only design**: there is one well-tested way to start, and
 recovering is just starting again. We tried it with `docker compose restart
@@ -1499,9 +1511,10 @@ printed for review (`--sql`), and that a second run waits its turn.
   codes that are already taken, to prove each retry path: an ID clash, a code
   that clashes with an alias, and giving up after exactly 5 tries.
 - **PostgreSQL-only tests** (skipped on SQLite): instances get different
-  numbers; a number is free again when its instance stops, or when its session
-  is killed (`pg_terminate_backend`, as if the machine died); the lease leaves
-  no transaction open; a second migration run waits its turn.
+  numbers; a number is free again when its instance stops, or when the server
+  ends its session (`pg_terminate_backend`, as its keepalives do once a machine
+  is gone); every session asks the server for those keepalives; the lease
+  leaves no transaction open; a second migration run waits its turn.
 - **Pretending to be Nginx.** `TestClient(app, client=("10.89.0.10", 40000))`
   sends requests from Nginx's address.
 - **The real stack, in CI.** `scripts/check_instances.py` checks that 30

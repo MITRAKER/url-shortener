@@ -25,7 +25,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Instance numbers are leased from PostgreSQL with advisory locks when an
   instance starts. Every 5 seconds the instance checks that it still holds
   its number; if not (say, PostgreSQL restarted), it stops making IDs and
-  shuts down, and Docker starts it again with a new lease.
+  shuts down, and Docker starts it again with a new lease. A number is free
+  again as soon as its instance stops or crashes, or about 25 seconds after
+  its machine or network vanishes: the app asks PostgreSQL to probe its
+  sessions with TCP keepalives.
 - Codes are IDs scrambled by a keyed Feistel network (`CODE_SECRET`): unique
   without retries, and impossible to guess from each other without the key.
 - `TRUSTED_PROXIES`: the app takes the client's address from
