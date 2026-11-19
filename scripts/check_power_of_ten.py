@@ -26,8 +26,9 @@ as the class or any subclass in the module defines it:
     reading self.x    a property getter and `__getattribute__`; also
                       `__getattr__`, unless x is in `dir(object)` or is
                       `__dict__`, `__module__` or `__weakref__`, or the class
-                      or a base binds x in its body or sets it on `self` in a
-                      method: `self.x = v`, `setattr(self, "x", v)`,
+                      or a base binds x in its body, code anywhere in the
+                      module sets `Class.x = v`, or a method sets it on
+                      `self`: `self.x = v`, `setattr(self, "x", v)`,
                       `object.__setattr__(self, "x", v)`, or through
                       `self.__dict__` or `vars(self)`: `["x"] = v`,
                       `.setdefault("x", v)`, `.update(x=v)`
@@ -35,10 +36,12 @@ as the class or any subclass in the module defines it:
     del self.x        a property deleter and `__delattr__`
     self(...)         `__call__`
     cls(...)          `__init__` and `__new__`
-Because `self` and `cls` stand for every subclass in the module, a factory
-such as `Base.make()`, which runs `cls(...)`, is reported when a subclass's
-`__init__` calls it, though `cls` is `Base` there. Code like that needs a
-waiver: `# p10-waiver: R1 <reason>`.
+Names are compared the way Python stores them: inside class `C`, `self.__x`
+is `self._C__x`, while a string such as `setattr(self, "__x", v)` is kept as
+it is written. Because `self` and `cls` stand for every subclass in the
+module, a factory such as `Base.make()`, which runs `cls(...)`, is reported
+when a subclass's `__init__` calls it, though `cls` is `Base` there. Code like
+that needs a waiver: `# p10-waiver: R1 <reason>`.
 
 It only sees classes defined in the module. It cannot follow calls through
 other objects (`obj.m()`, `type(self)(...)`, `self.__class__(...)`), through
@@ -49,15 +52,18 @@ special methods that operators, statements and built-in functions call:
 `len(self)` (`__len__`), `self == other` (`__eq__`), `self[k]` (`__getitem__`,
 `__missing__`), `str(self)`, `repr(self)` and f-strings (`__str__`,
 `__repr__`, `__format__`), `iter(self)` and `for x in self` (`__iter__`),
-`bool(self)` and `if self:` (`__bool__`), `with self:` (`__enter__`). It
-resolves `super().m` to the bases of the class that calls it, not to the next
-class in the instance's MRO. And it assumes that an instance may have any
-attribute when its class or a base has a metaclass, or a base other than
-`object` that is not written as the name of a class in the module or as
-`Outer.Inner` (an import, `module.Base`, an alias such as `Shape = Base`, or
-`Generic[T]`), or sets attributes by names known only at run time
-(`setattr(self, key, v)`, `self.__dict__.update(d)`, a new `self.__dict__`):
-a `__getattr__` there that reads a missing attribute is not reported.
+`bool(self)` and `if self:` (`__bool__`), `with self:` (`__enter__`), nor
+`__getattr__` after a property's getter raises AttributeError, which Python
+also falls back to. It resolves `super().m` to the bases of the class that
+calls it, not to the next class in the instance's MRO. And it assumes that an
+instance may have any attribute when its class or a base has a metaclass, or a
+base other than `object` that is not written as the name of a class statement
+in the module or as `Outer.Inner` with `Inner` a class statement in `Outer`'s
+own body (an import, `module.Base`, an alias such as `Shape = Base`, an
+`Inner` that `Outer` inherits, or `Generic[T]`), or sets attributes by names
+known only at run time (`setattr(self, key, v)`, `self.__dict__.update(d)`, a
+new `self.__dict__`): a `__getattr__` there that reads a missing attribute is
+not reported.
 """
 
 import ast
@@ -81,6 +87,7 @@ DYNAMIC_CODE = frozenset(
 ENDLESS_ITERATORS = frozenset({"itertools.count", "itertools.cycle"})
 REPEAT_WITH_TIMES_ARGS = 2  # itertools.repeat(x, 3) stops; itertools.repeat(x) never does
 ITER_WITH_SENTINEL_ARGS = 2  # iter(read, "") calls read() until it returns ""
+SUPER_WITH_OBJECT_ARGS = 2  # super(C, x): the object comes second
 GROWING_METHODS = frozenset({"append", "extend", "insert"})
 CATCH_ALL = frozenset({"Exception", "BaseException"})
 
@@ -266,18 +273,34 @@ def _bound_names(node: ast.AST) -> list[str]:
     return []
 
 
-def _name_of(key: ast.expr | None) -> str:
-    """The attribute name that `key` gives, or ANY_NAME if it is known only at run time."""
-    if isinstance(key, ast.Constant) and isinstance(key.value, str):
-        return key.value
+def _mangled(name: str, cls: ast.ClassDef | None) -> str:
+    """`name` as Python stores it when the code that names it is inside the
+    body of `cls`: a private name such as `__x` becomes `_Cls__x`. A string
+    is never changed: `setattr(self, "__x", v)` sets `__x` itself."""
+    owner = cls.name.lstrip("_") if cls is not None else ""
+    if not owner or not name.startswith("__") or name.endswith("__"):
+        return name
+    return f"_{owner}{name}"
+
+
+def _enclosing_class(chain: Chain) -> ast.ClassDef | None:
+    """The innermost class whose body contains this point, at any depth."""
+    return next((scope for scope in chain if isinstance(scope, ast.ClassDef)), None)
+
+
+def _name_of(key: ast.expr | None) -> str | None:
+    """The attribute name that `key` gives: ANY_NAME if it is known only at
+    run time, None if it is a constant that is not a name (`d[0] = v`)."""
+    if isinstance(key, ast.Constant):
+        return key.value if isinstance(key.value, str) else None
     return ANY_NAME
 
 
-def _update_names(args: list[ast.expr], keywords: list[ast.keyword]) -> list[str]:
+def _update_names(args: list[ast.expr], keywords: list[ast.keyword]) -> list[str | None]:
     """The keys that `d.update(*args, **keywords)` may set: the names of its
     keyword arguments and the constant keys of a dict display. Anything else
     (`**values`, or a mapping built at run time) may set any key: ANY_NAME."""
-    names = [ANY_NAME if keyword.arg is None else keyword.arg for keyword in keywords]
+    names: list[str | None] = [ANY_NAME if kw.arg is None else kw.arg for kw in keywords]
     for arg in args:
         keys = arg.keys if isinstance(arg, ast.Dict) else [None]
         names += [_name_of(key) for key in keys]
@@ -289,7 +312,9 @@ def _attribute_writes(node: ast.AST) -> list[tuple[ast.expr, str]]:
     `setattr(obj, name, v)`, `object.__setattr__(obj, name, v)`,
     `obj.__setattr__(name, v)` (`obj` may be `super()`), and through
     `obj.__dict__` or `vars(obj)`: `[name] = v`, `.setdefault(name, v)` and
-    `.update(...)`. A name known only at run time is ANY_NAME."""
+    `.update(...)`. A name known only at run time is ANY_NAME; a call that
+    fails (a keyword argument where none is taken) or a key that is not a
+    string sets no attribute."""
     match node:
         case (
             ast.Call(func=ast.Name(id="setattr"), args=[obj, key, _], keywords=[])
@@ -313,10 +338,12 @@ def _attribute_writes(node: ast.AST) -> list[tuple[ast.expr, str]]:
                     ),
                     attr="setdefault",
                 ),
-                args=[key, *_],
+                args=[key] | [key, _],
+                keywords=[],
             )
         ):
-            return [(obj, _name_of(key))]
+            name = _name_of(key)
+            return [] if name is None else [(obj, name)]
         case ast.Call(
             func=ast.Attribute(
                 value=(
@@ -325,10 +352,10 @@ def _attribute_writes(node: ast.AST) -> list[tuple[ast.expr, str]]:
                 ),
                 attr="update",
             ),
-            args=args,
+            args=([] | [_]) as args,  # update(a, b) fails
             keywords=keywords,
         ):
-            return [(obj, name) for name in _update_names(args, keywords)]
+            return [(obj, n) for n in _update_names(args, keywords) if n is not None]
     return []
 
 
@@ -346,6 +373,8 @@ class _Scopes:
         self.references: list[Reference] = []
         # Attributes set by name, as `setattr(obj, "name", v)`: object, name, where.
         self.writes: list[tuple[ast.expr, str, Chain]] = []
+        # `obj.name = v` anywhere, in a function or not: `Class.x = v` adds to a class.
+        self.attribute_stores: list[tuple[ast.Attribute, Chain]] = []
         nodes = list(ast.walk(tree))
         self.calls = {n.func for n in nodes if isinstance(n, ast.Call)}
         # `x.a += 1` reads x.a, then assigns it; `x.a: int` with no value does neither.
@@ -356,7 +385,8 @@ class _Scopes:
         self._walk(tree)
         for scope, names in self.declared.items():
             for name in names:  # `global x` means this scope does not bind x
-                self.bindings[scope].pop(name, None)
+                self.bindings[scope].pop(self._key(scope, name), None)
+        self._bind_class_attributes()
         # Each class, then its base classes; and each class, then its subclasses.
         parents = {cls: self._bases(cls) for cls in self.class_chains}
         children = _subclasses(parents)
@@ -394,7 +424,23 @@ class _Scopes:
         return children
 
     def _bind(self, scope: ast.AST, name: str, target: Target) -> None:
-        self.bindings[scope][name].append(target)
+        self.bindings[scope][self._key(scope, name)].append(target)
+
+    @staticmethod
+    def _key(scope: ast.AST, name: str) -> str:
+        """How `scope` stores `name`: a class body stores a private name mangled."""
+        return _mangled(name, scope) if isinstance(scope, ast.ClassDef) else name
+
+    def _bind_class_attributes(self) -> None:
+        """`Class.x = v` gives a class of this module an attribute that its
+        body may not show, from anywhere in the module: we cannot follow it."""
+        for node, chain in self.attribute_stores:
+            if not isinstance(node.value, ast.Name):
+                continue
+            name = _mangled(node.attr, _enclosing_class(chain))
+            for target in self.resolve(node.value.id, chain):
+                if isinstance(target, ast.ClassDef):
+                    self.bindings[target][name].append(None)
 
     def _function(
         self, node: FunctionNode | ast.Lambda, chain: Chain
@@ -431,13 +477,24 @@ class _Scopes:
         elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
             self._bind(chain[0], node.id, None)
         elif isinstance(node, ast.Name | ast.Attribute):
-            owner = next((s for s in chain if isinstance(s, FunctionNode)), None)
-            if owner is not None:
-                self.references += [Reference(owner, chain, node, a) for a in self._accesses(node)]
+            self._record_use(node, chain)
         elif node not in self.annotated:  # `self.__dict__["x"]: int` sets nothing
             self.writes += [(obj, name, chain) for obj, name in _attribute_writes(node)]
         for name in _bound_names(node):
             self._bind(chain[0], name, None)
+
+    def _record_use(self, node: ast.Name | ast.Attribute, chain: Chain) -> None:
+        """A name or attribute used in a function may be a call; and `obj.x = v`,
+        in a function or not, may give a class an attribute (`Class.x = v`)."""
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Store)
+            and node not in self.annotated  # `Class.x: int` sets nothing
+        ):
+            self.attribute_stores.append((node, chain))
+        owner = next((s for s in chain if isinstance(s, FunctionNode)), None)
+        if owner is not None:
+            self.references += [Reference(owner, chain, node, a) for a in self._accesses(node)]
 
     def _accesses(self, node: ast.Name | ast.Attribute) -> list[Access]:
         """What this use of a name or attribute does to it."""
@@ -454,7 +511,11 @@ class _Scopes:
         for a class that sets some by names known only at run time."""
         assigned: dict[ast.ClassDef, set[str]] = {cls: set() for cls in self.class_chains}
         stores = [
-            (reference.node.value, reference.node.attr, reference.chain)
+            (
+                reference.node.value,
+                _mangled(reference.node.attr, _enclosing_class(reference.chain)),
+                reference.chain,
+            )
             for reference in self.references
             if reference.access == "store"
             and isinstance(reference.node, ast.Attribute)
@@ -474,7 +535,9 @@ class _Scopes:
             if not obj.args:
                 owner_class = self._class_of(chain)
                 return [] if owner_class is None else [owner_class]
-            target = obj.args[-1]  # super(C, x) sets the attribute on x
+            if len(obj.args) != SUPER_WITH_OBJECT_ARGS:
+                return []  # super(C) is not bound to an object: it sets nothing
+            target = obj.args[1]  # super(C, x) sets the attribute on x
         targets = self.resolve(target.id, chain) if isinstance(target, ast.Name) else []
         return [t.cls for t in targets if isinstance(t, Instance) and not t.is_class]
 
@@ -498,7 +561,8 @@ class _Scopes:
         for depth, scope in enumerate(chain):
             if isinstance(scope, ast.ClassDef) and depth > 0:
                 continue  # code inside a method cannot see its class's names
-            targets = self.bindings[scope].get(name) if scope in self.bindings else None
+            bound = self.bindings.get(scope)  # get() adds nothing to a defaultdict
+            targets = bound.get(self._key(scope, name)) if bound is not None else None
             if targets:
                 return targets
         return []  # a builtin, or something defined elsewhere
@@ -518,14 +582,15 @@ class _Scopes:
         return [t for t in targets if isinstance(t, ast.ClassDef)]
 
     def _base_targets(self, base: ast.expr, chain: Chain) -> list[Target]:
-        """What a base class names: `Base`, or `Outer.Inner` through class
-        bodies. [None] for what can't be followed, such as `module.Base`."""
+        """What a base class names: `Base`, or `Outer.Inner` through the class
+        statements in `Outer`'s own body. [None] for what can't be followed,
+        such as `module.Base`; [] when no class body binds the name."""
         attributes: list[str] = []
         node = base
         for _ in range(sum(1 for _ in ast.walk(base))):  # one step per `.attribute`
             if not isinstance(node, ast.Attribute):
                 break
-            attributes.append(node.attr)
+            attributes.append(_mangled(node.attr, _enclosing_class(chain)))
             node = node.value
         unknown: list[Target] = [None]
         targets = self.resolve(node.id, chain) if isinstance(node, ast.Name) else unknown
@@ -533,7 +598,8 @@ class _Scopes:
             classes = [t for t in targets if isinstance(t, ast.ClassDef)]
             if not classes or len(classes) < len(targets):
                 return unknown
-            targets = [t for c in classes for t in self._in_body(c, attribute) or unknown]
+            # A class that lacks it would fail at `Outer.Inner`: only the others count.
+            targets = [t for c in classes for t in self._in_body(c, attribute)]
         return targets
 
     def _in_body(self, cls: ast.ClassDef, attr: str) -> list[Target]:
@@ -561,21 +627,22 @@ class _Scopes:
         return functions
 
     def _attribute(self, node: ast.Attribute, reference: Reference) -> list[Target]:
+        attr = _mangled(node.attr, _enclosing_class(reference.chain))  # `self.__x`
         value = node.value
         if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
             owner_class = self._class_of(reference.chain)
             # super() can only read: assigning or deleting through it fails.
             if value.func.id != "super" or owner_class is None or reference.access != "load":
                 return []
-            return _run_by(self.lookup(owner_class, node.attr, skip_self=True), "load")
+            return _run_by(self.lookup(owner_class, attr, skip_self=True), "load")
         if not isinstance(value, ast.Name):
             return []
         found: list[Target] = []
         for base in self.resolve(value.id, reference.chain):
             if isinstance(base, Instance):  # self.x or cls.x
-                found += self._on_instance(base, node.attr, reference.access)
+                found += self._on_instance(base, attr, reference.access)
             elif isinstance(base, ast.ClassDef) and reference.access == "load":  # ClassName.x
-                found += _run_by(self.lookup(base, node.attr), "load")
+                found += _run_by(self.lookup(base, attr), "load")
         return found
 
     def _on_instance(self, instance: Instance, attr: str, access: Access) -> list[Target]:
