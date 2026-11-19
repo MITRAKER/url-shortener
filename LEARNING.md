@@ -1611,14 +1611,14 @@ GET /abc1234 ─▶ Nginx ─▶ app ── XADD clicks:v1 * code abc1234 ──
 
 | File | What's new |
 |------|------------|
-| `app/clicks.py` | `ClickStream.append()`: one `XADD`, through the Redis gateway |
+| `app/clicks.py` | `ClickStream.append()`: one `XADD`, unless a million clicks already wait (a small Lua script), through the Redis gateway |
 | `app/service.py` | `count_click()`: the stream, or PostgreSQL straight away when Redis can't take the click |
 | `app/worker.py` | The click worker: read a batch, add it up, count it with its checkpoint in one transaction |
 | `app/heartbeat.py` | The worker's health check: was its last round recent? |
 | `app/models.py`, migration `0003` | `click_checkpoints`: how far the worker got |
 | `docker-compose.yml` | The `worker` service; Redis keeps the stream on disk and never evicts it |
 | `scripts/check_clicks.py` | For CI: clicks wait while the worker is stopped, and survive a Redis restart |
-| `tests/test_clicks.py`, `tests/test_worker.py` | 33 tests: the redirect path, batching, every failure in between, two workers at once |
+| `tests/test_clicks.py`, `tests/test_worker.py` | 35 tests: the redirect path, batching, every failure in between, two workers at once |
 
 ### Part 1: Why take work off the request path?
 
@@ -1834,14 +1834,13 @@ worst kind**: it is found by a customer, weeks later.
 #### Redis down or full: fall back, don't drop
 
 `count_click()` appends to the stream; if Redis can't take the click (not
-configured, down, circuit breaker open, or out of memory), the click is
-counted the old way, with an `UPDATE`. The system degrades to step 3's
-speed instead of losing clicks or failing redirects.
+configured, down, circuit breaker open, out of memory, or the stream full),
+the click is counted the old way, with an `UPDATE`. The system degrades to
+step 3's speed instead of losing clicks or failing redirects.
 
-Redis has a fixed memory budget (64 MB), so the stream is a **bounded
-buffer**. That matters: a buffer without a bound turns a slow consumer into
-an out-of-memory crash. When it fills up, something must give, and the
-choices are the classic three:
+The stream must be a **bounded buffer**: a buffer without a bound turns a
+slow consumer into an out-of-memory crash. When it fills up, something must
+give, and the choices are the classic three:
 
 - **Drop** the oldest (`XADD ... MAXLEN 1000000`): quiet data loss. No.
 - **Block** the producer until there is room: a redirect waiting on the
@@ -1849,9 +1848,31 @@ choices are the classic three:
 - **Push back**: refuse the write and let the producer take another path.
   That's our fallback, and it's called **backpressure**.
 
-Measured: 100,000 waiting clicks take 2.53 MB, about 25 bytes each, so 64 MB
-holds up to some 2.5 million of them (cache entries are evicted first to
-make room, see below).
+Where does the bound go? Our first version let Redis's memory budget (64 MB)
+be the bound, and the review showed why that is the wrong place: the stream
+shares those 64 MB with the cache and the rate limits. A long worker outage
+filled Redis with waiting clicks, and a full Redis refuses every command that
+needs more memory, not only new clicks. The rate limiter's script failed, so
+the limits failed open (lesson 3), and every cache write failed too. Each
+refusal also counted as a Redis failure, so the circuit breaker kept opening.
+A stopped worker had switched off a security control.
+
+So the stream has a bound of its own, `MAX_WAITING_CLICKS`: a million
+clicks. The append is a small Lua script, atomic like the rate limiter's:
+
+```lua
+if redis.call('XLEN', KEYS[1]) >= tonumber(ARGV[2]) then
+  return false  -- full: nil for the app, which counts the click itself
+end
+return redis.call('XADD', KEYS[1], '*', 'code', ARGV[1])
+```
+
+At the bound the script returns nil, and the click goes to PostgreSQL like
+any other refusal. A full stream is an answer, not an error, so the circuit
+breaker doesn't count it. Measured on Redis 7.4, a million waiting clicks
+take about 21 MB (with 8-character codes; 43 MB if every click were on a
+32-character alias), so the cache and the rate limits keep the rest. The
+script costs about 10 to 20 microseconds more per click than a bare `XADD`.
 
 #### The eviction policy that would have lost clicks
 
@@ -1861,8 +1882,11 @@ same Redis, that policy could evict the stream itself, and every click
 waiting in it would vanish without an error. Step 4 switches to
 `volatile-lfu`: evict only keys that have an expiry time anyway (cache
 entries, rate limit buckets). The stream never expires, so it is never
-evicted; when nothing else is left to evict, Redis refuses the `XADD` with an
-out-of-memory error, and the fallback above takes over.
+evicted, and its bound keeps it from crowding out the keys that can be.
+Should Redis still reach its limit with nothing left to evict, it refuses
+every write: the click's (the fallback above takes over), but also the rate
+limiter's, so the limits fail open, and the cache's, so the cache stops
+working until there is room again.
 
 #### Redis restarts: persistence
 
@@ -1943,6 +1967,9 @@ heartbeat module takes 0.15 s.
   No threads, no timing, the same result every run.
 - **A race, made likely.** Two threads drain 300 clicks with a batch size of
   7, so they collide again and again: every link must end up at exactly 100.
+- **A bound, without a million clicks.** The tests lower `MAX_WAITING_CLICKS`
+  to 1 or 2 with `monkeypatch`: at the bound, a click is counted in
+  PostgreSQL at once, and the circuit breaker stays shut.
 - **The checkpoint's birth.** Two workers starting together both find no
   checkpoint and both insert one. A SQLAlchemy `before_flush` event inserts
   the row from "another worker" just before ours: one row, no error.

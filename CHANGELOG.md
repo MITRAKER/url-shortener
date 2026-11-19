@@ -22,7 +22,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   crash at any moment, or a second worker, can't count a click twice or
   lose one. Counted clicks are then removed from the stream.
 - When Redis can't take a click (not configured, down, or full), it is
-  counted in PostgreSQL at once, as before.
+  counted in PostgreSQL at once, as before. So is a click that finds a
+  million clicks already waiting: the stream stops there (about 21 MB), so
+  that a long worker outage can't fill Redis, whose cache and rate limits
+  share its 64 MB.
 - A health check for the worker: it touches a heartbeat file on every round,
   and `python -m app.heartbeat` checks that the last one is recent.
 - CI checks that clicks wait while the worker is stopped, and survive a
