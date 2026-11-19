@@ -79,8 +79,11 @@ hashes.
 | Lint, format, types, Power of Ten | All pre-commit hooks on every file |
 | Tests (SQLite + fake Redis), Tests (PostgreSQL + Redis) | The test suite on both setups; fails below 95% branch coverage |
 | Dependency vulnerability audit | `pip-audit` against the Python vulnerability database |
-| Docker build and smoke test | Builds the image, starts the stack (migrations, Nginx, 3 instances, the click worker), runs `scripts/smoke_test.py`, checks that clicks wait while the worker is stopped and survive a Redis restart, checks that Nginx uses all 3 instances, then stops one and checks that no request fails |
+| Docker build and smoke test | Checks Prometheus's configuration and runs the alerts' tests (`make monitoring-check`). Builds the image, starts the stack (migrations, Nginx, 3 instances, the click worker, Prometheus, Grafana), runs `scripts/smoke_test.py`, checks that clicks wait while the worker is stopped and survive a Redis restart, checks that Prometheus collects every instance and the worker, that every rule works and every dashboard query runs (`scripts/check_metrics.py`), runs the load test for 10 seconds, checks that Nginx uses all 3 instances, then stops one and checks that no request fails |
 | CodeQL | Security analysis of the Python code and of the workflows |
+
+A longer load test runs only when asked: Actions, Load test, Run workflow
+(`.github/workflows/loadtest.yml`), or `make loadtest` on your machine.
 
 ## Releasing
 

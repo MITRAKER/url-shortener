@@ -62,5 +62,11 @@ in a comment too. Today there are seven, all for Ruff:
 - **Tests:** every feature and every bug fix comes with a test. Branch coverage
   must stay at or above 95%. Tests must not print warnings.
 - **Time:** only timezone-aware datetimes, in UTC (Ruff `DTZ`).
+- **Metrics:** label values come only from short, fixed lists (route
+  templates, known methods, status codes), never from IDs, codes, URLs or
+  addresses: each new value is a new time series, held in memory. A new metric
+  comes with a test. Every alert has a section in `docs/RUNBOOK.md` and a test
+  in `monitoring/prometheus/alerts_test.yml` (`tests/test_monitoring.py`
+  checks both, and that every query names a metric that exists).
 - **Commits:** [Conventional Commits](https://www.conventionalcommits.org/),
   e.g. `feat: add rate limiting`, `fix: handle expired links`.

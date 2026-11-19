@@ -109,7 +109,12 @@ filterwarnings = ["error"]
 branch = true
 source = ["app", "scripts"]
 # Need a running stack: the CI "docker" job runs them against the real containers.
-omit = ["scripts/smoke_test.py", "scripts/check_instances.py", "scripts/check_clicks.py"]
+omit = [
+    "scripts/smoke_test.py",
+    "scripts/check_instances.py",
+    "scripts/check_clicks.py",
+    "scripts/check_metrics.py",
+]
 
 [tool.coverage.report]
 fail_under = 95

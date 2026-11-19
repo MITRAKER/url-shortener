@@ -1,0 +1,17 @@
+# Grafana reads this at startup: our Prometheus, as the default data source.
+# Provisioned, not clicked together: it is the same on every machine, and
+# kept in git. Grafana shows it read-only.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy # Grafana's server asks Prometheus, not your browser
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # The scrape interval (monitoring/prometheus/prometheus.yml). Panels
+      # use $__rate_interval, which needs it to pick a safe rate() window.
+      timeInterval: 15s
