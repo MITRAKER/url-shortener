@@ -464,9 +464,17 @@ has `timeout-minutes`.
 **Rule 3: no dynamic memory allocation after start-up.** In C, `malloc` can
 fail or fragment memory at the worst moment. Python allocates constantly, so we
 keep the *purpose*: **resources are bounded**. The connection pool has a fixed
-size, and every input has a maximum: URLs up to 2048 characters (new, with a
-test), aliases up to 32. Without a limit, one request with a 50 MB "URL" would
+size, and every input has a maximum: URLs up to 2048 characters (new, with
+tests), aliases up to 32. Without a limit, one request with a 50 MB "URL" would
 be stored, and later cached, forever.
+
+The limit must hold for what we store, not only for what we were sent.
+Pydantic normalizes a URL, which percent-encodes non-ASCII characters in the
+path: `é` (2 bytes in UTF-8) is stored as `%C3%A9` (6 characters). Its
+`max_length` counts the bytes of the input as typed, so on its own it accepted
+a 2048-byte URL made mostly of emoji, then stored it, and sent it back in
+`Location`, as 6104 characters. `app/schemas.py` keeps it as a cheap first
+check, then measures the normalized URL.
 
 There is a catch: Pydantic checks the URL only *after* FastAPI has read and
 parsed the whole request body. A 200 MB request would fill the server's memory

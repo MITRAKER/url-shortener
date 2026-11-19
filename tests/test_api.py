@@ -77,6 +77,21 @@ def test_url_length_is_limited(client: TestClient) -> None:
     assert client.post("/api/links", json={"url": longest + "a"}).status_code == 422
 
 
+@pytest.mark.parametrize("char", ["é", "😀"])  # 2 and 4 bytes in UTF-8
+def test_url_length_is_measured_as_stored(client: TestClient, char: str) -> None:
+    # Stored percent-encoded in the path, 3 characters per UTF-8 byte: "é" is "%C3%A9".
+    base = "https://example.com/"
+    longest = base + char * ((MAX_URL_LENGTH - len(base)) // (3 * len(char.encode())))
+    r = client.post("/api/links", json={"url": longest})
+    assert r.status_code == 201
+    assert len(r.json()["target_url"]) == MAX_URL_LENGTH
+    assert len(client.get(f"/{r.json()['code']}").headers["location"]) == MAX_URL_LENGTH
+
+    r = client.post("/api/links", json={"url": longest + char})  # under 2048 bytes as typed
+    assert r.status_code == 422
+    assert f"at most {MAX_URL_LENGTH} characters" in r.json()["detail"][0]["msg"]
+
+
 def test_largest_valid_body_fits_under_the_size_limit(client: TestClient) -> None:
     # Worst case: every character of a 2048-character URL written as a JSON
     # escape (6 bytes each). It must still fit.

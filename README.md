@@ -63,8 +63,9 @@ curl -X POST localhost:8000/api/links -H 'content-type: application/json' \
 curl -i localhost:8000/github
 ```
 
-Limits: URLs up to 2048 characters; aliases 3 to 32 characters of `A-Z a-z 0-9 _ -`;
-request bodies up to 16 KB (`413 Content Too Large` above that).
+Limits: URLs up to 2048 characters once normalized (an `é` in the path is
+stored as `%C3%A9`, 6 characters); aliases 3 to 32 characters of
+`A-Z a-z 0-9 _ -`; request bodies up to 16 KB (`413 Content Too Large` above that).
 
 ## Configuration
 

@@ -32,7 +32,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
-- URLs longer than 2048 characters are rejected with `422`.
+- URLs longer than 2048 characters are rejected with `422`. The length is
+  measured on the normalized URL that is stored and redirected to, where an
+  `é` in the path takes 6 characters (`%C3%A9`).
 - Waits on the database now have timeouts: connecting (5 s), waiting for a
   pooled connection (10 s), each SQL statement (5 s), each lock wait (2 s),
   and a dead network (TCP keepalives and `tcp_user_timeout`). They do not
