@@ -48,7 +48,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - `base62.encode` accepts 0 to 2^64 - 1 and uses a loop with a fixed bound;
   `base62.decode` rejects empty, too long or invalid input with `ValueError`.
 - The Docker image runs as a non-root user and has a health check.
-- Dependencies are installed from lock files with hashes (`requirements.txt`,
+- Dependencies, including the tools that the pre-commit hooks run, are
+  installed from lock files with hashes (`requirements.txt`,
   `requirements-dev.txt`, generated from `requirements*.in` with `make lock`),
   and the Docker base image is pinned by digest.
 - `make check` also runs the dependency audit, and actionlint checks workflow

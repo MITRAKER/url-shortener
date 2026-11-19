@@ -46,6 +46,11 @@ edit them by hand. To add or change a dependency, edit the `.in` file, run
 `pip-compile --upgrade-package <name>` with the options listed at the top of
 the `.txt` file.
 
+The pre-commit hooks follow the same rule: each one is a `repo: local` hook
+that runs a tool pinned in `requirements-dev.in`. Add a new hook the same way,
+not as a remote hook repository, which pre-commit would install without
+hashes.
+
 ## What CI checks
 
 | Job | What it does |

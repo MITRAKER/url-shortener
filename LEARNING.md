@@ -298,6 +298,18 @@ skips that check without a word. So `shellcheck-py` is pinned too.
 Extra hooks: `actionlint` checks the GitHub workflow files, `hadolint` checks
 the Dockerfile, `detect-private-key` stops you committing a secret key.
 
+Every hook in `.pre-commit-config.yaml` is a `repo: local` hook with
+`language: system`: pre-commit runs its command in your environment, where
+the tools from `requirements-dev.txt` are installed. That includes the file
+hygiene hooks such as `trailing-whitespace` and `check-yaml`, which come from
+the `pre-commit-hooks` package. The usual setup points pre-commit at the
+hooks' GitHub repository instead, by a tag such as `rev: v6.0.0`. pre-commit
+then clones that repository and installs it with pip, without hashes, taking
+whatever versions of its dependencies are newest at that moment. That code
+would escape our lock files, and a tag can be moved, as the next section
+shows. With local hooks pre-commit downloads nothing, so CI has nothing to
+cache for it.
+
 #### Supply-chain security: pip-audit, Dependabot, pinned actions
 
 Most code we run, we didn't write: it comes from dependencies. A **supply-chain

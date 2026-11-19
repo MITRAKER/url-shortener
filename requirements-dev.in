@@ -14,6 +14,9 @@ httpx2==2.16.2  # used by FastAPI's TestClient
 ruff==0.17.5
 mypy==2.4.1
 pre-commit==4.7.0
+# The file hygiene hooks in .pre-commit-config.yaml (trailing whitespace,
+# YAML syntax, private keys and more).
+pre-commit-hooks==6.0.0
 actionlint-py==1.7.12.25
 # actionlint checks the shell scripts in workflows only if it finds
 # shellcheck, so we pin it too: otherwise CI would check more than your laptop.
