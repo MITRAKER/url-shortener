@@ -22,8 +22,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   call waits at most 0.25 s, a timeout is never retried, and after 3 failures
   in a row a circuit breaker skips Redis for 5 seconds.
 - `REDIS_URL` is checked at startup, so a malformed URL stops the app instead
-  of failing every request. The error never repeats the value, which may
-  hold a password.
+  of failing every request. The error never shows the value or any part of
+  it, since it may hold a password.
 - Redis in Docker Compose (64 MB, LFU eviction) and in CI.
 - Lesson 3 in LEARNING.md: caching, rate limiting and graceful degradation.
 - CI pipeline on every pull request: Ruff lint and format, strict mypy, the

@@ -41,7 +41,17 @@ class Settings(BaseSettings):
         # every request later. Building a pool parses the URL but opens no
         # connection; it raises ValueError, e.g. for a missing redis:// scheme.
         if url:
-            redis.ConnectionPool.from_url(url)
+            try:
+                redis.ConnectionPool.from_url(url)
+            except ValueError:
+                # redis-py's message can quote part of the URL, and so part of
+                # the password: in redis://:abc#def@host, the parser stops at
+                # the '#' and reports "abc" as a bad port. So we never pass its
+                # message on.
+                raise ValueError(
+                    "not a valid redis://, rediss:// or unix:// URL"
+                    " (percent-encode special characters in the password)"
+                ) from None
         return url
 
 

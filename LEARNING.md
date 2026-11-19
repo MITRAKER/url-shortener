@@ -852,8 +852,15 @@ bad deploy never looks healthy.
 
 One more detail: that error ends up in the logs, and a URL can hold a password
 (`redis://:password@host`). By default, Pydantic's error message repeats the
-value it rejected, so `Settings` sets `hide_input_in_errors=True`: the message
-names the setting and the problem, never the value.
+value it rejected, so `Settings` sets `hide_input_in_errors=True`. A review
+showed that this was not enough, because redis-py's own message can quote part
+of the URL. In `redis://:S3cret#Pass@redis:6379/0`, the `#` in the password is
+not percent-encoded, so the parser stops there and takes `S3cret` for the
+port. The error read "Port could not be cast to integer value as 'S3cret'".
+A `/` or a `?` does the same, and generated passwords often contain a `/`.
+Now `_check_redis_url` catches redis-py's `ValueError` and raises its own,
+with a fixed message: it names the setting and the problem, never the value
+or any part of it.
 
 #### Making the cache visible
 

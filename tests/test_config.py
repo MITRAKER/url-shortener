@@ -46,10 +46,19 @@ def test_malformed_redis_url_stops_the_app_at_startup(monkeypatch: pytest.Monkey
         "redis//:hunter2@redis:6379/0",  # missing colon
         "http://:hunter2@redis:6379/0",  # wrong scheme
         "redis://:hunter2@redis:port/0",  # port is not a number
+        # A '#', '/' or '?' that is not percent-encoded: the parser stops
+        # there and reads the start of the password as the port.
+        "redis://:hun#ter2@redis:6379/0",
+        "redis://:hun/ter2@redis:6379/0",
+        "redis://:hun?ter2@redis:6379/0",
+        # A full-width '#': Python's URL parser quotes all of ":password@host:port".
+        "redis://:hun\uff03ter2@redis:6379/0",
     ],
 )
 def test_error_for_a_malformed_redis_url_does_not_show_the_password(url: str) -> None:
-    """The error is printed when the app stops, so it ends up in the logs."""
+    """The error is printed when the app stops, so it ends up in the logs.
+    Not even a part of the password may appear in it."""
     with pytest.raises(ValidationError, match="redis_url") as error:
         Settings(redis_url=url)
-    assert "hunter2" not in str(error.value)
+    assert "hun" not in str(error.value)
+    assert "ter2" not in str(error.value)
