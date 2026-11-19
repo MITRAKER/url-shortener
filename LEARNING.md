@@ -1618,7 +1618,7 @@ GET /abc1234 ─▶ Nginx ─▶ app ── XADD clicks:v1 * code abc1234 ──
 | `app/models.py`, migration `0003` | `click_checkpoints`: how far the worker got |
 | `docker-compose.yml` | The `worker` service; Redis keeps the stream on disk and never evicts it |
 | `scripts/check_clicks.py` | For CI: clicks wait while the worker is stopped, and survive a Redis restart |
-| `tests/test_clicks.py`, `tests/test_worker.py` | 32 tests: the redirect path, batching, every failure in between, two workers at once |
+| `tests/test_clicks.py`, `tests/test_worker.py` | 33 tests: the redirect path, batching, every failure in between, two workers at once |
 
 ### Part 1: Why take work off the request path?
 
@@ -1803,6 +1803,14 @@ logged**, but the checkpoint still moves past it. The alternative, stopping
 at it, would make it a **poison message**: the worker would read it, fail,
 read it again, forever, and no click behind it would ever be counted.
 
+The review found one we had missed: bytes that aren't UTF-8. Redis stores
+bytes, and redis-py, asked for `str`, decoded every reply strictly, so such
+an entry raised `UnicodeDecodeError` before our checks ever saw it. That is
+not a Redis error, so the worker crashed, started again, read the same
+entry, and crashed again: a poison message after all. Now `make_redis()`
+decodes with `encoding_errors="replace"`: the bad bytes become U+FFFD (�),
+and the entry fails validation like any other junk.
+
 #### The stream holds only what is left to count
 
 After each batch, `XTRIM ... MINID <the ID right after the last one counted>`
@@ -1939,8 +1947,8 @@ heartbeat module takes 0.15 s.
   checkpoint and both insert one. A SQLAlchemy `before_flush` event inserts
   the row from "another worker" just before ours: one row, no error.
 - **Shapes and junk.** Replies of other shapes (RESP3's dict, a broken entry)
-  raise; entries that aren't clicks are skipped without blocking the clicks
-  behind them.
+  raise; entries that aren't clicks, bytes that aren't UTF-8 among them, are
+  skipped without blocking the clicks behind them.
 - **The real stack, in CI.** The smoke test waits for its click to be counted;
   `scripts/check_clicks.py` checks clicks across a Redis restart.
 

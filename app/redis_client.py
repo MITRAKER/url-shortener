@@ -40,6 +40,12 @@ def make_redis(url: str, socket_timeout: float = SOCKET_TIMEOUT_SECONDS) -> redi
     return redis.Redis.from_url(
         url,
         decode_responses=True,  # give us str instead of bytes
+        # Redis stores bytes, and anyone who can write to it can store bytes
+        # that aren't UTF-8. Decoding them strictly raises UnicodeDecodeError,
+        # which is not a RedisError: one such entry in the click stream
+        # crashed the worker at every start. Replaced by U+FFFD instead, they
+        # fail validation like any other junk (app/worker.py).
+        encoding_errors="replace",
         # RESP2, the protocol whose reply shapes our code reads (app/worker.py
         # parses XREAD replies). Named here, so that a newer redis-py with
         # another default can't change them under us.

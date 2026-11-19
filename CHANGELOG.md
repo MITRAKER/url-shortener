@@ -41,6 +41,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   worker catches up.
 - The app asks redis-py for the RESP2 protocol by name, so a new default in
   a later redis-py can't change the shape of the replies it reads.
+- The app's Redis clients decode bytes that aren't UTF-8 as U+FFFD instead
+  of raising an error, so a stream entry holding such bytes is skipped as
+  junk instead of stopping the worker.
 
 ## [0.3.0] - 2026-11-18
 

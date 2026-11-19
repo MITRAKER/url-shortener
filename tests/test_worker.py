@@ -49,6 +49,14 @@ def click(client: redis.Redis, *codes: str) -> str:
     return ids[-1]
 
 
+def bytes_client(client: redis.Redis) -> redis.Redis:
+    """Another client of the same Redis, one that sends and returns bytes as
+    they are: what a program other than ours might use."""
+    pool = client.connection_pool
+    options = pool.connection_kwargs | {"decode_responses": False}
+    return redis.Redis(connection_pool=redis.ConnectionPool(pool.connection_class, **options))
+
+
 def clicks() -> dict[str, int]:
     with SessionLocal() as session:
         return dict(session.execute(select(Link.code, Link.clicks)).all())
@@ -116,6 +124,23 @@ def test_a_batch_of_nothing_but_junk_still_moves_the_checkpoint(
     assert click_worker.process_batch() == 1
     assert checkpoint() == last
     assert redis_client.xlen(STREAM) == 0
+
+
+def test_an_entry_that_is_not_utf8_is_skipped_too(
+    redis_client: redis.Redis, click_worker: ClickWorker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Redis stores bytes, so the stream can hold bytes that aren't UTF-8.
+    Decoded strictly, such an entry crashed the worker at every start, and no
+    click behind it was ever counted. make_redis decodes it to U+FFFD, and it
+    fails validation like any other junk."""
+    click(redis_client, FIRST)
+    with bytes_client(redis_client) as raw:
+        raw.xadd(STREAM, {"code": b"\xff\xfe"})
+    last = click(redis_client, SECOND)
+    assert click_worker.process_batch() == 3
+    assert clicks() == {FIRST: 1, SECOND: 1, THIRD: 0}
+    assert checkpoint() == last
+    assert "skipped 1 stream entries" in caplog.text
 
 
 # ------------------------------------------------ exactly once, anyway ----
