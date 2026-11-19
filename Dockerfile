@@ -26,10 +26,17 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
+# The app, its database migrations (app/migrations) and their configuration.
+COPY alembic.ini .
 COPY app ./app
 USER 10001:10001
 
 EXPOSE 8000
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --no-proxy-headers: the app itself decides whose X-Forwarded-For to believe
+# (TRUSTED_PROXIES, see app/main.py), so uvicorn must not rewrite it first.
+# --timeout-keep-alive 65: keep idle connections open longer than Nginx does
+# (60 s). Otherwise uvicorn could close one just as Nginx sends a request on it.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--no-proxy-headers", "--timeout-keep-alive", "65"]

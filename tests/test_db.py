@@ -8,7 +8,15 @@ import pytest
 from sqlalchemy import Engine, text
 from sqlalchemy.exc import OperationalError
 
-from app.db import LOCK_TIMEOUT_MS, STATEMENT_TIMEOUT_MS, engine, make_engine
+from app.db import (
+    KEEPALIVE_COUNT,
+    KEEPALIVE_IDLE_SECONDS,
+    KEEPALIVE_INTERVAL_SECONDS,
+    LOCK_TIMEOUT_MS,
+    STATEMENT_TIMEOUT_MS,
+    engine,
+    make_engine,
+)
 
 pytestmark = pytest.mark.skipif(
     engine.dialect.name != "postgresql", reason="needs PostgreSQL (set TEST_DATABASE_URL)"
@@ -33,6 +41,17 @@ def _setting(conn_engine: Engine, name: str) -> str:
 def test_every_session_has_query_and_lock_timeouts(pg_engine: Engine) -> None:
     assert _setting(pg_engine, "statement_timeout") == str(STATEMENT_TIMEOUT_MS)
     assert _setting(pg_engine, "lock_timeout") == str(LOCK_TIMEOUT_MS)
+
+
+def test_every_session_asks_the_server_for_keepalives(pg_engine: Engine) -> None:
+    """A client whose machine loses power closes nothing, so PostgreSQL only
+    notices through its own TCP keepalives. With these, it ends the session,
+    and frees the instance number the session leased, after about 25 s; with
+    the system defaults, after over 2 hours. (Over TCP, as in CI: a session on
+    a Unix socket has no keepalives, and reads 0 for all three.)"""
+    assert _setting(pg_engine, "tcp_keepalives_idle") == str(KEEPALIVE_IDLE_SECONDS)
+    assert _setting(pg_engine, "tcp_keepalives_interval") == str(KEEPALIVE_INTERVAL_SECONDS)
+    assert _setting(pg_engine, "tcp_keepalives_count") == str(KEEPALIVE_COUNT)
 
 
 def test_waiting_for_a_lock_fails_instead_of_hanging(pg_engine: Engine) -> None:

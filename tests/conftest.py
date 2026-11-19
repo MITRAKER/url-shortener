@@ -6,19 +6,35 @@ import pytest
 import redis
 from fastapi.testclient import TestClient
 
-from tests.fakes import SilentServer
+from app.ids import EPOCH_SECONDS, CodeCipher, LinkIds, Snowflake
+from tests.fakes import NGINX, FakeClock, SilentServer
 
 # Tests use TEST_DATABASE_URL if set (CI points it at real Postgres),
 # otherwise a throwaway SQLite file.
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL") or "sqlite:///./test.db"
 # Likewise, TEST_REDIS_URL selects a real Redis; otherwise an in-memory fake.
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL")
+# As in docker-compose.yml: believe X-Forwarded-For only from Nginx.
+os.environ["TRUSTED_PROXIES"] = NGINX
+# A key of our own, so the app does not warn about the public default.
+TEST_CODE_SECRET = "a-secret-for-the-tests-only"  # noqa: S105 - a test value
+os.environ["CODE_SECRET"] = TEST_CODE_SECRET
 
 # The app reads its settings when it is imported, so these imports must come
 # after the environment variables above are set (hence noqa: E402).
 from app.db import Base, engine  # noqa: E402
-from app.main import app  # noqa: E402
+from app.main import app, get_ids  # noqa: E402
 from app.redis_client import RedisGateway, get_redis, make_redis  # noqa: E402
+
+
+def make_ids(instance_id: int = 0) -> LinkIds:
+    """IDs on a fake clock. A real Snowflake waits up to a second before its
+    first ID (see app/ids.py); this one only pretends to."""
+    clock = FakeClock()
+    snowflake = Snowflake(
+        instance_id, wall=lambda: EPOCH_SECONDS + 1_000.5, monotonic=clock, sleep=clock.sleep
+    )
+    return LinkIds(snowflake, CodeCipher(TEST_CODE_SECRET))
 
 
 @pytest.fixture
@@ -40,6 +56,8 @@ def _client_with(redis_client: redis.Redis | None) -> Iterator[TestClient]:
     # One gateway (and so one circuit breaker) shared by every request of the test.
     gateway = None if redis_client is None else RedisGateway(redis_client)
     app.dependency_overrides[get_redis] = lambda: gateway
+    ids = make_ids()
+    app.dependency_overrides[get_ids] = lambda: ids
     try:
         with TestClient(app, follow_redirects=False) as c:
             yield c

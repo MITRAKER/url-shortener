@@ -4,22 +4,10 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from app.breaker import CircuitBreaker
+from tests.fakes import FakeClock
 
 THRESHOLD = 3
 RESET_AFTER = 5.0
-
-
-class FakeClock:
-    """A clock the test moves by hand, so no test has to sleep."""
-
-    def __init__(self) -> None:
-        self.now = 1000.0
-
-    def __call__(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
 
 
 @pytest.fixture

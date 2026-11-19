@@ -8,6 +8,8 @@ with **exercises** so you can practise building it yourself.
 - [Lesson 2: Engineering like a professional team](#lesson-2-engineering-like-a-professional-team)
   (CI/CD, code quality, security scanning, NASA/JPL's Power of Ten)
 - [Lesson 3: Caching and rate limiting](#lesson-3-caching-and-rate-limiting) (step 2)
+- [Lesson 4: Many instances, one service](#lesson-4-many-instances-one-service) (step 3:
+  load balancing, distributed IDs, migrations)
 
 ---
 
@@ -64,7 +66,7 @@ There are three classic strategies:
 |----------|-----|------|------|
 | Hash the URL (MD5 → first 7 chars) | Deterministic | Same URL → same code | Collisions still possible; can't have two codes for one URL |
 | Counter (auto-increment ID → base62) | `id=125 → "21"` | Never collides | Codes are guessable (`/21`, `/22` …); needs one central counter |
-| **Random + retry** (what we use) | Random 7 chars, insert, retry on conflict | Unguessable; no coordination | Tiny chance of retry |
+| **Random + retry** (steps 1 and 2) | Random 7 chars, insert, retry on conflict | Unguessable; no coordination | Tiny chance of retry |
 
 The important detail is **how** we check for collisions. A naive version is:
 
@@ -80,6 +82,11 @@ truth, so this stays correct even with many servers (which matters in step 3).
 
 How often will we retry? With `n` links stored, the chance a random code is
 taken is `n / 62^7`. Even with 10 million links that is `0.0003%`.
+
+> Step 3 replaces random codes with IDs that can't collide in the first
+> place, made by each server on its own, and scrambled so they stay
+> unguessable. [Lesson 4](#part-2-unique-ids-without-asking-anyone) explains
+> how, and why the database's `UNIQUE` constraint still stays.
 
 #### 3. Atomic counters (no lost updates)
 
@@ -316,16 +323,17 @@ cache for it.
 Most code we run, we didn't write: it comes from dependencies. A **supply-chain
 attack** hides malicious code in one of them.
 
-- **Lock files with hashes.** `requirements.in` lists the 7 packages the app
-  imports. Those need about 18 more (Starlette, anyio, h11, ...). Pinning only
-  the direct ones, as this repo first did, still lets pip pick the newest version of the
-  other 18 at install time, so CI, the Docker build and your laptop could each
-  get different code. `pip-compile` (from pip-tools) resolves the whole tree
-  once and writes `requirements.txt`: every package at an exact version, plus
-  the SHA-256 hash of every file pip may download for it. `pip install
-  --require-hashes` refuses any file whose hash differs, so a package that was
-  tampered with, or quietly re-uploaded, cannot get in. You edit the `.in`
-  files and run `make lock`; Dependabot does the same for updates.
+- **Lock files with hashes.** `requirements.in` lists the handful of packages
+  the app imports. Those need about twenty more (Starlette, anyio, h11, ...).
+  Pinning only the direct ones, as this repo first did, still lets pip pick the
+  newest version of all the others at install time, so CI, the Docker build
+  and your laptop could each get different code. `pip-compile` (from
+  pip-tools) resolves the whole tree once and writes `requirements.txt`: every
+  package at an exact version, plus the SHA-256 hash of every file pip may
+  download for it. `pip install --require-hashes` refuses any file whose hash
+  differs, so a package that was tampered with, or quietly re-uploaded, cannot
+  get in. You edit the `.in` files and run `make lock`; Dependabot does the
+  same for updates.
 - **The base image pinned by digest:** `FROM python:3.13-slim@sha256:e48f…`.
   `3.13-slim` is a moving name: Docker rebuilds it for every Python patch and
   every Debian security fix. The digest is the hash of one exact image, so the
@@ -1154,3 +1162,586 @@ docker compose unpause redis
 
 **Next:** step 3 runs three instances of the app behind an Nginx load
 balancer, and replaces random codes with distributed, collision-free IDs.
+
+---
+
+## Lesson 4: Many instances, one service
+
+Step 3 runs three copies of the app, called **instances**, behind an **Nginx**
+load balancer. Two problems appear the moment there is more than one copy:
+which instance answers each request (**load balancing**), and how instances
+that never talk to each other avoid handing out the same short code
+(**distributed IDs**). A third follows from the first: three instances can't
+each create the tables when they start, so the schema now changes through
+**migrations**.
+
+### What we built
+
+```
+                            ┌──▶ app, instance 0 ──┐
+client ──▶ Nginx :8000 ─────┼──▶ app, instance 1 ──┼──▶ Redis       cache and rate limits, shared
+           round robin,     └──▶ app, instance 2 ──┴──▶ PostgreSQL  links, shared; instance numbers, leased
+           retries, timeouts
+
+POST /api/links, answered by instance 1:
+  ID   = | seconds since 2026 | instance 1 | sequence |   made locally: nobody was asked
+  code = Feistel(ID, CODE_SECRET) = "z4qLsrbd"           8 characters, unique, unguessable
+  INSERT ...                                             the UNIQUE constraints still have the last word
+```
+
+| File | What's new |
+|------|------------|
+| `nginx/default.conf` | The load balancer: round robin, finding instances by DNS, timeouts, retries, keepalive, the client's address |
+| `docker-compose.yml` | Nginx in front, `replicas: 3`, a one-shot `migrate` service, a fixed address for Nginx |
+| `app/ids.py` | `Snowflake` makes IDs, `CodeCipher` turns an ID into a code and back |
+| `app/instances.py` | Instance numbers leased from PostgreSQL, and a watchdog that notices a lost lease |
+| `app/migrations/` | The schema as versioned migration scripts (Alembic) |
+| `app/main.py` | The lease at startup, the proxy header middleware, the instance number in `/health` |
+| `app/service.py` | `create_link` uses the IDs; the retry loop is now only a safety net |
+| `app/config.py` | `CODE_SECRET` and `TRUSTED_PROXIES` |
+| `scripts/check_instances.py` | For CI: does Nginx use every instance, and does losing one lose requests? |
+| `tests/test_ids.py`, `test_instances.py`, `test_migrations.py`, `test_proxy.py` | 65 more tests than step 2 |
+
+### Part 1: Load balancing
+
+#### Why run more than one copy?
+
+- **Capacity.** One Python process runs Python code on one CPU core at a time
+  (the GIL). More processes use more cores, and more machines go further.
+- **Availability.** With one copy, every crash, deploy or reboot is an outage.
+  With three, one can die and the service stays up.
+- **Deploys without downtime.** Replace the instances one at a time (a
+  *rolling deploy*) and users never notice.
+
+#### The rule that makes it work: stateless instances
+
+The load balancer may send each request to any instance, so an instance must
+keep nothing that a later request needs: no sessions in memory, no files on
+its own disk. Everything shared lives in PostgreSQL and Redis.
+
+Step 2's design pays off here. The rate limiter keeps its buckets in Redis,
+so a client gets 10 link creations per minute in total, not 10 per instance.
+Some state is per instance on purpose, and that's fine: the circuit breaker's
+opinion of Redis, the connection pools.
+
+#### How Nginx chooses an instance
+
+| Algorithm | How | Good for | Watch out for |
+|-----------|-----|----------|---------------|
+| **Round robin** (ours) | 0, 1, 2, 0, 1, 2 ... | Identical instances, short similar requests | A slow instance gets as many requests as a fast one |
+| Weighted round robin | Bigger machines get more turns | Mixed hardware | Weights to maintain |
+| Least connections (`least_conn`) | The instance with the fewest requests in progress | Requests of very different lengths | Nginx must share the counts between its workers (our `zone`) |
+| Power of two choices | Pick two at random, send to the less busy | Many load balancers sharing traffic | |
+| Hashing (`hash $key consistent`) | The same client or key always goes to the same instance | Per-instance caches, "sticky" sessions | Uneven load. *Consistent* hashing moves only the leaving instance's keys |
+
+Our instances are identical and stateless, and our requests are short, so
+round robin it is. `/health` reports which instance answered, so you can
+watch it: 30 requests in CI come back 10, 10 and 10.
+
+Nginx works here at **layer 7** (HTTP): it reads each request, so it can retry
+it, set headers and log the path. A **layer 4** balancer (a cloud network
+load balancer, or Nginx's `stream` module) forwards TCP connections without
+reading them: faster, but it can't retry a request it never looked at.
+
+#### Finding the instances: DNS
+
+Compose gives the three replicas one name, `app`, and Docker's built-in DNS
+server (`127.0.0.11`) answers with all three addresses. A plain
+`server app:8000;` is resolved once, when Nginx starts: restart an instance,
+it gets a new address, and Nginx keeps knocking on the old one. So ours says:
+
+```nginx
+resolver 127.0.0.11 valid=10s;
+upstream app_instances {
+    zone app_instances 64k;              # the list lives in memory shared by all Nginx workers
+    server app:8000 resolve max_fails=3 fail_timeout=10s;
+}
+```
+
+`resolve` (in free Nginx since version 1.27.3) asks again every 10 seconds,
+so instances that come and go are picked up. That's **service discovery**:
+Kubernetes Services, Consul and cloud target groups solve the same problem.
+
+#### When an instance fails
+
+Free Nginx has **passive health checks**: it learns that an instance is down
+from real requests.
+
+- `proxy_connect_timeout 2s`: on the same network, a live instance accepts a
+  connection in well under a millisecond. Two seconds means it's gone.
+- `proxy_next_upstream error timeout`: when connecting fails or takes over
+  2 s, or the instance closes the connection before it answers, try the next
+  instance. `proxy_next_upstream_tries 2` and `proxy_next_upstream_timeout 10s`
+  limit the retries: a retry is a loop, and every loop needs a bound
+  (NASA/JPL rule 2). An instance that takes the request and then says nothing
+  for 30 s (`proxy_read_timeout`) is past those 10 s, so that request is not
+  retried: the client gets a `504`.
+- `max_fails=3 fail_timeout=10s`: after 3 failures within 10 seconds, leave
+  that instance out for 10 seconds, then give it another chance.
+
+Which requests are retried? Nginx never retries a `POST` that already reached
+an instance: creating a link twice is not safe (lesson 3: retry only what is
+idempotent). A `POST` that could not even connect *is* retried: no instance
+ever saw it.
+
+**Active health checks** poll `/health` in the background instead (HAProxy,
+Nginx Plus, Kubernetes readiness probes). Free Nginx doesn't have them, but
+Docker's `HEALTHCHECK` and `depends_on: condition: service_healthy` keep Nginx
+from starting before the instances are ready.
+
+We measured it: while a client sent requests nonstop, we stopped one
+instance, four times over. Of 1,741 requests, none failed. A few took 2.0
+seconds: they went to the stopped instance, waited out the connect timeout,
+and were retried on another. CI repeats a shorter version on every pull
+request.
+
+#### A race we found later: the list changes under a retry
+
+CI's version found what our measurement missed. CI sends its requests
+*after* `docker stop` has finished, so there is no moment when the stopping
+instance still refuses connections at once: every request sent its way
+waits out the 2-second connect timeout. If `resolve` asks DNS again during
+that wait, the list of instances changes under the request. Nginx then
+doesn't pick the retry from the new list: it answers 502, and its log says
+`no live upstreams`, although two instances are up. We ran CI's sequence 8
+times: 7 runs had one 502 each.
+
+The fix is a second chance for what is safe to repeat:
+
+```nginx
+location / {
+    proxy_pass http://app_instances;
+    error_page 502 = @once_more;   # a 502 made by Nginx: no instance answered
+}
+location @once_more {
+    if ($request_method !~ ^(GET|HEAD)$) {
+        return 502;                # a POST is never asked twice
+    }
+    proxy_pass http://app_instances;   # a fresh try, with the new list
+    proxy_next_upstream_tries 1;       # one try, not 2 more
+}
+```
+
+The proxy settings moved up to the `server` block, so both locations share
+them, all but one: the second chance makes a single try. So a `GET` or `HEAD`
+reaches the instances at most 3 times, 2 tries and then 1. After the fix, CI's
+sequence ran 11 times without a single 502. And to be sure the changing list
+was the trigger, we ran the old configuration with DNS asked only every 5
+minutes (`valid=300s`): 4 runs, no 502 either. Two lessons in one: the same
+failure can be harmless or not depending on *when* requests arrive, so test
+more than one timing; and a second chance is only for requests that are safe
+to repeat. (Is a `GET` safe? In HTTP's terms, yes. Ours counts a click, the
+one side effect we accept repeating. "No instance answered" doesn't mean no
+instance received the request: one may count the click and die before it
+answers. With 3 tries, a click can be counted up to 3 times.)
+
+A later review found that our first version of `@once_more` had no
+`proxy_next_upstream_tries` of its own. It inherited the `server` block's 2,
+so a `GET` could reach the instances 4 times, not 3. A setting made once for
+every location applies to every location, wanted or not. With the single try,
+we replayed the race with stand-in instances, 10 runs each way: without the
+second chance, 4 runs had a 502; with it, the race struck in 8 runs and every
+request succeeded.
+
+#### Keepalive, and a race at the edge of a timeout
+
+A new TCP connection per request costs a round trip, so Nginx keeps
+connections to the instances open and reuses them: `keepalive 16` (idle
+connections kept per Nginx worker), with `proxy_http_version 1.1` and
+`proxy_set_header Connection ""` (HTTP/1.0, or `Connection: close`, would end
+each connection after one request).
+
+Reuse has a classic race. The server closes an idle connection at the very
+moment the proxy sends a new request on it, and the request fails with a 502.
+The fix is an ordering of timeouts: **the server must wait longer than the
+proxy.** Nginx closes idle connections to the app after 60 seconds
+(`keepalive_timeout 60s`), uvicorn after 65 (`--timeout-keep-alive 65`; its
+default is 5!). So Nginx always closes first. The same rule holds between a
+cloud load balancer and Nginx.
+
+#### Who is the client?
+
+Behind Nginx, every request comes from Nginx's address, so all clients would
+share one rate-limit bucket (lesson 3 warned about this). Nginx passes the
+real address in the `X-Forwarded-For` header. But anyone can send that
+header, so it may be believed only when it comes from our own proxy.
+
+- **Nginx** *replaces* the header: `proxy_set_header X-Forwarded-For $remote_addr;`.
+  The common `$proxy_add_x_forwarded_for` *appends* to whatever the client
+  sent, which keeps a forgery at the front.
+- **The app** runs uvicorn's `ProxyHeadersMiddleware` with
+  `TRUSTED_PROXIES=10.89.0.10`. It reads the header only on requests from that
+  address, and takes the **rightmost** address that isn't a trusted proxy: the
+  left end of the header is whatever the client wrote. `TRUSTED_PROXIES="*"`
+  would take the leftmost, so anyone could choose their own address and dodge
+  their limit. The setting accepts only addresses and networks, so `*` (and
+  any typo) stops the app at startup. So does `10.89.0.10/24`, an address
+  with a prefix length (`docker network inspect` prints addresses that way):
+  uvicorn would quietly ignore it, and every client would share Nginx's rate
+  limit. A network is written `10.89.0.0/24`.
+- **Compose** gives Nginx a fixed address, 10.89.0.10, and hands out addresses
+  to other containers only from 10.89.0.128 up (`ip_range`), so no other
+  container can ever get Nginx's.
+- **The instances publish no ports**: the only way in is through Nginx. And
+  `--no-proxy-headers` turns off uvicorn's own handling of the header, so
+  exactly one place decides whom to believe.
+
+`tests/test_proxy.py` checks all of it: one bucket per client behind Nginx,
+the header ignored from anyone else, and a forged address in front ignored.
+
+Nginx should pass on one more header: `Host`, the name and port the client
+asked for. Left to itself, Nginx would send the name its configuration gives
+the instances, `app_instances`. (Our redirects would survive that:
+`proxy_redirect`, on by default, rewrites a `Location` that starts with
+`http://app_instances/` to the address the client used. But the app would
+have the wrong idea of its own address.) `proxy_set_header Host $http_host;` passes on
+what the client sent, port included. The app uses it to build the few
+redirects that point back at itself: `/docs/` sends you to `/docs`, on the
+host and port you used. Our first version used the common `$host`, which
+drops the port: `http://localhost:8000/docs/` sent you to
+`http://localhost/docs`, on port 80, where the app isn't. The smoke test now
+checks one such redirect.
+
+### Part 2: Unique IDs without asking anyone
+
+#### The problem with random codes
+
+Until now, a new link got a random 7-character code; if the database already
+had it, we tried another. That is correct with any number of instances (the
+database's `UNIQUE` constraint decides), but look at the numbers.
+
+There are 62^7 ≈ 3.5 trillion codes. With 10 million links stored, a new
+code is taken with probability 0.0003%: rare. But the chance that *some* two
+codes ever collide passes 50% after only about 2.2 million links. That's the
+**birthday paradox**: `P ≈ 1 − e^(−k²/2N)` for `k` codes out of `N`. So
+collisions are rare per request and certain over the life of the service,
+each costs a failed `INSERT`, and they get more frequent as the table fills.
+
+| Approach | Unique? | Coordination | Short? | Guessable? |
+|----------|---------|--------------|--------|------------|
+| Database sequence (`BIGSERIAL`) | Yes | Every insert asks the one database for a number | Yes | Yes: `/21`, `/22` ... |
+| UUID v4 (122 random bits) | In practice | None | No: 22 base62 characters | No |
+| Random code, retry on conflict (steps 1 and 2) | After a retry | The database settles conflicts | Yes | No |
+| Ticket server, or blocks of IDs (Flickr) | Yes | Ask a central server, per ID or per block | Yes | Yes |
+| **Snowflake ID + a keyed permutation** (ours) | By construction | Once, at startup, for an instance number | Yes: 8 characters | No |
+
+#### Snowflake IDs
+
+Twitter's idea (2010): put side by side three numbers that together can never
+repeat.
+
+```
+| 31 bits: seconds since 2026-01-01 | 6 bits: instance number | 10 bits: sequence |
+  only moves forward                  no two running instances  counts up within
+                                      share one                 one second
+```
+
+- Same instance, same second: different sequence numbers. Different
+  instances: different instance numbers. Different seconds: different times.
+  So two IDs are never equal, and nobody had to be asked.
+- 47 bits make 2^47 ≈ 1.4 × 10^14 IDs, which fit in 8 base62 characters
+  (62^8 ≈ 2.2 × 10^14). That's why ours has 47 bits and Twitter's has 64 (41
+  bits of milliseconds, 10 of machine, 12 of sequence): we traded millisecond
+  timestamps for short links.
+- The limits: 64 instances, 1024 IDs per second each (65,536 per second in
+  total), until 19 January 2094. An instance that hands out 1024 IDs in one
+  second makes the next request wait for the next second (under a second):
+  back pressure instead of an error.
+- IDs sort by creation time. New rows land at the right edge of the primary
+  key's index, where the page is already in memory; random UUIDs (v4) write
+  all over the index. UUID v7 (RFC 9562, 2024) standardises the same idea.
+- `parse_id` takes an ID apart: when, which instance, which sequence. Handy
+  when debugging.
+
+#### Time is harder than it looks
+
+- **The wall clock can go backwards.** NTP corrects drift, or someone sets the
+  clock, and a second that runs twice could repeat IDs. So the wall clock is
+  read once, at startup; from then on, time is that reading plus the
+  **monotonic** clock (`time.monotonic()`), which never goes backwards.
+- **Restarts.** A process that stops, and a new one with the same instance
+  number in the same second, could repeat (second, sequence) pairs. So a new
+  `Snowflake` counts the current second as used up, and its first ID waits for
+  the next second: under a second, once per start.
+- **A clock far off** (before 2026, after 2094) stops the app at startup with
+  a `ClockError`. Failing loudly beats making IDs that sort wrong or overflow.
+- **What's not covered:** a clock that is *behind* the previous run by more
+  than a second when the instance restarts. Its IDs could repeat old ones. The
+  `UNIQUE` constraints refuse them, the app retries with the next ID and logs a
+  warning, and after 5 tries answers 503. Exercise 3 closes this gap.
+- **Tests never sleep.** `Snowflake` takes its clocks and its `sleep` as
+  parameters, so `tests/test_ids.py` moves a fake clock by hand, as lesson 3
+  did for the circuit breaker.
+
+#### Instance numbers: a lease, not a setting
+
+Giving each instance its number in its configuration fails in practice. With
+`replicas: 3`, Compose gives all three the very same environment. And sooner
+or later, a copy-pasted configuration gives two machines the same number,
+which silently makes duplicate IDs. So each instance **leases** a free number
+from PostgreSQL when it starts:
+
+```sql
+SELECT pg_try_advisory_lock(1970433139, 0);   -- true: number 0 is ours
+SELECT pg_try_advisory_lock(1970433139, 1);   -- false would mean "taken": try the next
+```
+
+An **advisory lock** is a lock on numbers we choose; PostgreSQL attaches no
+meaning to them. The first number is a namespace, "urls" in ASCII
+(0x75726C73, which is 1970433139), so our locks never clash with another
+app's. The lock belongs to the database **session**, and PostgreSQL releases
+it when the session ends: no clean-up job. A clean shutdown or a crash closes
+the connection, and the number is free at once. A machine that loses power, or
+a network that fails, closes nothing: PostgreSQL learns of it only through TCP
+**keepalives**, probes it sends on a connection that has gone quiet. Its
+defaults are the operating system's: on Linux, 2 hours of silence, then 9
+probes 75 s apart, about 2 h 11 min in all, while the number stays taken. So
+every session the app opens asks for a probe after 10 s of silence, then one
+every 5 s, and for the session to end after 3 go unanswered (`app/db.py`):
+about 25 s. That is the lease's real expiry. ZooKeeper's ephemeral nodes and
+etcd's leases are the same idea, with the expiry in plain sight: a session
+timeout, a TTL.
+
+Two details from building it:
+
+- SQLAlchemy opens a transaction for that `SELECT`, and left open, the session
+  would sit "idle in transaction" for the instance's whole life. Databases are
+  often set to end such sessions (`idle_in_transaction_session_timeout`), and
+  the lease would end with it: we tried. So the app commits right away. The
+  lock survives the commit because it belongs to the session, not the
+  transaction.
+- Advisory locks belong to one database. The first version of our tests
+  looked at `pg_locks` without saying which database, and saw the locks of the
+  Compose stack running next to the test database.
+
+**Leases can be lost.** The flip side of "the lock ends with the session": if
+PostgreSQL restarts, every session ends and every lock is released, while the
+instances keep running. A new instance could then lease number 0 while the
+old instance 0 is still using it. So each instance checks its session every 5
+seconds (`watch` in `app/instances.py`). When the check fails, it retires its
+`Snowflake` (no more IDs, so creating a link answers 503), and sends itself
+`SIGTERM`, the signal `docker stop` sends. uvicorn finishes the requests in
+progress and exits, and Docker starts it again (`restart: unless-stopped`)
+with a fresh lease. The same check covers a network that fails between an
+instance and PostgreSQL: the instance gives up within about 15 s (its next
+check, plus 10 s of `tcp_user_timeout`), before the server's keepalives free
+its number. We cut one off the network: it noticed after 14 s, and its number
+was free after 23.
+
+That's **crash-only design**: there is one well-tested way to start, and
+recovering is just starting again. We tried it with `docker compose restart
+db`: within 5 seconds every instance logged `lost instance number N`,
+restarted, and leased numbers 0, 1 and 2 again.
+
+For up to those 5 seconds, two instances could share a number; the `UNIQUE`
+constraints catch any duplicate. Every lease system has such a window:
+ZooKeeper sessions and etcd leases expire on a timer, and a process paused
+for a while may not know its lease is gone. The general fix is a **fencing
+token**: each lease carries a generation number that grows, every write
+carries it, and storage refuses writes from an older generation (see Martin
+Kleppmann's "How to do distributed locking").
+
+#### Codes: scrambling the ID with a Feistel network
+
+Writing the ID in base62 would give short, unique codes, but consecutive
+links would get consecutive codes:
+
+```
+ID               base62     our code
+1835008001024    wiZAz8k    mCZkN2ct
+1835008001025    wiZAz8l    z4qLsrbd
+1835008001026    wiZAz8m    4gEB6mN3
+1835008001027    wiZAz8n    OiS0UIuG
+```
+
+Anyone could walk through everybody's links, an **enumeration attack**. We
+need a function that scrambles numbers but never maps two of them to the same
+code: a **permutation** of all the codes, chosen by a secret key. That's what
+a block cipher is. AES works on 128-bit blocks, though, and our "block" is a
+number below 62^8: we need **format-preserving encryption**. The classic way
+to build one is a **Feistel network**:
+
+```
+split the number into halves L and R, each below 62^4
+repeat 10 times:
+    L, R = R, (L + F(round, R)) mod 62^4
+```
+
+`F` is a keyed hash (BLAKE2b, with a key made from `CODE_SECRET`). The trick:
+`F` itself doesn't need to be reversible. Each round passes `R` along
+unchanged, so it can be undone: `L = (new R − F(round, old R)) mod 62^4`. Undo
+the rounds in reverse order and the ID comes back (`decode`). So the whole
+thing is a permutation **whatever `F` is**: unique codes are guaranteed by the
+structure, not by luck. DES (1977) and NIST's FF1 format-preserving encryption
+are built this way; we use 10 rounds, as FF1 does. A code takes about 8
+microseconds to make.
+
+What follows from it:
+
+- IDs use 2^47 of the 62^8 codes (64%). Every ID gets its own code; the other
+  codes are never handed out, and asking for one is just a 404.
+- Every instance needs the same `CODE_SECRET`, and it must never change: a new
+  key would send new IDs to codes that old links already have (the `UNIQUE`
+  constraint would refuse them, as clashes). `test_codes_do_not_change_between_versions`
+  pins the algorithm for the same reason.
+- It hides the *order*, not the *existence*: one code tells you nothing about
+  the next. Guessing codes at random is still possible, and the rate limiter
+  and the negative cache (lesson 3) deal with that.
+- It is fine for unguessable links. It is not a substitute for real encryption
+  of secrets.
+- Aliases share the `code` column, so someone may choose, as an alias, the
+  code a future ID will get. That insert then fails, and the retry takes the
+  next ID (`test_a_code_that_clashes_with_an_alias_is_replaced`).
+
+#### The database still has the last word
+
+The `UNIQUE` constraints on `id` and `code` stay, and so does a short retry
+loop (5 tries). With working leases and clocks they never fire. When they do,
+something is wrong (a lost lease, a clock far behind), so every retry logs a
+warning, and after 5 the app answers 503. **Defense in depth**: the design
+makes duplicates impossible; the database makes them harmless.
+
+### Part 3: Migrations
+
+Until now, every instance ran `create_all()` when it started. With three
+instances, three processes would race to create the same tables. Worse,
+`create_all()` only creates what is missing; it never changes an existing
+table, and step 3 *had* to change one: IDs no longer come from a database
+sequence. So the schema now lives in versioned scripts, run by **Alembic**:
+
+- `0001_baseline.py`: the table as v0.2.0 made it. On a database from v0.2.0
+  it finds the table and does nothing (it *adopts* it); on an empty database it
+  creates it. That's a **baseline** migration.
+- `0002_ids_from_the_app.py`: removes the sequence that used to number links,
+  because the app chooses every ID now. Its `downgrade` puts the sequence back,
+  starting above the largest ID.
+
+Alembic records the version in a table (`alembic_version`) and applies only
+what is missing: `alembic upgrade head` (`make migrate`).
+
+- **When they run.** A one-shot `migrate` service in Compose runs the
+  migrations and exits; the instances wait for it
+  (`depends_on: condition: service_completed_successfully`).
+- **One at a time.** If two deploys start together, both run migrations.
+  `env.py` takes an advisory lock first, so the second run waits for the
+  first, then finds nothing left to do. It waits 2 seconds at most (the lock
+  timeout), then fails instead of hanging; run it again once the first is done.
+- **Timeouts.** A statement may run for 60 seconds, but waiting for a lock
+  stays at 2: a schema change queued behind a long query blocks every query
+  that arrives after it.
+- **Expand, then contract.** During a rolling deploy, old and new instances
+  run side by side, so every migration must work with both: add a column,
+  deploy code that uses it, and remove the old one a release later.
+
+Migration `0002` breaks that rule: it removes the sequence in the same
+release that stops using it, instead of a release later. A v0.2.0 instance
+that is still running afterwards can't create links: it leaves out the ID,
+the database refuses the row, and the instance answers 503 (or 409, "Alias
+is already taken", for an alias that is free). We accept that for this one
+upgrade because it can't be rolling anyway: Nginx takes over port 8000 from
+the single v0.2.0 instance, so that instance has to stop. Stop it before the
+migrations run: `docker compose down` (which keeps the database's volume),
+then `docker compose up --build`.
+
+`tests/test_migrations.py` checks that the migrations build exactly what the
+models describe (Alembic's autogenerate finds no difference), that each can be
+undone, that a v0.2.0 database is adopted with its links, that the SQL can be
+printed for review (`--sql`), and that a second run waits its turn. Each test
+starts by dropping every table it finds, not only the ones this step knows,
+so tables that a later step's tests left in the same database can't make it
+fail.
+
+### Testing it
+
+- **Fake clocks.** `Snowflake` takes `wall`, `monotonic` and `sleep` as
+  parameters, so the tests cross seconds and run out of IDs without waiting.
+- **Threads.** 4 instances × 4 threads ask for 8,000 IDs at once: all
+  different (and each instance runs out of a second's IDs along the way).
+- **Forcing clashes.** `monkeypatch` makes `LinkIds.new` hand out IDs and
+  codes that are already taken, to prove each retry path: an ID clash, a code
+  that clashes with an alias, and giving up after exactly 5 tries.
+- **PostgreSQL-only tests** (skipped on SQLite): instances get different
+  numbers; a number is free again when its instance stops, or when the server
+  ends its session (`pg_terminate_backend`, as its keepalives do once a machine
+  is gone); every session asks the server for those keepalives; the lease
+  leaves no transaction open; a second migration run waits its turn.
+- **Pretending to be Nginx.** `TestClient(app, client=("10.89.0.10", 40000))`
+  sends requests from Nginx's address.
+- **The real stack, in CI.** `scripts/check_instances.py` checks that 30
+  requests reach all 3 instances; then CI stops one with `docker stop`, and 30
+  more must all succeed.
+
+### Try it yourself
+
+```bash
+docker compose up --build
+for i in $(seq 6); do curl -s localhost:8000/health; echo; done    # instances 0, 1, 2, 0, 1, 2
+docker compose logs nginx | tail -6                                # upstream=...: the round robin
+docker compose exec db psql -U app -d shortener -c \
+  "SELECT objid AS instance, pid FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 2"
+
+curl -s -X POST localhost:8000/api/links -H 'content-type: application/json' -d '{"url":"https://example.com"}'
+docker compose exec db psql -U app -d shortener -c "SELECT id, code FROM links"
+docker compose exec --index 1 app python -c "from app.ids import parse_id; print(parse_id(<id>))"
+
+# Lose an instance: no request fails, a few wait 2 s for the retry.
+docker stop "$(docker compose ps --quiet app | head -n 1)"
+python -m scripts.check_instances http://localhost:8000 2
+docker compose up --detach                                         # three again
+
+# Lose the database: every instance gives up its number and restarts.
+docker compose restart db
+docker compose logs app | grep "lost instance number"
+
+# Migrations
+docker compose run --rm migrate alembic current
+docker compose run --rm migrate alembic upgrade head --sql | less
+```
+
+### Exercises
+
+1. **Least connections.** Pause one instance (`docker pause` on its
+   container: it accepts connections but never answers) and send requests
+   with a 5-second client timeout. Compare round robin with `least_conn`, then
+   lower `proxy_read_timeout`. What's the trade-off between a slow request and
+   a dead instance?
+2. **Faster failover.** Requests to a stopped instance wait for the 2-second
+   connect timeout. Why doesn't a stopped container refuse the connection at
+   once? Try `proxy_connect_timeout 200ms` and measure with
+   `scripts/check_instances.py`. What's the risk of a timeout that's too
+   short?
+3. **Close the clock gap.** When an instance leases a number, have it record
+   the last second it uses (a new table, with a migration), and refuse to
+   start if the clock reads earlier than the previous holder's last second.
+   Write the test first.
+4. **Fencing tokens.** Give every lease a generation number that grows, store
+   it with each link, and make the database refuse a write from a lease that
+   was taken over. Where would the check live?
+5. **Inspect a code.** Write `scripts/inspect_code.py`: given a code, print
+   when and on which instance it was created. Who should be allowed to run
+   it, and why?
+6. **More instances.** `docker compose up --scale app=5`. What does `/health`
+   show? What happens to a 65th instance?
+7. **A real migration.** Add a `last_clicked_at` column, following
+   CONTRIBUTING's "Database changes". Make sure old instances keep working
+   while new ones roll out.
+
+### Interview questions this lesson prepares you for
+
+- "How would you scale this service to 10 times the traffic?"
+- "Layer 4 or layer 7 load balancer: what's the difference?"
+- "Round robin, least connections, consistent hashing: when would you use each?"
+- "How does a load balancer know an instance is down? Active vs passive health checks."
+- "What can go wrong with keep-alive connections between a proxy and a server?"
+- "How do you get the client's real IP address behind a proxy, and how can it be spoofed?"
+- "Design a unique ID generator for a distributed system. Snowflake or UUIDs?"
+- "What happens to your ID generator when the clock goes backwards?"
+- "How do you give each worker a unique number without configuring it by hand?"
+- "What is a lease? What goes wrong when a process loses one without knowing? What's a fencing token?"
+- "How do you make short codes that are unique but can't be guessed?"
+- "Why are sequential IDs (or UUID v7) better primary keys than random UUIDs?"
+- "How do you change a database schema without downtime?"
+
+**Next:** step 4 takes click counting off the redirect path: each click
+becomes an event on a Redis stream, and a separate worker writes the counts
+to PostgreSQL in batches.

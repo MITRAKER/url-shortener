@@ -7,6 +7,65 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-18
+
+### Added
+
+- Three app instances behind an Nginx load balancer (round robin) in Docker
+  Compose. Nginx finds the instances through Docker's DNS and looks again
+  every 10 seconds. When an instance can't be reached, Nginx tries another
+  (2 tries at most), and leaves it out for 10 seconds after 3 failures. A
+  `GET` or `HEAD` that ends in a 502 made by Nginx itself (no instance
+  answered: one closed the connection mid-answer, or the list of instances
+  changed while it waited) is tried once more, so it reaches the instances
+  at most 3 times, and a click can be counted up to 3 times when instances
+  die mid-answer. A request that times out gets a 504 and no further try.
+  Nginx keeps connections to the instances open, and refuses request bodies
+  over 16 KB.
+- Snowflake IDs, made by each instance without asking anyone: 31 bits of
+  seconds since 2026, a 6-bit instance number and a 10-bit sequence (up to
+  1024 IDs per second per instance, 64 instances, until 2094). IDs sort by
+  creation time.
+- Instance numbers are leased from PostgreSQL with advisory locks when an
+  instance starts. Every 5 seconds the instance checks that it still holds
+  its number; if not (say, PostgreSQL restarted), it stops making IDs and
+  shuts down, and Docker starts it again with a new lease. A number is free
+  again as soon as its instance stops or crashes, or about 25 seconds after
+  its machine or network vanishes: the app asks PostgreSQL to probe its
+  sessions with TCP keepalives.
+- Codes are IDs scrambled by a keyed Feistel network (`CODE_SECRET`): unique
+  without retries, and impossible to guess from each other without the key.
+- `TRUSTED_PROXIES`: the app takes the client's address from
+  `X-Forwarded-For` only on requests from these proxies, so behind Nginx each
+  client gets its own rate limit, and nobody can choose their own address.
+- Database migrations with Alembic (`make migrate`; a one-shot `migrate`
+  service runs them in Docker Compose before the instances start). A database
+  created by v0.2.0 is adopted as it is. Only one migration run at a time.
+- `/health` reports which instance answered.
+- CI checks that Nginx spreads requests over all three instances, and that
+  stopping one loses no requests.
+- Lesson 4 in LEARNING.md: load balancing and distributed IDs.
+
+### Changed
+
+- Generated codes are 8 characters instead of 7.
+- The app no longer creates its tables at startup: run the migrations first.
+- Link IDs come from the app, not from a database sequence. The migration
+  that drops the sequence (0002) stops v0.2.0 instances from creating
+  links, so stop every v0.2.0 instance before the migrations run
+  (`docker compose down`, which keeps the database's volume).
+- In Docker Compose, the app instances can only be reached through Nginx, and
+  start again whenever they stop by themselves (`restart: unless-stopped`).
+- The app, not uvicorn, decides whom to trust with proxy headers
+  (`TRUSTED_PROXIES`). uvicorn keeps idle connections open for 65 seconds,
+  longer than Nginx does, so Nginx never reuses one the app is closing.
+
+### Removed
+
+- The `CODE_LENGTH` setting, and random codes with their insert-and-retry
+  loop. (Retries remain as a safety net, should the database ever refuse an
+  ID.)
+
 ## [0.2.0] - 2026-11-18
 
 ### Added
@@ -97,6 +156,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - GitHub Actions CI running the tests on SQLite and PostgreSQL.
 - Lesson 1 in LEARNING.md.
 
-[Unreleased]: https://github.com/MITRAKER/url-shortener/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/MITRAKER/url-shortener/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/MITRAKER/url-shortener/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MITRAKER/url-shortener/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MITRAKER/url-shortener/releases/tag/v0.1.0

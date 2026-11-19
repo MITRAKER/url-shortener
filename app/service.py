@@ -1,5 +1,6 @@
 """Business logic, kept separate from HTTP so it is easy to test and reuse."""
 
+import logging
 import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -8,18 +9,19 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import base62
 from app.cache import CachedLink, LinkCache, Lookup
-from app.config import settings
+from app.ids import LinkIds
 from app.models import Link
 from app.schemas import ALIAS_PATTERN
+
+log = logging.getLogger(__name__)
 
 # Codes that would clash with our own routes.
 RESERVED = frozenset({"api", "docs", "redoc", "health", "openapi.json", "favicon.ico"})
 # Upper bound for the insert-and-retry loop (NASA/JPL rule 2).
 MAX_ATTEMPTS = 5
 # Every code we hand out matches this: aliases are validated against it, and
-# random codes use a subset of the same characters.
+# generated codes use a subset of the same characters.
 CODE_PATTERN = re.compile(ALIAS_PATTERN)
 
 
@@ -27,8 +29,13 @@ class AliasTakenError(Exception):
     """The requested alias is reserved or already in use."""
 
 
-class CodeSpaceExhaustedError(Exception):
-    """No free random code was found within MAX_ATTEMPTS tries."""
+class IdClashError(Exception):
+    """MAX_ATTEMPTS new IDs in a row clashed with existing rows.
+
+    Should never happen: it means two instances share a number, or the clock
+    jumped back across a restart. The database refused the duplicates, so no
+    data is wrong, but something is misconfigured.
+    """
 
 
 class CacheStatus(StrEnum):
@@ -68,33 +75,40 @@ def _write_through(cache: LinkCache | None, link: Link) -> None:
         cache.set(link.code, CachedLink(link.target_url, expires_at))
 
 
+def _code_exists(session: Session, code: str) -> bool:
+    return session.scalar(select(Link.id).where(Link.code == code)) is not None
+
+
 def create_link(
     session: Session,
+    ids: LinkIds,
     url: str,
     alias: str | None = None,
     expires_in_days: int | None = None,
     cache: LinkCache | None = None,
 ) -> Link:
+    if alias is not None and alias.lower() in RESERVED:
+        raise AliasTakenError(alias)
     expires_at = datetime.now(UTC) + timedelta(days=expires_in_days) if expires_in_days else None
 
-    if alias is not None:
-        link = Link(code=alias, target_url=url, expires_at=expires_at)
-        if alias.lower() in RESERVED or not _insert(session, link):
-            raise AliasTakenError(alias)
-        _write_through(cache, link)
-        return link
-
-    # Random code + "insert and retry on conflict". We do NOT check-then-insert,
-    # because two requests could both see "free" and then both insert. The
-    # database's UNIQUE constraint is the single source of truth.
+    # Snowflake IDs and their codes are unique by construction, so the first
+    # INSERT succeeds. The database's UNIQUE constraints still have the last
+    # word: we never check-then-insert (two requests could both see "free"),
+    # we insert and look at the answer.
     for _ in range(MAX_ATTEMPTS):
-        link = Link(
-            code=base62.random_code(settings.code_length), target_url=url, expires_at=expires_at
-        )
+        link_id, code = ids.new()
+        code = code if alias is None else alias
+        link = Link(id=link_id, code=code, target_url=url, expires_at=expires_at)
         if _insert(session, link):
             _write_through(cache, link)
             return link
-    raise CodeSpaceExhaustedError
+        if alias is not None and _code_exists(session, alias):
+            raise AliasTakenError(alias)
+        # The ID or the generated code is already taken. A generated code can
+        # clash with an alias someone chose; anything else means trouble (see
+        # IdClashError). Either way, a new ID solves it.
+        log.warning("new link %d (code %r) clashed with an existing row, retrying", link_id, code)
+    raise IdClashError
 
 
 def get_link(session: Session, code: str) -> Link | None:
