@@ -2062,7 +2062,7 @@ for every click or two (Part 5).
 | `nginx/default.conf` | `/metrics` is refused from outside |
 | `scripts/check_metrics.py` | For CI: every target up, every rule working, every dashboard query valid |
 | `docs/BENCHMARKS.md` | Every step, measured with the same load test |
-| `tests/test_metrics.py`, `tests/test_monitoring.py` | 30 tests: each metric moves when it should; every query names metrics that exist |
+| `tests/test_metrics.py`, `tests/test_monitoring.py` | 32 tests: each metric moves when it should; every query names metrics that exist |
 
 ### Part 1: Metrics
 
@@ -2139,10 +2139,14 @@ a Prometheus server, and anyone on the internet could trigger ours.
 
 So every label value comes from a short, fixed list:
 
-- **route**: the route's *template*. Starlette's router leaves the route it
+- **route**: the route's *template*. FastAPI's router leaves the route it
   matched in the request's `scope` (the dictionary handed down through every
   middleware), and the middleware reads `scope["route"].path` once the app
-  has answered. A request that matched no route is `unmatched`.
+  has answered. It does that for our routes only: FastAPI's own pages
+  (`/docs`, `/redoc`, `/openapi.json`) are labelled with their paths, a
+  fixed list the middleware is given at startup. A request that matched no
+  route is `unmatched`: a 404 for `/no/such/page`, or the router's redirect
+  from `/health/` to `/health`.
 - **method**: one of the seven known methods, or `other`. Anyone can send a
   method called `FOOBAR`.
 - **status**: in practice, a dozen codes.
@@ -2624,8 +2628,9 @@ runs. And don't believe a difference you haven't seen twice.
 ### Testing it
 
 - **Each metric moves when it should** (`tests/test_metrics.py`): a 404 on a
-  short code is counted under `/{code}`, an unknown path under `unmatched`, a
-  crash as a 500, a strange method as `other`; a cache hit, a click through
+  short code is counted under `/{code}`, the API docs under their paths, an
+  unknown path and a redirect that drops a trailing slash under `unmatched`,
+  a crash as a 500, a strange method as `other`; a cache hit, a click through
   the stream or the database, a 429, three Redis errors and then a circuit
   open, which reads closed again once its cool-down is over, without a call;
   the pool collector, and the backlog with a click added 5 seconds in the

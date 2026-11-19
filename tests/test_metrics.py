@@ -123,6 +123,25 @@ def test_paths_that_match_no_route_share_one_label(client: TestClient) -> None:
     assert requests("GET", "unmatched", 404) == before + 3
 
 
+def test_the_api_docs_pages_are_counted_by_their_paths(client: TestClient) -> None:
+    """FastAPI's own pages are routes too, but its router doesn't leave them
+    in the scope as it does ours: the middleware is given their paths."""
+    pages = ["/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"]
+    before = [requests("GET", page, 200) for page in pages]
+    for page in pages:
+        assert client.get(page).status_code == 200
+    assert [requests("GET", page, 200) for page in pages] == [n + 1 for n in before]
+
+
+def test_a_redirect_that_drops_a_trailing_slash_is_unmatched(client: TestClient) -> None:
+    """/health/ and /docs/ match no route; the router answers them with a
+    redirect to the path without the slash."""
+    before = requests("GET", "unmatched", 307)
+    assert client.get("/health/").status_code == 307
+    assert client.get("/docs/").status_code == 307
+    assert requests("GET", "unmatched", 307) == before + 2
+
+
 def test_unknown_methods_share_one_label(client: TestClient) -> None:
     before = requests("other", "/health", 405)
     assert client.request("FOOBAR", "/health").status_code == 405

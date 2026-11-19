@@ -69,8 +69,12 @@ app.add_middleware(LimitBodySize)
 # request.client is the real client (the rate limiter counts per client).
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=settings.trusted_proxy_list)
 # Count and time every request (app/metrics.py). Added last, so it runs
-# first: it also sees the requests that the middleware above refuses.
-app.add_middleware(metrics.PrometheusMiddleware)
+# first: it also sees the requests that the middleware above refuses. It is
+# given the paths of FastAPI's own pages (the API docs), to label them.
+app.add_middleware(
+    metrics.PrometheusMiddleware,
+    docs_paths=[app.openapi_url, app.docs_url, app.swagger_ui_oauth2_redirect_url, app.redoc_url],
+)
 # How busy the connection pool is. PostgreSQL only: that is the server whose
 # connections run out (SQLite's pool, a file on this machine, sizes itself).
 if engine.dialect.name == "postgresql":

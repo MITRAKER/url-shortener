@@ -16,7 +16,7 @@ is a new time series held in memory, and anyone can send `GET /aaaa`, `GET
 
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from typing import Final
 
 import redis
@@ -45,7 +45,8 @@ log = logging.getLogger(__name__)
 __all__ = ["CONTENT_TYPE_LATEST", "REGISTRY", "generate_latest"]
 
 METRICS_PATH: Final = "/metrics"
-# Requests that matched no route (a 404 for /no/such/page) share one label.
+# Requests that matched no route share one label: a 404 for /no/such/page,
+# and the redirect from /health/ to /health, which the router sends itself.
 UNMATCHED: Final = "unmatched"
 KNOWN_METHODS: Final = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
 
@@ -169,12 +170,24 @@ class _StatusRecorder:
 class PrometheusMiddleware:
     """ASGI middleware: counts and times every HTTP request but /metrics.
 
-    The route label is the route's template ("/{code}"), which Starlette's
-    router leaves in the request's scope once it has picked a route.
+    The route label is the route's template ("/{code}"), which FastAPI's
+    router leaves in the request's scope once it has picked one of our
+    routes. It doesn't for FastAPI's own pages (/docs, /redoc,
+    /openapi.json), which are routes of another kind: those are labelled
+    with their paths, given as `docs_paths`.
     """
 
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, docs_paths: Iterable[str | None] = ()) -> None:
         self.app = app
+        # A fixed list, known at startup. None is a page switched off.
+        self.docs_paths = frozenset(path for path in docs_paths if path is not None)
+
+    def route_label(self, scope: Scope) -> str:
+        route = getattr(scope.get("route"), "path", None)
+        if route is not None:
+            return str(route)
+        path = str(scope["path"])
+        return path if path in self.docs_paths else UNMATCHED
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or scope["path"] == METRICS_PATH:
@@ -188,7 +201,7 @@ class PrometheusMiddleware:
         finally:
             IN_PROGRESS.dec()
             method = method_label(scope["method"])
-            route = str(getattr(scope.get("route"), "path", UNMATCHED))
+            route = self.route_label(scope)
             REQUESTS.labels(method, route, str(recorder.status)).inc()
             DURATION.labels(method, route).observe(time.perf_counter() - start)
 
