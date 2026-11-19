@@ -123,8 +123,11 @@ is lost.
 
 **Severity: ticket.** An instance stopped calling Redis after repeated
 failures (`app/breaker.py`). Redirects still work, from PostgreSQL, without
-the cache, rate limits or the click stream. The breaker tries again every 5
-seconds and closes by itself once Redis answers.
+the cache, rate limits or the click stream. After 5 seconds, the breaker lets
+the next call through, and closes if Redis answers. It doesn't try by itself:
+only a request makes that call. The gauge counts the circuit as open only
+while calls skip Redis, so an instance that gets no requests drops out of
+this alert after those 5 seconds.
 
 1. `docker compose ps redis`, `docker compose logs --tail 50 redis`.
 2. Slow rather than down? Every Redis call has 250 ms to answer

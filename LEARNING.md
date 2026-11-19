@@ -2062,7 +2062,7 @@ for every click or two (Part 5).
 | `nginx/default.conf` | `/metrics` is refused from outside |
 | `scripts/check_metrics.py` | For CI: every target up, every rule working, every dashboard query valid |
 | `docs/BENCHMARKS.md` | Every step, measured with the same load test |
-| `tests/test_metrics.py`, `tests/test_monitoring.py` | 29 tests: each metric moves when it should; every query names metrics that exist |
+| `tests/test_metrics.py`, `tests/test_monitoring.py` | 30 tests: each metric moves when it should; every query names metrics that exist |
 
 ### Part 1: Metrics
 
@@ -2194,6 +2194,11 @@ same idea. Ours:
   opens for 5 seconds and closes again between two scrapes never shows as
   open. So the breaker also counts how many times it opened: a counter can't
   miss it.
+- **A gauge worked out when asked** (`set_function`). The breaker's gauge
+  reads the breaker's clock at each scrape: 1 while calls skip Redis. Set
+  only when the state changed, it would still say "open" on an instance
+  without requests long after Redis came back, because only a call closes
+  the breaker.
 
 The worker answers no HTTP requests, so it has a registry of its own, served
 on port 8001 by `prometheus_client`'s small built-in server, on a thread:
@@ -2622,8 +2627,9 @@ runs. And don't believe a difference you haven't seen twice.
   short code is counted under `/{code}`, an unknown path under `unmatched`, a
   crash as a 500, a strange method as `other`; a cache hit, a click through
   the stream or the database, a 429, three Redis errors and then a circuit
-  open; the pool collector, and the backlog with a click added 5 seconds in
-  the past (a stream ID chosen by the test).
+  open, which reads closed again once its cool-down is over, without a call;
+  the pool collector, and the backlog with a click added 5 seconds in the
+  past (a stream ID chosen by the test).
 - **The worker's metrics**: batches, clicks counted, errors by system, and
   its own `/metrics` page, served on a free port. A fake stop event records
   every wait, to check the linger happens after a small batch only.

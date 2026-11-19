@@ -224,6 +224,19 @@ def test_the_circuit_breaker_reports_its_state() -> None:
     assert value("circuit_breaker_open", name="metrics-test") == 0
 
 
+def test_the_circuit_reads_closed_once_the_cool_down_is_over() -> None:
+    """After the cool-down, the breaker no longer skips Redis: it lets the
+    next call through. An instance that gets no request makes no call, and
+    must not report the circuit open for as long as it stays idle."""
+    clock = FakeClock()
+    breaker = CircuitBreaker("idle-test", failure_threshold=1, reset_after=5, clock=clock)
+    breaker.record_failure()
+    clock.advance(4.9)
+    assert value("circuit_breaker_open", name="idle-test") == 1
+    clock.advance(0.1)
+    assert value("circuit_breaker_open", name="idle-test") == 0  # without a single call
+
+
 # ------------------------------------------------------------ collectors ----
 
 
