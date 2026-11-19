@@ -15,6 +15,8 @@ from urllib.parse import urlsplit
 
 TIMEOUT_SECONDS = 5  # every network call has an upper bound (NASA/JPL rule 2)
 TARGET = "https://example.com/smoke-test"
+# Default create limit is 10/minute, so 20 attempts must hit it (bounded loop).
+MAX_CREATE_ATTEMPTS = 20
 
 
 class SmokeTestError(Exception):
@@ -53,10 +55,22 @@ def run(base_url: str) -> None:
     status, headers, _ = request(base_url, "GET", f"/{code}")
     expect(status == HTTPStatus.FOUND, f"GET /{code} returned {status}, expected 302")
     expect(headers.get("location") == TARGET, f"redirected to {headers.get('location')}")
+    # Proves Redis is connected: new links are cached on create.
+    expect(headers.get("x-cache") == "HIT", f"X-Cache was {headers.get('x-cache')}")
 
     status, _, body = request(base_url, "GET", f"/api/links/{code}")
     expect(status == HTTPStatus.OK, f"GET /api/links/{code} returned {status}")
     expect(json.loads(body)["clicks"] == 1, f"click was not counted: {body!r}")
+
+    expect(rate_limit_kicks_in(base_url), "never got 429 Too Many Requests")
+
+
+def rate_limit_kicks_in(base_url: str) -> bool:
+    for _ in range(MAX_CREATE_ATTEMPTS):
+        status, headers, _ = request(base_url, "POST", "/api/links", {"url": TARGET})
+        if status == HTTPStatus.TOO_MANY_REQUESTS:
+            return headers.get("retry-after", "").isdigit()
+    return False
 
 
 def main(argv: Sequence[str]) -> int:

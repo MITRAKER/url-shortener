@@ -1,10 +1,12 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+import redis
 from fastapi.testclient import TestClient
 from sqlalchemy import update
 
 from app import base62
+from app.cache import LinkCache
 from app.db import SessionLocal
 from app.limits import MAX_BODY_BYTES
 from app.models import Link
@@ -139,7 +141,7 @@ def test_expiry_is_reported(client: TestClient) -> None:
     assert timedelta(hours=23) < expires_at - datetime.now(UTC) <= timedelta(days=1)
 
 
-def test_expired_link_410(client: TestClient) -> None:
+def test_expired_link_410(client: TestClient, redis_client: redis.Redis) -> None:
     code = client.post(
         "/api/links", json={"url": "https://example.com", "expires_in_days": 1}
     ).json()["code"]
@@ -150,6 +152,9 @@ def test_expired_link_410(client: TestClient) -> None:
             .values(expires_at=datetime.now(UTC) - timedelta(seconds=1))
         )
         s.commit()
+    # We changed the database behind the cache's back, so drop the cached copy
+    # (test_cache.py shows what happens if you forget).
+    redis_client.delete(LinkCache.key(code))
     assert client.get(f"/{code}").status_code == 410
 
 

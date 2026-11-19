@@ -9,6 +9,7 @@
 pytest==9.2.0
 pytest-cov==7.1.0
 httpx2==2.16.2  # used by FastAPI's TestClient
+fakeredis[lua]==2.40.0  # in-memory Redis for tests, with Lua scripting
 
 # Code quality (same versions locally, in pre-commit and in CI)
 ruff==0.17.5
