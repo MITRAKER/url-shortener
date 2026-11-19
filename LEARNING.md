@@ -299,6 +299,18 @@ skips that check without a word. So `shellcheck-py` is pinned too.
 Extra hooks: `actionlint` checks the GitHub workflow files, `hadolint` checks
 the Dockerfile, `detect-private-key` stops you committing a secret key.
 
+Every hook in `.pre-commit-config.yaml` is a `repo: local` hook with
+`language: system`: pre-commit runs its command in your environment, where
+the tools from `requirements-dev.txt` are installed. That includes the file
+hygiene hooks such as `trailing-whitespace` and `check-yaml`, which come from
+the `pre-commit-hooks` package. The usual setup points pre-commit at the
+hooks' GitHub repository instead, by a tag such as `rev: v6.0.0`. pre-commit
+then clones that repository and installs it with pip, without hashes, taking
+whatever versions of its dependencies are newest at that moment. That code
+would escape our lock files, and a tag can be moved, as the next section
+shows. With local hooks pre-commit downloads nothing, so CI has nothing to
+cache for it.
+
 #### Supply-chain security: pip-audit, Dependabot, pinned actions
 
 Most code we run, we didn't write: it comes from dependencies. A **supply-chain
@@ -431,8 +443,8 @@ for _ in range(MAX_LENGTH):
 
 The distributed-systems version of this rule: **every wait has a timeout**.
 A network call without a timeout is an unbounded loop in disguise. Talking to
-Postgres involves four different waits, and each needs its own limit
-(see `app/db.py`):
+Postgres involves several different waits, and each needs its own limit
+(see `app/db.py`). One of them still has none:
 
 | Wait | Limit | What happens without it |
 |------|-------|-------------------------|
@@ -441,18 +453,44 @@ Postgres involves four different waits, and each needs its own limit
 | Running one SQL statement | `statement_timeout` = 5 s (Postgres cancels it) | One slow query holds a connection forever |
 | Waiting for a row lock | `lock_timeout` = 2 s | A transaction that holds a lock freezes everyone behind it |
 | A dead network | TCP keepalives and `tcp_user_timeout` | The server vanished, but we keep waiting for its answer |
+| A server that is alive but stuck (a paused container, a hung pooler or proxy) | **None** in the app | The request's thread and its pooled connection wait until the server answers |
 
-Our first version only had the first two. An independent review caught the
-gap: once a connection is open, nothing stopped a query from waiting forever
-for a lock. That is a lesson in itself: "we have timeouts" is not the same as
-"every wait has a timeout". Every CI job also has `timeout-minutes`.
+Each limit covers only its own case. `statement_timeout` and `lock_timeout`
+are enforced by Postgres itself, so they need a server that answers.
+Keepalives and `tcp_user_timeout` only notice a dead peer or network: they
+fire when the other machine stops acknowledging our packets, and the kernel of
+a machine whose Postgres is frozen still acknowledges them. (A paused VM is
+different: its own kernel stops too, nothing acknowledges our packets, and
+`tcp_user_timeout` ends the wait as it does for a dead network, unless a port
+forwarder on the host keeps answering for it.) libpq, the C library under
+psycopg, has no client-side read timeout. So nothing in the app
+bounds a query sent on an open connection to a server that is alive but stuck.
+(Opening a new connection to it still fails after 5 s: `connect_timeout`
+covers the whole handshake.)
+
+Our first version only had the first two limits. An independent review caught
+the gap: once a connection was open, nothing stopped a query from waiting
+forever for its answer. The limits we added next cover a slow query, a lock
+and a dead network. A later review froze the database with `docker pause`, and
+a lookup waited exactly as long as the pause (the last row). That is a lesson
+in itself: "we have timeouts" is not the same as "every wait has a timeout",
+and only a test of each case shows which waits are covered. Every CI job also
+has `timeout-minutes`.
 
 **Rule 3: no dynamic memory allocation after start-up.** In C, `malloc` can
 fail or fragment memory at the worst moment. Python allocates constantly, so we
 keep the *purpose*: **resources are bounded**. The connection pool has a fixed
-size, and every input has a maximum: URLs up to 2048 characters (new, with a
-test), aliases up to 32. Without a limit, one request with a 50 MB "URL" would
+size, and every input has a maximum: URLs up to 2048 characters (new, with
+tests), aliases up to 32. Without a limit, one request with a 50 MB "URL" would
 be stored, and later cached, forever.
+
+The limit must hold for what we store, not only for what we were sent.
+Pydantic normalizes a URL, which percent-encodes non-ASCII characters in the
+path: `é` (2 bytes in UTF-8) is stored as `%C3%A9` (6 characters). Its
+`max_length` counts the bytes of the input as typed, so on its own it accepted
+a 2048-byte URL made mostly of emoji, then stored it, and sent it back in
+`Location`, as 6104 characters. `app/schemas.py` keeps it as a cheap first
+check, then measures the normalized URL.
 
 There is a catch: Pydantic checks the URL only *after* FastAPI has read and
 parsed the whole request body. A 200 MB request would fill the server's memory
@@ -509,13 +547,13 @@ with 200 old warnings nobody notices the 201st.
 
 Ruff and mypy can't check rules 1, 2, 4, 6 and 8 the way JPL meant them (nor
 the `suppress` trap of rule 7), so we wrote
-[`scripts/check_power_of_ten.py`](scripts/check_power_of_ten.py), about 500
+[`scripts/check_power_of_ten.py`](scripts/check_power_of_ten.py), about 650
 lines. It uses Python's `ast` module, which turns source code into a tree:
 
 ```python
 >>> import ast
 >>> print(ast.dump(ast.parse("while True: pass")))
-Module(body=[While(test=Constant(value=True), body=[Pass()], orelse=[])], ...)
+Module(body=[While(test=Constant(value=True), body=[Pass()])])
 ```
 
 Each rule is a function that walks the tree looking for a node type: `While`
@@ -524,21 +562,50 @@ Imports are resolved first, so `import itertools as it; it.count()` is caught
 as surely as `itertools.count()`.
 
 Rule 1 is the interesting one. The checker builds a **call graph** (which
-function may call which) and reports every function that can reach itself.
-To know what a name like `walk` refers to, it applies Python's own scoping
-rule, **LEGB**: Local, then Enclosing functions, then Global (the module),
-then Builtins. Class bodies are skipped, which is why a method `sleep` that
-calls `sleep(1)` calls `time.sleep`, not itself. It also follows `self.m()`,
-`ClassName.m()`, `super().m()`, `ClassName(...)` (which runs `__init__`), and
-functions passed as values, as in `map(walk, nodes)`. The checker follows its
-own rules, so even that graph search is a bounded `for` loop instead of the
-usual recursive depth-first search.
+function may call which) and reports every function that can reach itself in
+that graph. To know what a name like `walk` refers to, it applies Python's own
+scoping rule, **LEGB**: Local, then Enclosing functions, then Global (the
+module), then Builtins. Class bodies are skipped, which is why a method `sleep`
+that calls `sleep(1)` calls `time.sleep`, not itself. It also follows
+`self.m()` (including an override of `m` in a subclass), `ClassName.m()`,
+`super().m()`, `ClassName(...)` and `cls(...)` (which run `__init__` and
+`__new__`), and functions passed as values, as in `map(walk, nodes)`. The
+checker follows its own rules, so even that graph search is a bounded `for`
+loop instead of the usual recursive depth-first search.
+
+Python also calls methods for you, and those calls can recurse just as well.
+Reading `self.x` runs a property's getter, `__getattribute__`, and
+`__getattr__` when nothing defines `x`. `self.x = v` runs the property's
+setter and `__setattr__`, `del self.x` its deleter and `__delattr__`, and
+`self(...)` runs `__call__`. So a setter that does `self.x = v` calls itself,
+though no line says `x(...)`. The checker follows these calls on `self`.
+"Nothing defines `x`" is a judgment: the checker looks for `x` in the class
+bodies and for code that sets it on `self` (`self.x = v`,
+`setattr(self, "x", v)`, `self.__dict__["x"] = v`). When a class gets
+attributes from code it cannot read (a base class from another module, such
+as `dict` or `Exception`, a metaclass, or `setattr(self, key, v)` with a name
+known only at run time), it assumes `x` may be there and says nothing.
 
 It is still an approximation, like every static analyzer for a dynamic
-language: it cannot see calls through other objects (`node.walk()`), across
-modules, or through `getattr`. Knowing what your tool can't see is part of
-using it well. The first version was simpler, and an independent review found
-seven kinds of recursion it missed; each one is now a test case.
+language: it only knows the classes of one module, and it cannot see calls
+through other objects (`node.walk()`, `self.__class__(...)`), across modules,
+through `getattr`, `setattr` or metaclasses, through descriptors other than
+decorated methods, or through the special methods that operators and
+built-ins run (`len(self)`, `self == other`, `self[k]`, `with self`,
+`str(self)`). It takes `super().m` to mean `m` in the bases of the class that
+calls it, though with multiple inheritance Python picks the next class in the
+instance's method resolution order (MRO). It can also be wrong the other way:
+`self` and `cls` stand for every subclass in the module, so a factory such as
+`Base.make()`, which runs `cls(...)`, is reported when a subclass's `__init__`
+calls it, though `cls` is `Base` there. Code like that needs a waiver,
+`# p10-waiver: R1 <reason>` (see below).
+
+Knowing what your tool can't see is part of using it well. The first version
+was simpler, and an independent review found seven kinds of recursion it
+missed; a later review found six more, through properties, special methods
+and subclasses. A third review found the opposite mistake: false alarms on
+classes whose attributes come from outside the module. Each one is now a test
+case.
 
 Rules sometimes need breaking. A waiver must name the rule and give a reason,
 right on the line, so a reviewer can judge it:

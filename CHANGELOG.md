@@ -37,7 +37,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - `scripts/check_power_of_ten.py`: a static checker for the NASA/JPL rules that
   Ruff and mypy do not cover (recursion, unbounded loops, function length,
   widened scope, swallowed errors, dynamic code). Recursion is found with a
-  call graph that follows Python's scoping rules.
+  call graph that follows Python's scoping rules, overrides in subclasses,
+  and some of the methods Python runs for you: property getters, setters and
+  deleters, `__getattribute__`, `__getattr__`, `__setattr__`, `__delattr__`,
+  `__call__`, and `__init__` and `__new__` through `cls(...)`. The script's
+  docstring lists what it cannot see.
 - `HEAD` requests on short links and `/health`. A `HEAD` shows where a link
   goes without counting a click.
 - Request bodies over 16 KB are refused with `413 Content Too Large` before
@@ -52,14 +56,23 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Redirects reject impossible codes (not 3 to 32 of `A-Z a-z 0-9 _ -`) with
   `404` before touching the cache or the database (only the rate limiter's
   script runs in Redis).
-- URLs longer than 2048 characters are rejected with `422`.
-- Every wait on the database now has a timeout: connecting (5 s), waiting
-  for a pooled connection (10 s), each SQL statement (5 s), each lock wait
-  (2 s), and a dead network (TCP keepalives and `tcp_user_timeout`).
+- URLs longer than 2048 characters are rejected with `422`. The length is
+  checked on the input as sent, in UTF-8 bytes, and on the normalized URL that
+  is stored and redirected to, where an `é` in the path takes 6 characters
+  (`%C3%A9`).
+- Waits on the database now have timeouts: connecting (5 s), waiting for a
+  pooled connection (10 s), each SQL statement (5 s), each lock wait (2 s),
+  and a dead network (TCP keepalives and `tcp_user_timeout`). They do not
+  cover a server that is alive but stuck (a paused container, a hung pooler
+  or proxy): the statement and lock limits need a server that answers, the
+  keepalives only notice a dead peer or network, and libpq has no client-side
+  read timeout, so a query on an open connection waits until the server
+  answers.
 - `base62.encode` accepts 0 to 2^64 - 1 and uses a loop with a fixed bound;
   `base62.decode` rejects empty, too long or invalid input with `ValueError`.
 - The Docker image runs as a non-root user and has a health check.
-- Dependencies are installed from lock files with hashes (`requirements.txt`,
+- Dependencies, including the tools that the pre-commit hooks run, are
+  installed from lock files with hashes (`requirements.txt`,
   `requirements-dev.txt`, generated from `requirements*.in` with `make lock`),
   and the Docker base image is pinned by digest.
 - `make check` also runs the dependency audit, and actionlint checks workflow

@@ -116,6 +116,110 @@ def test_clean_code_passes() -> None:
             def size(self):
                 return self.size
         """,
+        # a property setter that assigns its own property
+        """
+        class Temperature:
+            @property
+            def celsius(self):
+                return self._celsius
+
+            @celsius.setter
+            def celsius(self, value):
+                self.celsius = value
+        """,
+        # a property deleter that deletes its own property
+        """
+        class Cache:
+            @property
+            def data(self):
+                return self._data
+
+            @data.deleter
+            def data(self):
+                del self.data
+        """,
+        # `+=` reads the property before it assigns it
+        """
+        class Counter:
+            @property
+            def count(self):
+                self.count += 1
+                return self._count
+        """,
+        # every `self.x = ...` runs __setattr__, every `del self.x` runs __delattr__
+        """
+        class Record:
+            def __setattr__(self, name, value):
+                self.last = name
+        """,
+        """
+        class Record:
+            def __delattr__(self, name):
+                del self.last
+        """,
+        # reading an attribute that nothing defines runs __getattr__
+        """
+        class Proxy:
+            def __getattr__(self, name):
+                return self.target
+        """,
+        # a base from this module, or `object`, does not define it either
+        """
+        class Base(object):
+            pass
+
+        class Proxy(Base):
+            def __getattr__(self, name):
+                return self.target
+        """,
+        # nor does setting another name, or an attribute of another object
+        """
+        class Proxy:
+            def __init__(self, inner):
+                object.__setattr__(self, "_target", inner)
+                setattr(inner, "target", 1)
+                inner.__dict__.update(target=1)
+
+            def __getattr__(self, name):
+                return self.target
+        """,
+        # every read of an attribute runs __getattribute__
+        """
+        class Logged:
+            def __getattribute__(self, name):
+                return self.__dict__[name]
+        """,
+        # self(...) runs __call__
+        """
+        class Countdown:
+            def __call__(self, n):
+                return self(n - 1)
+        """,
+        # cls(...) runs __init__ and __new__
+        """
+        class Node:
+            def __init__(self, n):
+                self.child = Node.make(n - 1)
+
+            @classmethod
+            def make(cls, n):
+                return cls(n)
+        """,
+        """
+        class Node:
+            def __new__(cls, n):
+                return cls(n - 1)
+        """,
+        # self.step() may run a subclass's step, which calls back
+        """
+        class Base:
+            def run(self):
+                return self.step()
+
+        class Child(Base):
+            def step(self):
+                return self.run()
+        """,
         # async functions
         """
         async def countdown(n):
@@ -189,6 +293,170 @@ def test_recursion_is_rejected(source: str) -> None:
                     return handle(event)
                 case [handle, *_]:
                     return handle(event)
+        """,
+        # a setter that reads its property runs the getter, not itself
+        """
+        class Temperature:
+            @property
+            def celsius(self):
+                return self._celsius
+
+            @celsius.setter
+            def celsius(self, value):
+                if value != self.celsius:
+                    self._celsius = value
+
+            @celsius.deleter
+            def celsius(self):
+                del self._celsius
+        """,
+        # __setattr__ and __delattr__ that hand the work to `object`, and an
+        # assignment to an attribute of another object
+        """
+        class Record:
+            def __init__(self, log):
+                self.log = log
+                self.last = None
+
+            def __setattr__(self, name, value):
+                if name != "log":
+                    self.log.last = name
+                super().__setattr__(name, value)
+
+            def __delattr__(self, name):
+                object.__delattr__(self, name)
+        """,
+        # __getattr__ reading attributes that exist: from `object`, a class
+        # body, or an assignment in a base class's __init__
+        """
+        class Base:
+            retries = 3
+
+            def __init__(self, target):
+                self.target = target
+
+        class Proxy(Base):
+            def __getattr__(self, name):
+                if name in self.__dict__ or self.retries < 0:
+                    return None
+                return getattr(self.target, name)
+        """,
+        # ... or from a base or metaclass that this module does not define
+        """
+        from plugins import Registry
+
+        class Settings(dict):
+            pass
+
+        class Env(Settings):
+            def __getattr__(self, name):
+                return self.get(name)
+
+        class ApiError(Exception):
+            def __getattr__(self, name):
+                return self.args[0][name]
+
+        class Plugin(metaclass=Registry):
+            def __getattr__(self, name):
+                return self.registry[name]
+        """,
+        # ... or set by name, with a constant or one known only at run time
+        """
+        class Proxy:
+            def __init__(self, target, log):
+                object.__setattr__(self, "_target", target)
+                setattr(self, "_log", log)
+                super().__setattr__("_hits", 0)
+                self.__dict__["_misses"] = 0
+                vars(self)["_name"] = "proxy"
+
+            def __getattr__(self, name):
+                self._log.append(self._name)
+                return getattr(self._target, name, self._hits + self._misses)
+        """,
+        """
+        class Record:
+            def __init__(self, fields):
+                self.__dict__.update(fields)
+
+            def __getattr__(self, name):
+                return self.defaults[name]
+
+        class Options:
+            def __init__(self, **values):
+                for key, value in values.items():
+                    setattr(self, key, value)
+
+            def __getattr__(self, name):
+                return self.fallback
+
+        class Snapshot:
+            def __init__(self, fields):
+                self.__dict__ = dict(fields)
+
+            def __getattr__(self, name):
+                return self.default
+        """,
+        """
+        class Logged:
+            def __getattribute__(self, name):
+                return object.__getattribute__(self, name)
+        """,
+        # self(...) and cls(...) from methods that __call__ and __init__ don't call
+        """
+        class Task:
+            def __init__(self, step):
+                self.step = step
+
+            def __call__(self, n):
+                return n + self.step
+
+            def twice(self, n):
+                return self(self(n))
+
+            @classmethod
+            def default(cls):
+                return cls(1)
+        """,
+        # an override that calls super(), and a call that names its class
+        """
+        class Base:
+            def run(self):
+                return self.step() + Base.finish(self)
+
+            def step(self):
+                return 1
+
+            def finish(self):
+                return 0
+
+        class Child(Base):
+            def step(self):
+                return super().step() + 1
+
+            def finish(self):
+                return self.run()
+        """,
+        # assigning on the class, or declaring without a value, runs no __setattr__
+        """
+        class Registry:
+            def __setattr__(self, name, value):
+                self.seen: bool
+                Registry.register(name)
+
+            @classmethod
+            def register(cls, name):
+                cls.last = name
+        """,
+        # replacing a method on its class does not call it
+        """
+        class Config:
+            def load(self):
+                Config.load = Config.cached
+                return self.cached()
+
+            def cached(self):
+                return 1
         """,
     ],
 )
