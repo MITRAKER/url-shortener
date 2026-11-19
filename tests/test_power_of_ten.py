@@ -212,7 +212,83 @@ def test_clean_code_passes() -> None:
             def __getattr__(self, name):
                 return self.target
         """,
-        # ... nor a base of this module reached through another class
+        # ... nor a key that is not a name, or a call that fails
+        """
+        class Proxy:
+            def __init__(self):
+                self.__dict__.update({0: "zero"})
+                vars(self)[1] = "one"
+                try:
+                    setattr(self, "target", None, strict=True)
+                except TypeError:
+                    pass
+                try:
+                    object.__setattr__(self, "target", None, strict=True)
+                except TypeError:
+                    pass
+                try:
+                    self.__setattr__("target", None, strict=True)
+                except TypeError:
+                    pass
+                try:
+                    self.__dict__.setdefault("target", default=None)
+                except TypeError:
+                    pass
+                try:
+                    self.__dict__.update({"target": None}, {})
+                except TypeError:
+                    pass
+                try:
+                    super(self).__setattr__("target", None)
+                except TypeError:
+                    pass
+
+            def __getattr__(self, name):
+                return self.target
+        """,
+        # ... nor a private name spelled out: inside a class, Python stores
+        # `self.__target` as `self._Proxy__target`, and a string never changes
+        """
+        class Proxy:
+            def __init__(self, target):
+                self.__dict__.update(__target=target)
+
+            def __getattr__(self, name):
+                return getattr(self.__target, name)
+        """,
+        """
+        class Base:
+            def __init__(self, target):
+                self.__target = target
+
+        class Proxy(Base):
+            def __getattr__(self, name):
+                return getattr(self.__target, name)
+        """,
+        """
+        class Proxy:
+            def __getattr__(self, name):
+                return getattr(self.__target, name)
+
+        Proxy.__target = None  # outside the class: sets `__target` itself
+        """,
+        """
+        class Proxy:
+            global __target
+            __target = None  # a global named `_Proxy__target`
+
+            def __getattr__(self, name):
+                return self.__target
+        """,
+        # ... nor an annotation without a value
+        """
+        class Proxy:
+            def __getattr__(self, name):
+                return self.target
+
+        Proxy.target: str
+        """,
+        # ... nor a base of this module reached through other classes
         """
         class Shapes:
             class Base:
@@ -221,6 +297,61 @@ def test_clean_code_passes() -> None:
         class Proxy(Shapes.Base):
             def __getattr__(self, name):
                 return self.target
+        """,
+        """
+        class A:
+            class B:
+                class C:
+                    sides = 0
+
+        class Proxy(A.B.C):
+            def __getattr__(self, name):
+                return self.target
+        """,
+        # ... when only one of two definitions of Shapes has Base, that one
+        """
+        import os
+
+        if os.environ.get("FAST"):
+            class Shapes:
+                class Base:
+                    sides = 0
+        else:
+            class Shapes:
+                pass
+
+        class Proxy(Shapes.Base):
+            def __getattr__(self, name):
+                return self.target
+        """,
+        # a private method calling itself (stored as `_Node__step`), a private
+        # name in a class body, and a private nested class as a base
+        """
+        class Node:
+            def __step(self, n):
+                return self.__step(n - 1)
+        """,
+        """
+        def build(n):
+            class Node:
+                def __helper(m):
+                    return build(m - 1)
+
+                value = __helper(n)
+
+            return Node
+        """,
+        """
+        class Outer:
+            class __Inner:
+                sides = 0
+
+            def make(self):
+                class Proxy(Outer.__Inner):
+                    def __getattr__(self, name):
+                        return self.target
+
+                return Proxy
         """,
         # every read of an attribute runs __getattribute__
         """
@@ -440,9 +571,58 @@ def test_recursion_is_rejected(source: str) -> None:
                 self.__dict__.update(_loader=load)
                 vars(self).update({"_suffix": "!"})
                 self.__dict__.setdefault("_cache", {})
+                vars(self).setdefault("_seen", set())
+                self.__dict__.setdefault("_misses")
 
             def __getattr__(self, name):
+                self._seen.add(name)
+                if self._misses is not None:
+                    raise AttributeError(name)
                 return self._cache.setdefault(name, self._loader(name) + self._suffix)
+        """,
+        # ... or private names, set the way Python stores them (a class name
+        # loses its leading underscores; one made of underscores only mangles nothing)
+        """
+        class _Proxy:
+            def __init__(self, target):
+                self.__dict__.update(_Proxy__target=target)
+                object.__setattr__(self, "_Proxy__hits", 0)
+                self.__misses = 0
+
+            def __getattr__(self, name):
+                return getattr(self.__target, name, self.__fallback())
+
+            def __fallback(self):
+                self.__misses += 1
+                return self.__hits + self.__misses
+
+        class __:
+            def __init__(self, target):
+                self.__dict__.update(__target=target)
+
+            def __getattr__(self, name):
+                return getattr(self.__target, name)
+        """,
+        # ... or set on the class from outside its body, nested classes included
+        """
+        class Proxy:
+            def __getattr__(self, name):
+                return self.target
+
+        Proxy.target = "set later"
+
+        class Shapes:
+            class Base:
+                pass
+
+        class Stored:
+            target = "stored"
+
+        Shapes.Base = Stored
+
+        class Square(Shapes.Base):
+            def __getattr__(self, name):
+                return self.target
         """,
         # ... or reached through another class (Outer.Inner)
         """
@@ -453,6 +633,19 @@ def test_recursion_is_rejected(source: str) -> None:
         class Proxy(Shapes.Base):
             def __getattr__(self, name):
                 return self.target
+        """,
+        # ... but a nested class that may come from an import counts as outside
+        """
+        class Shapes:
+            try:
+                from shapes import Base
+            except ImportError:
+                class Base:
+                    pass
+
+        class Square(Shapes.Base):
+            def __getattr__(self, name):
+                return self.side
         """,
         """
         class Record:
