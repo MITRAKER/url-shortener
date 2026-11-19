@@ -34,9 +34,12 @@ def alembic_config(output: io.StringIO | None = None) -> Config:
 
 
 def drop_everything() -> None:
+    """Drop every table, also one that the tests of another branch left in the
+    same database: `differences()` would report it as a table no model has."""
     with engine.begin() as connection:
-        connection.execute(text("DROP TABLE IF EXISTS links"))
-        connection.execute(text("DROP TABLE IF EXISTS alembic_version"))
+        tables = sa.MetaData()
+        tables.reflect(connection)
+        tables.drop_all(connection)
         if POSTGRES:
             connection.execute(text("DROP SEQUENCE IF EXISTS links_id_seq"))
 
@@ -59,6 +62,15 @@ def differences() -> list[Any]:
 
 def table_exists(name: str) -> bool:
     return sa.inspect(engine).has_table(name)
+
+
+def test_a_table_that_no_model_has_is_dropped_too() -> None:
+    """Running a later step's tests and then this step's, on one database,
+    leaves the later step's tables behind."""
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE from_a_later_step (id INTEGER)"))
+    drop_everything()
+    assert not table_exists("from_a_later_step")
 
 
 def test_the_migrations_build_exactly_what_the_models_describe() -> None:

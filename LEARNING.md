@@ -1195,7 +1195,7 @@ POST /api/links, answered by instance 1:
 | `app/service.py` | `create_link` uses the IDs; the retry loop is now only a safety net |
 | `app/config.py` | `CODE_SECRET` and `TRUSTED_PROXIES` |
 | `scripts/check_instances.py` | For CI: does Nginx use every instance, and does losing one lose requests? |
-| `tests/test_ids.py`, `test_instances.py`, `test_migrations.py`, `test_proxy.py` | 64 more tests than step 2 |
+| `tests/test_ids.py`, `test_instances.py`, `test_migrations.py`, `test_proxy.py` | 65 more tests than step 2 |
 
 ### Part 1: Load balancing
 
@@ -1641,7 +1641,10 @@ then `docker compose up --build`.
 `tests/test_migrations.py` checks that the migrations build exactly what the
 models describe (Alembic's autogenerate finds no difference), that each can be
 undone, that a v0.2.0 database is adopted with its links, that the SQL can be
-printed for review (`--sql`), and that a second run waits its turn.
+printed for review (`--sql`), and that a second run waits its turn. Each test
+starts by dropping every table it finds, not only the ones this step knows,
+so tables that a later step's tests left in the same database can't make it
+fail.
 
 ### Testing it
 
