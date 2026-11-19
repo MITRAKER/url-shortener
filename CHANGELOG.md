@@ -33,9 +33,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Changed
 
 - URLs longer than 2048 characters are rejected with `422`.
-- Every wait on the database now has a timeout: connecting (5 s), waiting
-  for a pooled connection (10 s), each SQL statement (5 s), each lock wait
-  (2 s), and a dead network (TCP keepalives and `tcp_user_timeout`).
+- Waits on the database now have timeouts: connecting (5 s), waiting for a
+  pooled connection (10 s), each SQL statement (5 s), each lock wait (2 s),
+  and a dead network (TCP keepalives and `tcp_user_timeout`). They do not
+  cover a server that is alive but stuck (a paused container or VM, a hung
+  pooler): the statement and lock limits need a server that answers, the
+  keepalives only notice a dead peer or network, and libpq has no client-side
+  read timeout, so a query on an open connection waits until the server
+  answers.
 - `base62.encode` accepts 0 to 2^64 - 1 and uses a loop with a fixed bound;
   `base62.decode` rejects empty, too long or invalid input with `ValueError`.
 - The Docker image runs as a non-root user and has a health check.

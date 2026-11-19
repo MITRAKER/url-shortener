@@ -430,8 +430,8 @@ for _ in range(MAX_LENGTH):
 
 The distributed-systems version of this rule: **every wait has a timeout**.
 A network call without a timeout is an unbounded loop in disguise. Talking to
-Postgres involves four different waits, and each needs its own limit
-(see `app/db.py`):
+Postgres involves several different waits, and each needs its own limit
+(see `app/db.py`). One of them still has none:
 
 | Wait | Limit | What happens without it |
 |------|-------|-------------------------|
@@ -440,11 +440,26 @@ Postgres involves four different waits, and each needs its own limit
 | Running one SQL statement | `statement_timeout` = 5 s (Postgres cancels it) | One slow query holds a connection forever |
 | Waiting for a row lock | `lock_timeout` = 2 s | A transaction that holds a lock freezes everyone behind it |
 | A dead network | TCP keepalives and `tcp_user_timeout` | The server vanished, but we keep waiting for its answer |
+| A server that is alive but stuck (a paused container or VM, a hung pooler) | **None** in the app | The request's thread and its pooled connection wait until the server answers |
 
-Our first version only had the first two. An independent review caught the
-gap: once a connection is open, nothing stopped a query from waiting forever
-for a lock. That is a lesson in itself: "we have timeouts" is not the same as
-"every wait has a timeout". Every CI job also has `timeout-minutes`.
+Each limit covers only its own case. `statement_timeout` and `lock_timeout`
+are enforced by Postgres itself, so they need a server that answers.
+Keepalives and `tcp_user_timeout` only notice a dead peer or network: they
+fire when the other machine stops acknowledging our packets, and the kernel of
+a machine whose Postgres is frozen still acknowledges them. libpq, the C
+library under psycopg, has no client-side read timeout. So nothing in the app
+bounds a query sent on an open connection to a server that is alive but stuck.
+(Opening a new connection to it still fails after 5 s: `connect_timeout`
+covers the whole handshake.)
+
+Our first version only had the first two limits. An independent review caught
+the gap: once a connection was open, nothing stopped a query from waiting
+forever for its answer. The limits we added next cover a slow query, a lock
+and a dead network. A later review froze the database with `docker pause`, and
+a lookup waited exactly as long as the pause (the last row). That is a lesson
+in itself: "we have timeouts" is not the same as "every wait has a timeout",
+and only a test of each case shows which waits are covered. Every CI job also
+has `timeout-minutes`.
 
 **Rule 3: no dynamic memory allocation after start-up.** In C, `malloc` can
 fail or fragment memory at the worst moment. Python allocates constantly, so we
