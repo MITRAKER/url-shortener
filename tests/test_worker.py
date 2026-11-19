@@ -169,6 +169,28 @@ def test_a_failed_transaction_counts_nothing_and_loses_nothing(
     assert clicks()[FIRST] == 2
 
 
+def test_a_batch_read_again_skips_its_junk_only_once(
+    redis_client: redis.Redis,
+    click_worker: ClickWorker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Entries are skipped for good when the checkpoint moves past them, in
+    the commit. A batch that failed is read again, junk and all."""
+    redis_client.xadd(STREAM, {"code": "not valid!"})
+    click(redis_client, FIRST)
+    before = metric("click_worker_entries_skipped_total")
+    broken = text("UPDATE no_such_table SET clicks = :added WHERE code = :for_code")
+    monkeypatch.setattr(worker_module, "ADD_CLICKS", broken)
+    with pytest.raises(SQLAlchemyError):
+        click_worker.process_batch()
+    assert metric("click_worker_entries_skipped_total") == before  # nothing skipped yet
+    monkeypatch.undo()
+    assert click_worker.process_batch() == 2
+    assert metric("click_worker_entries_skipped_total") == before + 1
+    assert caplog.text.count("not clicks on a valid code") == 1
+
+
 def test_a_crash_after_the_commit_counts_nothing_twice(
     redis_client: redis.Redis,
     click_worker: ClickWorker,

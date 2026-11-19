@@ -116,6 +116,11 @@ class Batch:
     clicks: dict[str, int]  # how many clicks each code got
     size: int  # how many entries were read
 
+    @property
+    def skipped(self) -> int:
+        """How many entries were not clicks on a valid code."""
+        return self.size - sum(self.clicks.values())
+
 
 class ClickWorker:
     """Reads clicks from the stream and counts them, one batch at a time."""
@@ -156,10 +161,6 @@ class ClickWorker:
         if not entries:
             return None
         clicks = Counter(code for _, code in entries if code is not None)
-        skipped = len(entries) - clicks.total()
-        if skipped:
-            metrics.ENTRIES_SKIPPED.inc(skipped)
-            log.warning("skipped %d stream entries that are not clicks on a valid code", skipped)
         return Batch(after, entries[-1][0], dict(clicks), len(entries))
 
     def count(self, batch: Batch) -> bool:
@@ -186,8 +187,15 @@ class ClickWorker:
                     [{"for_code": code, "added": n} for code, n in sorted(batch.clicks.items())],
                 )
             session.commit()
+        # Counted only now that the checkpoint is past these entries, junk
+        # included: a batch that failed is read again, and counted again.
         metrics.BATCHES.labels("counted").inc()
         metrics.CLICKS_COUNTED.inc(sum(batch.clicks.values()))
+        if batch.skipped:
+            metrics.ENTRIES_SKIPPED.inc(batch.skipped)
+            log.warning(
+                "skipped %d stream entries that are not clicks on a valid code", batch.skipped
+            )
         self._forget(batch)
         return True
 

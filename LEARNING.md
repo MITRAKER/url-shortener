@@ -2635,9 +2635,10 @@ runs. And don't believe a difference you haven't seen twice.
   open, which reads closed again once its cool-down is over, without a call;
   the pool collector, and the backlog with a click added 5 seconds in the
   past (a stream ID chosen by the test).
-- **The worker's metrics**: batches, clicks counted, errors by system, and
-  its own `/metrics` page, served on a free port. A fake stop event records
-  every wait, to check the linger happens after a small batch only.
+- **The worker's metrics**: batches, clicks counted, entries skipped (once,
+  even when a failed batch is read again), errors by system, and its own
+  `/metrics` page, served on a free port. A fake stop event records every
+  wait, to check the linger happens after a small batch only.
 - **Every query names real metrics** (`tests/test_monitoring.py`): a small
   PromQL reader takes each query of the dashboard and the alerts apart, and
   every name must be one the app, the worker or a recording rule defines.
