@@ -7,9 +7,12 @@ for a free number when it starts, and keeps it until it stops.
 
 The lease is a PostgreSQL *advisory lock*: a lock on a number we choose. It
 means nothing to PostgreSQL itself; the app decides what it protects. It
-belongs to one database session, so when an instance dies, its connection
-closes and its number is free again: no clean-up job, no expiry to tune.
-(ZooKeeper's ephemeral nodes and etcd's leases are the same idea.)
+belongs to one database session, so no clean-up job is needed. When an
+instance stops or crashes, its connection closes and its number is free again
+at once. When its machine or network vanishes, nothing closes the connection:
+PostgreSQL notices through TCP keepalives, which app/db.py sets to give up
+after about 25 s. That is the lease's expiry. (ZooKeeper's ephemeral nodes and
+etcd's leases are the same idea, with a session timeout or a TTL as expiry.)
 
 The flip side: the lease ends with the session, even when the instance lives
 on. If PostgreSQL restarts, every lock is gone, and a new instance may take a

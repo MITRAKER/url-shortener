@@ -89,18 +89,21 @@ Interactive API docs: http://localhost:8000/docs
 | `GET`, `HEAD` | `/health` | Health check, and which instance answered: `{"status": "ok", "instance": 0}` |
 
 Redirects carry an `X-Cache` header: `HIT` (served from Redis), `MISS` (from
-PostgreSQL, now cached) or `BYPASS` (Redis not used: not configured, down, or
-skipped by the circuit breaker). Too many requests
+PostgreSQL, now cached) or `BYPASS` (from PostgreSQL, not cached: Redis not
+configured, down, or skipped by the circuit breaker, or the cache write did
+not go through). Too many requests
 from one client get `429 Too Many Requests` with a `Retry-After` header.
 
 ```bash
 curl -X POST localhost:8000/api/links -H 'content-type: application/json' \
-     -d '{"url": "https://github.com", "alias": "gh"}'
-curl -i localhost:8000/gh
+     -d '{"url": "https://github.com", "alias": "github"}'
+curl -i localhost:8000/github
 ```
 
-Limits: URLs up to 2048 characters; aliases 3 to 32 characters of `A-Z a-z 0-9 _ -`;
-request bodies up to 16 KB (`413 Content Too Large` above that).
+Limits: URLs up to 2048 characters, counted both as sent (in UTF-8 bytes) and
+once normalized (an `é` in the path is stored as `%C3%A9`, 6 characters);
+aliases 3 to 32 characters of `A-Z a-z 0-9 _ -`; request bodies up to 16 KB
+(`413 Content Too Large` above that).
 
 ## Configuration
 
@@ -109,7 +112,7 @@ request bodies up to 16 KB (`413 Content Too Large` above that).
 | `DATABASE_URL` | `sqlite:///./dev.db` | SQLAlchemy database URL |
 | `BASE_URL` | `http://localhost:8000` | Used to build `short_url` in responses |
 | `CODE_SECRET` | *(a public default)* | Key that scrambles IDs into codes. At least 16 characters, the same on every instance. Set your own in production: the app logs a warning while the default is in use |
-| `TRUSTED_PROXIES` | *(empty)* | IP addresses or networks of your proxies, comma-separated, e.g. `10.89.0.10`. Only requests from these may name the client's address in `X-Forwarded-For`. Empty: trust nobody |
+| `TRUSTED_PROXIES` | *(empty)* | IP addresses or networks of your proxies, comma-separated, e.g. `10.89.0.10` or `10.89.0.0/24`. Only requests from these may name the client's address in `X-Forwarded-For`. Empty: trust nobody. Checked at startup: anything else, such as `*` or `10.89.0.10/24`, stops the app |
 | `REDIS_URL` | *(empty)* | e.g. `redis://localhost:6379/0`. Empty: no cache, no rate limiting, and clicks counted in the database at once. The click worker needs it. Checked at startup: a malformed URL stops the app |
 | `CACHE_TTL_SECONDS` | `3600` | How long a link stays cached (±10% jitter) |
 | `CACHE_NEGATIVE_TTL_SECONDS` | `60` | How long "this code does not exist" is cached |
@@ -125,7 +128,10 @@ make help      # all commands
 ```
 
 Tests run on SQLite and an in-memory fake Redis by default. To use the real ones:
-`TEST_DATABASE_URL=postgresql+psycopg://app:app@localhost:5432/shortener_test TEST_REDIS_URL=redis://localhost:6379/0 pytest`.
+`TEST_DATABASE_URL=postgresql+psycopg://app:app@localhost:5432/shortener_test TEST_REDIS_URL=redis://localhost:6379/15 pytest`.
+The tests empty that Redis database (number 15, not the app's 0) and drop and recreate
+the app's tables and its migration history in `TEST_DATABASE_URL`, so never point them at
+data you want to keep.
 Some tests (instance number leases, the migration lock) need PostgreSQL and are
 skipped on SQLite.
 

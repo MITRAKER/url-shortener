@@ -63,9 +63,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Compose. Nginx finds the instances through Docker's DNS and looks again
   every 10 seconds. When an instance can't be reached, Nginx tries another
   (2 tries at most), and leaves it out for 10 seconds after 3 failures. A
-  `GET` or `HEAD` that finds no instance, because the list of instances
-  changed while it waited, is asked once more. Nginx keeps connections to
-  the instances open, and refuses request bodies over 16 KB.
+  `GET` or `HEAD` that ends in a 502 made by Nginx itself (no instance
+  answered: one closed the connection mid-answer, or the list of instances
+  changed while it waited) is tried once more, so it reaches the instances
+  at most 3 times, and a click can be counted up to 3 times when instances
+  die mid-answer. A request that times out gets a 504 and no further try.
+  Nginx keeps connections to the instances open, and refuses request bodies
+  over 16 KB.
 - Snowflake IDs, made by each instance without asking anyone: 31 bits of
   seconds since 2026, a 6-bit instance number and a 10-bit sequence (up to
   1024 IDs per second per instance, 64 instances, until 2094). IDs sort by
@@ -73,7 +77,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Instance numbers are leased from PostgreSQL with advisory locks when an
   instance starts. Every 5 seconds the instance checks that it still holds
   its number; if not (say, PostgreSQL restarted), it stops making IDs and
-  shuts down, and Docker starts it again with a new lease.
+  shuts down, and Docker starts it again with a new lease. A number is free
+  again as soon as its instance stops or crashes, or about 25 seconds after
+  its machine or network vanishes: the app asks PostgreSQL to probe its
+  sessions with TCP keepalives.
 - Codes are IDs scrambled by a keyed Feistel network (`CODE_SECRET`): unique
   without retries, and impossible to guess from each other without the key.
 - `TRUSTED_PROXIES`: the app takes the client's address from
@@ -91,7 +98,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - Generated codes are 8 characters instead of 7.
 - The app no longer creates its tables at startup: run the migrations first.
-- Link IDs come from the app, not from a database sequence.
+- Link IDs come from the app, not from a database sequence. The migration
+  that drops the sequence (0002) stops v0.2.0 instances from creating
+  links, so stop every v0.2.0 instance before the migrations run
+  (`docker compose down`, which keeps the database's volume).
 - In Docker Compose, the app instances can only be reached through Nginx, and
   start again whenever they stop by themselves (`restart: unless-stopped`).
 - The app, not uvicorn, decides whom to trust with proxy headers
@@ -119,8 +129,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   call waits at most 0.25 s, a timeout is never retried, and after 3 failures
   in a row a circuit breaker skips Redis for 5 seconds.
 - `REDIS_URL` is checked at startup, so a malformed URL stops the app instead
-  of failing every request. The error never repeats the value, which may
-  hold a password.
+  of failing every request. The error never shows the value or any part of
+  it, since it may hold a password.
 - Redis in Docker Compose (64 MB, LFU eviction) and in CI.
 - Lesson 3 in LEARNING.md: caching, rate limiting and graceful degradation.
 - CI pipeline on every pull request: Ruff lint and format, strict mypy, the
@@ -134,7 +144,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - `scripts/check_power_of_ten.py`: a static checker for the NASA/JPL rules that
   Ruff and mypy do not cover (recursion, unbounded loops, function length,
   widened scope, swallowed errors, dynamic code). Recursion is found with a
-  call graph that follows Python's scoping rules.
+  call graph that follows Python's scoping rules, overrides in subclasses,
+  and some of the methods Python runs for you: property getters, setters and
+  deleters, `__getattribute__`, `__getattr__`, `__setattr__`, `__delattr__`,
+  `__call__`, and `__init__` and `__new__` through `cls(...)`. The script's
+  docstring lists what it cannot see.
 - `HEAD` requests on short links and `/health`. A `HEAD` shows where a link
   goes without counting a click.
 - Request bodies over 16 KB are refused with `413 Content Too Large` before
@@ -147,15 +161,25 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Changed
 
 - Redirects reject impossible codes (not 3 to 32 of `A-Z a-z 0-9 _ -`) with
-  `404` before touching Redis or the database.
-- URLs longer than 2048 characters are rejected with `422`.
-- Every wait on the database now has a timeout: connecting (5 s), waiting
-  for a pooled connection (10 s), each SQL statement (5 s), each lock wait
-  (2 s), and a dead network (TCP keepalives and `tcp_user_timeout`).
+  `404` before touching the cache or the database (only the rate limiter's
+  script runs in Redis).
+- URLs longer than 2048 characters are rejected with `422`. The length is
+  checked on the input as sent, in UTF-8 bytes, and on the normalized URL that
+  is stored and redirected to, where an `é` in the path takes 6 characters
+  (`%C3%A9`).
+- Waits on the database now have timeouts: connecting (5 s), waiting for a
+  pooled connection (10 s), each SQL statement (5 s), each lock wait (2 s),
+  and a dead network (TCP keepalives and `tcp_user_timeout`). They do not
+  cover a server that is alive but stuck (a paused container, a hung pooler
+  or proxy): the statement and lock limits need a server that answers, the
+  keepalives only notice a dead peer or network, and libpq has no client-side
+  read timeout, so a query on an open connection waits until the server
+  answers.
 - `base62.encode` accepts 0 to 2^64 - 1 and uses a loop with a fixed bound;
   `base62.decode` rejects empty, too long or invalid input with `ValueError`.
 - The Docker image runs as a non-root user and has a health check.
-- Dependencies are installed from lock files with hashes (`requirements.txt`,
+- Dependencies, including the tools that the pre-commit hooks run, are
+  installed from lock files with hashes (`requirements.txt`,
   `requirements-dev.txt`, generated from `requirements*.in` with `make lock`),
   and the Docker base image is pinned by digest.
 - `make check` also runs the dependency audit, and actionlint checks workflow

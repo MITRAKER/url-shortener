@@ -13,7 +13,7 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 # The largest valid body is a 2048-character URL with every character written
-# as a 6-byte JSON escape such as a, plus an alias: about 12.5 KB.
+# as a 6-byte JSON escape such as \u0061, plus an alias: about 12.5 KB.
 MAX_BODY_BYTES: Final = 16 * 1024
 TOO_LARGE: Final = "Request body is too large"
 
