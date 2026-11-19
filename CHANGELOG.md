@@ -15,8 +15,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Compose. Nginx finds the instances through Docker's DNS and looks again
   every 10 seconds. When an instance can't be reached, Nginx tries another
   (2 tries at most), and leaves it out for 10 seconds after 3 failures. A
-  `GET` or `HEAD` that finds no instance, because the list of instances
-  changed while it waited, is asked once more. Nginx keeps connections to
+  `GET` or `HEAD` that still gets no answer from an instance, for example
+  because the list of instances changed while it waited, is tried once
+  more: it reaches the instances at most 3 times, so a click can be counted
+  up to 3 times when instances die mid-answer. Nginx keeps connections to
   the instances open, and refuses request bodies over 16 KB.
 - Snowflake IDs, made by each instance without asking anyone: 31 bits of
   seconds since 2026, a 6-bit instance number and a 10-bit sequence (up to

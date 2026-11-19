@@ -1194,30 +1194,42 @@ doesn't pick the retry from the new list: it answers 502, and its log says
 `no live upstreams`, although two instances are up. We ran CI's sequence 8
 times: 7 runs had one 502 each.
 
-The fix is a second chance for what is safe to ask twice:
+The fix is a second chance for what is safe to repeat:
 
 ```nginx
 location / {
     proxy_pass http://app_instances;
-    error_page 502 = @once_more;   # a 502 made by Nginx: it reached no instance
+    error_page 502 = @once_more;   # a 502 made by Nginx: no instance answered
 }
 location @once_more {
     if ($request_method !~ ^(GET|HEAD)$) {
         return 502;                # a POST is never asked twice
     }
     proxy_pass http://app_instances;   # a fresh try, with the new list
+    proxy_next_upstream_tries 1;       # one try, not 2 more
 }
 ```
 
 The proxy settings moved up to the `server` block, so both locations share
-them. After the fix, CI's sequence ran 11 times without a single 502. And to
-be sure the changing list was the trigger, we ran the old configuration with
-DNS asked only every 5 minutes (`valid=300s`): 4 runs, no 502 either. Two
-lessons in one: the same failure can be harmless or not depending on
-*when* requests arrive, so test more than one timing; and a second chance is
-only for requests that are safe to repeat. (Is a `GET` safe? In HTTP's terms,
-yes. Ours counts a click, the one side effect we accept repeating: a click
-counted twice when an instance dies mid-answer.)
+them, all but one: the second chance makes a single try. So a `GET` or `HEAD`
+reaches the instances at most 3 times, 2 tries and then 1. After the fix, CI's
+sequence ran 11 times without a single 502. And to be sure the changing list
+was the trigger, we ran the old configuration with DNS asked only every 5
+minutes (`valid=300s`): 4 runs, no 502 either. Two lessons in one: the same
+failure can be harmless or not depending on *when* requests arrive, so test
+more than one timing; and a second chance is only for requests that are safe
+to repeat. (Is a `GET` safe? In HTTP's terms, yes. Ours counts a click, the
+one side effect we accept repeating. "No instance answered" doesn't mean no
+instance received the request: one may count the click and die before it
+answers. With 3 tries, a click can be counted up to 3 times.)
+
+A later review found that our first version of `@once_more` had no
+`proxy_next_upstream_tries` of its own. It inherited the `server` block's 2,
+so a `GET` could reach the instances 4 times, not 3. A setting made once for
+every location applies to every location, wanted or not. With the single try,
+we replayed the race with stand-in instances, 10 runs each way: without the
+second chance, 4 runs had a 502; with it, the race struck in 8 runs and every
+request succeeded.
 
 #### Keepalive, and a race at the edge of a timeout
 
