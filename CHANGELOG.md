@@ -50,7 +50,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Changed
 
 - Redirects reject impossible codes (not 3 to 32 of `A-Z a-z 0-9 _ -`) with
-  `404` before touching Redis or the database.
+  `404` before touching the cache or the database (only the rate limiter's
+  script runs in Redis).
 - URLs longer than 2048 characters are rejected with `422`.
 - Every wait on the database now has a timeout: connecting (5 s), waiting
   for a pooled connection (10 s), each SQL statement (5 s), each lock wait

@@ -96,8 +96,9 @@ def stats(code: str, session: SessionDep) -> LinkOut:
 @app.head("/{code}", dependencies=[limit_read], include_in_schema=False)
 @app.get("/{code}", dependencies=[limit_read])
 def redirect(code: str, request: Request, session: SessionDep, cache: CacheDep) -> RedirectResponse:
-    # Reject impossible codes before touching Redis or Postgres, so junk
-    # requests can't fill the cache with "not found" entries.
+    # Reject impossible codes before touching the cache or the database (only
+    # the rate limiter's script runs in Redis), so junk requests can't fill the
+    # cache with "not found" entries.
     if not service.CODE_PATTERN.fullmatch(code):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Link not found")
 

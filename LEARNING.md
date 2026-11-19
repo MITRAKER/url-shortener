@@ -685,7 +685,8 @@ send millions of made-up codes, and the cache doesn't help at all. That is
 
 1. **Validate first.** A code must look like a code: 3 to 32 characters of
    `A-Z a-z 0-9 _ -`. `/../../etc/passwd` or a 10 KB string is rejected with
-   404 before touching Redis or the database.
+   404 before touching the cache or the database (only the rate limiter's
+   script runs in Redis).
 2. **Cache the absence.** If the database says "not found", we store an empty
    string under that key for 60 seconds. Repeated lookups now hit Redis.
 
