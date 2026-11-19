@@ -512,7 +512,7 @@ lines. It uses Python's `ast` module, which turns source code into a tree:
 ```python
 >>> import ast
 >>> print(ast.dump(ast.parse("while True: pass")))
-Module(body=[While(test=Constant(value=True), body=[Pass()], orelse=[])], ...)
+Module(body=[While(test=Constant(value=True), body=[Pass()])])
 ```
 
 Each rule is a function that walks the tree looking for a node type: `While`
