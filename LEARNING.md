@@ -1613,12 +1613,12 @@ GET /abc1234 ─▶ Nginx ─▶ app ── XADD clicks:v1 * code abc1234 ──
 |------|------------|
 | `app/clicks.py` | `ClickStream.append()`: one `XADD`, unless a million clicks already wait (a small Lua script), through the Redis gateway |
 | `app/service.py` | `count_click()`: the stream, or PostgreSQL straight away when Redis can't take the click |
-| `app/worker.py` | The click worker: read a batch, add it up, count it with its checkpoint in one transaction |
+| `app/worker.py` | The click worker: read a batch, add it up, count it with its checkpoint in one transaction; a watchdog that ends it when its loop is stuck |
 | `app/heartbeat.py` | The worker's health check: was its last round recent? |
 | `app/models.py`, migration `0003` | `click_checkpoints`: how far the worker got |
 | `docker-compose.yml` | The `worker` service; Redis keeps the stream on disk and never evicts it |
 | `scripts/check_clicks.py` | For CI: clicks wait while the worker is stopped, and survive a Redis restart |
-| `tests/test_clicks.py`, `tests/test_worker.py` | 35 tests: the redirect path, batching, every failure in between, two workers at once |
+| `tests/test_clicks.py`, `tests/test_worker.py` | 39 tests: the redirect path, batching, every failure in between, two workers at once |
 
 ### Part 1: Why take work off the request path?
 
@@ -1924,16 +1924,35 @@ with it.)
 - **It's stopped** (`docker stop` sends SIGTERM): it finishes the round it is
   in and exits. Uncounted clicks wait in the stream.
 - **PostgreSQL or Redis is down**: it logs the error and tries again every
-  second. Restarting it wouldn't help, so its health check must not fail.
+  second. Restarting it wouldn't help, so nothing should restart it.
+- **Its loop is stuck**, by a bug or a wait without a limit: restarting it
+  would help, but a stuck process never exits by itself.
 
-That's why the health check asks "is the worker going round its loop?" and
-not "is it making progress?". The worker touches a **heartbeat** file on
-every round; `python -m app.heartbeat` checks that the last touch is less
-than 30 seconds old. Every wait inside a round has a limit (2 seconds for
-Redis; for PostgreSQL, 10 to get a connection and 5 per statement), so in
-practice only a stuck loop misses it. **Progress** is
-a different signal: the backlog (`XLEN`) and the age of its oldest entry (its
-ID is a timestamp). That's a metric to graph and alert on, which is step 5.
+Restarting is the cure for the last case only, so whatever restarts the
+worker must ask "is it going round its loop?", not "is it making progress?".
+The worker touches a **heartbeat** file on every round, failed or not;
+`python -m app.heartbeat` checks that the last touch is less than 30 seconds
+old. Every wait inside a round has a limit (2 seconds for Redis; for
+PostgreSQL, 10 to get a connection and 5 per statement), so in practice only
+a stuck loop misses it.
+
+That check is the container's health check, but a failing health check
+restarts nothing. Docker and Docker Compose only mark the container
+**unhealthy**: `docker compose ps` shows it, and `docker compose up --wait`
+and `depends_on: condition: service_healthy` wait for a healthy one. A
+restart policy acts only when the process exits. (Restarting on a failed
+check is what a Kubernetes **liveness probe** does.) So the worker brings
+its own **watchdog**: a thread that reads the heartbeat every 5 seconds and,
+once the health check would fail, ends the process with `os._exit(1)`. The
+restart policy does the rest, and crash-only design makes that safe.
+`sys.exit` would end only the watchdog's thread, and SIGTERM only asks the
+loop to stop, which a stuck loop never notices. A new worker gets 30 seconds
+for its first round: Docker restarts a container with its files, the old
+heartbeat included.
+
+**Progress** is a different signal: the backlog (`XLEN`) and the age of its
+oldest entry (its ID is a timestamp). That's a metric to graph and alert on,
+which is step 5.
 
 The health check imports nothing but the standard library, on purpose: our
 first version ran `python -m app.worker --alive`, which imports SQLAlchemy,
@@ -1976,6 +1995,11 @@ heartbeat module takes 0.15 s.
 - **Shapes and junk.** Replies of other shapes (RESP3's dict, a broken entry)
   raise; entries that aren't clicks, bytes that aren't UTF-8 among them, are
   skipped without blocking the clicks behind them.
+- **A watchdog that can't end pytest.** The watchdog takes its clock and its
+  exit function as arguments. The tests pass a fake clock, and an exit
+  function that only notes the status: a heartbeat 30 seconds old ends the
+  worker with status 1; rounds less than 30 seconds apart, and a new
+  worker's first 30 seconds, don't.
 - **The real stack, in CI.** The smoke test waits for its click to be counted;
   `scripts/check_clicks.py` checks clicks across a Redis restart.
 

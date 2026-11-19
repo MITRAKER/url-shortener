@@ -1,6 +1,7 @@
 """The click worker (app/worker.py): it counts the clicks in the Redis stream
 into PostgreSQL, each one exactly once, whatever fails in between."""
 
+import os
 import signal
 import threading
 from pathlib import Path
@@ -22,12 +23,14 @@ from app.worker import (
     START,
     Batch,
     ClickWorker,
+    Watchdog,
     following,
     main,
     parse_entries,
     run,
     stop_on_signals,
 )
+from tests.fakes import FakeClock
 
 FIRST, SECOND, THIRD = "first", "second", "third"
 
@@ -350,6 +353,97 @@ def test_the_health_check_reads_the_heartbeat(
     assert heartbeat_module.main() == 0
 
 
+def beat(heartbeat: Path, at: float) -> None:
+    """A round of the loop that began at `at`, a time on a FakeClock."""
+    heartbeat.touch()
+    os.utime(heartbeat, (at, at))
+
+
+def never_exit(status: int) -> None:
+    raise AssertionError(f"the watchdog ended a worker that isn't stuck (status {status})")
+
+
+class FakeTimeStop(threading.Event):
+    """A stop event whose waits move a FakeClock instead of waiting. After
+    `limit` waits it is set, so a watchdog that never acts fails its test
+    instead of hanging it."""
+
+    def __init__(self, clock: FakeClock, limit: int) -> None:
+        super().__init__()
+        self._clock = clock
+        self._waits_left = limit
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self._clock.advance(timeout or 0.0)
+        self._waits_left -= 1
+        if self._waits_left <= 0:
+            self.set()
+        return self.is_set()
+
+
+def test_a_stuck_loop_ends_the_worker_so_that_docker_starts_it_again(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    heartbeat = tmp_path / "alive"
+    clock = FakeClock()
+    stop = FakeTimeStop(clock, limit=100)
+    exits: list[tuple[int, float]] = []
+
+    def exit_process(status: int) -> None:
+        exits.append((status, clock()))
+        stop.set()  # os._exit never returns: the loop must end here too
+
+    watchdog = Watchdog(heartbeat, now=clock, exit_process=exit_process)
+    clock.advance(600)  # ten minutes of rounds later,
+    last_round = clock()
+    beat(heartbeat, last_round)  # a round begins that never ends
+    watchdog.watch(stop)
+    [(status, when)] = exits
+    assert status == 1
+    # Not while the round could still be a slow one, and at the next look after.
+    waited = when - last_round
+    assert ALIVE_SECONDS <= waited <= ALIVE_SECONDS + worker_module.WATCHDOG_SECONDS
+    assert "the loop is stuck" in caplog.text
+
+
+def test_a_worker_that_goes_round_its_loop_is_not_stuck(tmp_path: Path) -> None:
+    """While PostgreSQL or Redis is down, every round fails, waits and tries
+    again, and touches the heartbeat as it begins
+    (test_run_carries_on_after_errors_until_stopped). Restarting the worker
+    wouldn't help, so the watchdog leaves it alone, however long that lasts."""
+    heartbeat = tmp_path / "alive"
+    clock = FakeClock()
+    watchdog = Watchdog(heartbeat, now=clock, exit_process=never_exit)
+    for _ in range(200):  # 200 rounds, each just short of the limit
+        beat(heartbeat, clock())
+        clock.advance(ALIVE_SECONDS - 1)
+        assert not watchdog.is_stuck()
+
+
+def test_a_new_worker_has_time_for_its_first_heartbeat(tmp_path: Path) -> None:
+    """Docker starts the same container again, with the files it had: the
+    heartbeat may be missing, or left over from the worker that got stuck."""
+    heartbeat = tmp_path / "alive"
+    clock = FakeClock()
+    watchdog = Watchdog(heartbeat, now=clock, exit_process=never_exit)
+    assert not watchdog.is_stuck()  # no heartbeat yet
+    beat(heartbeat, clock() - 600)  # the one the stuck worker left, 10 minutes ago
+    clock.advance(ALIVE_SECONDS - 1)
+    assert not watchdog.is_stuck()  # still within its first round
+    clock.advance(1)
+    assert watchdog.is_stuck()  # no round in all that time: stuck as well
+
+
+def test_the_watchdog_runs_beside_the_loop_until_the_worker_stops(tmp_path: Path) -> None:
+    stop = threading.Event()
+    thread = worker_module.start_watchdog(tmp_path / "alive", stop)
+    assert thread.is_alive()
+    assert thread.daemon  # it never keeps the process alive
+    stop.set()  # SIGTERM, say
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
 def test_the_worker_takes_no_arguments(caplog: pytest.LogCaptureFixture) -> None:
     assert main(["--alive"]) == 2
     assert "takes no arguments" in caplog.text
@@ -365,14 +459,20 @@ def test_without_redis_there_is_nothing_to_count(
 
 def test_main_runs_the_worker(monkeypatch: pytest.MonkeyPatch) -> None:
     started: list[tuple[ClickWorker, Path]] = []
+    watched: list[Path] = []
 
     def fake_run(worker: ClickWorker, _stop: threading.Event, heartbeat: Path) -> None:
         started.append((worker, heartbeat))
 
+    def fake_start_watchdog(heartbeat: Path, _stop: threading.Event) -> None:
+        watched.append(heartbeat)
+
     monkeypatch.setattr(settings, "redis_url", "redis://127.0.0.1:1/0")  # never connected
+    monkeypatch.setattr(worker_module, "start_watchdog", fake_start_watchdog)
     monkeypatch.setattr(worker_module, "stop_on_signals", lambda _stop: None)
     monkeypatch.setattr(worker_module, "run", fake_run)
     assert main([]) == 0
     [(worker, heartbeat)] = started
     assert isinstance(worker, ClickWorker)
     assert heartbeat == HEARTBEAT
+    assert watched == [HEARTBEAT]

@@ -16,11 +16,13 @@ thousand clicks takes one transaction.
 """
 
 import logging
+import os
 import signal
 import sys
 import threading
+import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -33,7 +35,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.clicks import STREAM
 from app.config import settings
 from app.db import SessionLocal
-from app.heartbeat import HEARTBEAT
+from app.heartbeat import ALIVE_SECONDS, HEARTBEAT, is_alive
 from app.models import ClickCheckpoint, Link
 from app.redis_client import make_redis
 from app.service import CODE_PATTERN
@@ -43,6 +45,7 @@ log = logging.getLogger(__name__)
 BATCH_SIZE: Final = 1000  # stream entries per transaction, at most
 WAIT_MS: Final = 1000  # how long one read waits for new clicks to arrive
 SOCKET_MARGIN_SECONDS: Final = 1.0  # the client waits that much longer for Redis's answer
+WATCHDOG_SECONDS: Final = 5.0  # how often the watchdog looks at the heartbeat
 RETRY_SECONDS: Final = 1.0  # after an error, wait this long before trying again
 START: Final = "0-0"  # comes before every stream ID: "nothing counted yet"
 
@@ -191,9 +194,9 @@ class ClickWorker:
 
 def run(worker: ClickWorker, stop: threading.Event, heartbeat: Path) -> None:
     """Count batches until `stop` is set, touching `heartbeat` on every round
-    (the health check reads it, see app/heartbeat.py). Errors from Redis or
-    PostgreSQL are logged, then retried. Any other error is a bug: it ends
-    the process, and Docker starts a new one."""
+    (the health check and the watchdog read it, see app/heartbeat.py). Errors
+    from Redis or PostgreSQL are logged, then retried. Any other error is a
+    bug: it ends the process, and Docker starts a new one."""
     while not stop.is_set():  # p10-waiver: R2 runs until the process is told to stop
         heartbeat.touch()
         try:
@@ -210,6 +213,58 @@ def stop_on_signals(stop: threading.Event) -> None:
         signal.signal(signum, lambda _signum, _frame: stop.set())
 
 
+class Watchdog:
+    """Ends the process once the loop in run() is stuck, so that Docker starts
+    it again. A failing health check doesn't: Docker and Docker Compose only
+    mark the container unhealthy, and `restart: unless-stopped` acts only when
+    the process exits.
+
+    It reads the heartbeat, as the health check does, so a worker that goes
+    round its loop while PostgreSQL or Redis is down is not stuck: restarting
+    it wouldn't help."""
+
+    def __init__(
+        self,
+        heartbeat: Path,
+        now: Callable[[], float] = time.time,
+        exit_process: Callable[[int], object] = os._exit,
+    ) -> None:
+        self._heartbeat = heartbeat
+        self._now = now
+        # os._exit ends the whole process at once, from any thread. sys.exit
+        # would end only this thread, and SIGTERM would only set `stop`, which
+        # a stuck loop never looks at again.
+        self._exit_process = exit_process
+        self._started = now()
+
+    def is_stuck(self) -> bool:
+        """Would the health check fail (app/heartbeat.py)? Not before
+        ALIVE_SECONDS have passed: a new process has that long for its first
+        heartbeat, whatever file the one before it left (Docker restarts a
+        container with its files)."""
+        if self._now() - self._started < ALIVE_SECONDS:
+            return False
+        return not is_alive(self._heartbeat, self._now)
+
+    def watch(self, stop: threading.Event) -> None:
+        """Look at the heartbeat every few seconds, until `stop` is set."""
+        while not stop.wait(WATCHDOG_SECONDS):  # p10-waiver: R2 runs until the worker stops
+            if self.is_stuck():
+                log.critical("no heartbeat for %.0f s: the loop is stuck, exiting", ALIVE_SECONDS)
+                self._exit_process(1)
+
+
+def start_watchdog(heartbeat: Path, stop: threading.Event) -> threading.Thread:
+    """Watch the heartbeat from a thread of its own (a stuck loop can't watch
+    itself) until `stop` is set. A daemon thread: it never keeps the process
+    alive."""
+    thread = threading.Thread(
+        target=Watchdog(heartbeat).watch, args=(stop,), name="watchdog", daemon=True
+    )
+    thread.start()
+    return thread
+
+
 def main(argv: Sequence[str]) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     if argv:
@@ -221,6 +276,7 @@ def main(argv: Sequence[str]) -> int:
     # Each read asks Redis to wait up to WAIT_MS for clicks: wait a bit longer.
     client = make_redis(settings.redis_url, WAIT_MS / 1000 + SOCKET_MARGIN_SECONDS)
     stop = threading.Event()
+    start_watchdog(HEARTBEAT, stop)
     stop_on_signals(stop)
     log.info("counting clicks from the Redis stream %s", STREAM)
     run(ClickWorker(client, SessionLocal), stop, HEARTBEAT)

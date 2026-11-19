@@ -27,7 +27,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   that a long worker outage can't fill Redis, whose cache and rate limits
   share its 64 MB.
 - A health check for the worker: it touches a heartbeat file on every round,
-  and `python -m app.heartbeat` checks that the last one is recent.
+  and `python -m app.heartbeat` checks that the last one is recent. Docker
+  only marks a container that fails it as unhealthy, so a watchdog thread
+  ends the worker when its loop is stuck (no heartbeat for 30 seconds), and
+  Docker starts it again.
 - CI checks that clicks wait while the worker is stopped, and survive a
   Redis restart (`scripts/check_clicks.py`). The smoke test waits for the
   worker to count its click.

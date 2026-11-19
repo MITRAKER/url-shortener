@@ -112,7 +112,10 @@ services:
     healthcheck:
       # Healthy while it goes round its loop (a heartbeat file, see
       # app/heartbeat.py). The image's own check asks for /health over HTTP,
-      # which the worker doesn't serve.
+      # which the worker doesn't serve. A failing check restarts nothing:
+      # Docker only marks the container unhealthy, and `restart` acts only
+      # when the process exits. So when the loop is stuck, the worker's own
+      # watchdog ends the process (app/worker.py), and Docker starts it again.
       test: ["CMD", "python", "-m", "app.heartbeat"]
       interval: 10s
       timeout: 5s
