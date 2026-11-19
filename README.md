@@ -133,9 +133,11 @@ request bodies up to 16 KB (`413 Content Too Large` above that).
   `make loadtest RATE=500 DURATION=2m`, or on GitHub: Actions, Load test, Run
   workflow.
 - **Benchmarks.** Every step of the roadmap, measured with the same load test,
-  on the same three cores: step 1 answers about 250 redirects a second, step 5
-  keeps up with 900. What each step bought, and why:
-  [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+  on the same three cores. Step 1 answers about 250 redirects a second. Step 5
+  keeps up at 300 a second, and at 600 in one run of two (the other left 2 of
+  18,000 requests unsent). At 900 it still answers about 880 a second, but
+  falls behind: its p99 rises to 248-321 ms, past the 100 ms objective. What
+  each step bought, and why: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Configuration
 

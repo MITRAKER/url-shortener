@@ -47,8 +47,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   the alerts and the dashboard names a metric that exists, and that every
   alert has a runbook section and a test.
 - Benchmarks of every step with the same load test (`docs/BENCHMARKS.md`):
-  on the same three cores, step 1 answers about 250 redirects a second,
-  step 5 keeps up with 900.
+  on the same three cores, step 1 answers about 250 redirects a second.
+  Step 5 keeps up at 300 a second, and at 600 in one run of two; at 900 it
+  answers about 880 a second but falls behind, with a p99 of 248-321 ms.
 - Lesson 6 in LEARNING.md: metrics, PromQL, SLOs and burn-rate alerts, load
   testing, what the numbers showed, and what each step bought.
 

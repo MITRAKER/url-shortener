@@ -139,7 +139,9 @@ less predictable.
 
 Three processes answered 516 to 560 redirects a second, about twice step 2
 (not three times: they share three cores with PostgreSQL, Redis and Nginx).
-Below that they kept up easily. Above it, PostgreSQL's row locks became the
+Below that, they kept up in run 2, but not quite in run 1: k6 couldn't start
+12 requests on time at 100 a second, and 109 at 300, where the p99 reached
+681 ms. Above it, PostgreSQL's row locks became the
 problem: every redirect still ran `UPDATE links SET clicks = clicks + 1` in
 its own transaction, and a popular link's row can only be updated by one
 transaction at a time. We asked PostgreSQL to log every lock wait over 10 ms
@@ -168,9 +170,13 @@ against 51 to 140 ms for step 4.
 
 ### Where the limit is now
 
-At 900 a second, steps 4 and 5 just keep up: k6 couldn't start 61 to 145 of
-27,000 requests on time, and the median rose to 15-24 ms, with the three
-cores 76 to 83% busy. The next limit is plain CPU: the app needs about 2 ms
+At 900 a second, steps 4 and 5 fall behind. They still answered 876 to 881
+a second, but k6 couldn't start 61 to 145 of 27,000 requests on time, the
+median rose to 15-24 ms, and the p99 to 237-321 ms, past the 100 ms
+objective. The three cores were 76 to 83% busy. Step 5 kept up at 300 a
+second, and at 600 in run 2 (run 1 left 2 requests unsent), with a p99 of
+42 ms at most: at 600 it is near its limit on these three cores, and 900 is
+past it. The next limit is plain CPU: the app needs about 2 ms
 of it per redirect, plus what Nginx and Redis use. More instances wouldn't
 help on this machine; more cores, or less work per request, would.
 

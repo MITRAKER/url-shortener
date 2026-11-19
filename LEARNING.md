@@ -2624,10 +2624,14 @@ The ranges are the two runs. Each line has a lesson:
   25-51% of a core to 4%, PostgreSQL from 11-23% to 3-4%, and step 5's p99 at
   600 requests a second was 30 to 42 ms, against 51 to 140 ms for step 4.
 
-At 900 requests a second, steps 4 and 5 just keep up, with the three cores
-76 to 83% busy. The limit now is plain CPU: the app needs about 2 ms of it
-per redirect. More instances wouldn't help on this machine; more cores, or
-less work per request, would.
+At 900 requests a second, steps 4 and 5 fall behind. They still answer
+about 880 a second, but k6 can't start 61 to 145 requests on time, and the
+p99 rises to 237-321 ms: both miss their thresholds (Part 4). Step 5 keeps
+up at 300 a second, and at 600 in one run of two (the other left 2
+requests unsent): at 600 it is near its limit on three cores, and 900 is
+past it. The cores are 76 to 83% busy, and the limit now is plain CPU: the
+app needs about 2 ms of it per redirect. More instances wouldn't help on
+this machine; more cores, or less work per request, would.
 
 #### Noise
 
