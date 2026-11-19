@@ -626,7 +626,7 @@ GET /abc1234
 | `app/main.py` | Rate limits on the routes, the `X-Cache` header, the code-shape check |
 | `app/config.py` | `REDIS_URL`, checked when the app starts |
 | `docker-compose.yml` | A `redis` container with a 64 MB memory budget |
-| `tests/test_cache.py`, `test_ratelimit.py`, `test_redis_client.py`, `test_breaker.py`, `test_config.py` | 78 new tests |
+| `tests/test_cache.py`, `test_ratelimit.py`, `test_redis_client.py`, `test_breaker.py`, `test_config.py` | 89 new tests |
 | `tests/fakes.py` | `SilentServer`: a fake Redis that accepts connections and never answers |
 
 ### Part 1: Caching
