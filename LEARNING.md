@@ -529,7 +529,7 @@ with 200 old warnings nobody notices the 201st.
 
 Ruff and mypy can't check rules 1, 2, 4, 6 and 8 the way JPL meant them (nor
 the `suppress` trap of rule 7), so we wrote
-[`scripts/check_power_of_ten.py`](scripts/check_power_of_ten.py), about 500
+[`scripts/check_power_of_ten.py`](scripts/check_power_of_ten.py), about 650
 lines. It uses Python's `ast` module, which turns source code into a tree:
 
 ```python
@@ -544,21 +544,32 @@ Imports are resolved first, so `import itertools as it; it.count()` is caught
 as surely as `itertools.count()`.
 
 Rule 1 is the interesting one. The checker builds a **call graph** (which
-function may call which) and reports every function that can reach itself.
-To know what a name like `walk` refers to, it applies Python's own scoping
-rule, **LEGB**: Local, then Enclosing functions, then Global (the module),
-then Builtins. Class bodies are skipped, which is why a method `sleep` that
-calls `sleep(1)` calls `time.sleep`, not itself. It also follows `self.m()`,
-`ClassName.m()`, `super().m()`, `ClassName(...)` (which runs `__init__`), and
-functions passed as values, as in `map(walk, nodes)`. The checker follows its
-own rules, so even that graph search is a bounded `for` loop instead of the
-usual recursive depth-first search.
+function may call which) and reports every function that can reach itself in
+that graph. To know what a name like `walk` refers to, it applies Python's own
+scoping rule, **LEGB**: Local, then Enclosing functions, then Global (the
+module), then Builtins. Class bodies are skipped, which is why a method `sleep`
+that calls `sleep(1)` calls `time.sleep`, not itself. It also follows
+`self.m()` (including an override of `m` in a subclass), `ClassName.m()`,
+`super().m()`, `ClassName(...)` and `cls(...)` (which run `__init__` and
+`__new__`), and functions passed as values, as in `map(walk, nodes)`. The
+checker follows its own rules, so even that graph search is a bounded `for`
+loop instead of the usual recursive depth-first search.
+
+Python also calls methods for you, and those calls can recurse just as well.
+Reading `self.x` runs a property's getter, `__getattribute__`, and
+`__getattr__` when nothing defines `x`. `self.x = v` runs the property's
+setter and `__setattr__`, `del self.x` its deleter and `__delattr__`, and
+`self(...)` runs `__call__`. So a setter that does `self.x = v` calls itself,
+though no line says `x(...)`. The checker follows these calls on `self`.
 
 It is still an approximation, like every static analyzer for a dynamic
-language: it cannot see calls through other objects (`node.walk()`), across
-modules, or through `getattr`. Knowing what your tool can't see is part of
-using it well. The first version was simpler, and an independent review found
-seven kinds of recursion it missed; each one is now a test case.
+language: it only knows the classes of one module, and it cannot see calls
+through other objects (`node.walk()`), across modules, through `getattr`,
+`setattr` or metaclasses, or through descriptors other than decorated methods.
+Knowing what your tool can't see is part of using it well. The first version
+was simpler, and an independent review found seven kinds of recursion it
+missed; a later review found six more, through properties, special methods
+and subclasses. Each one is now a test case.
 
 Rules sometimes need breaking. A waiver must name the rule and give a reason,
 right on the line, so a reviewer can judge it:

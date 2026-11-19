@@ -20,7 +20,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - `scripts/check_power_of_ten.py`: a static checker for the NASA/JPL rules that
   Ruff and mypy do not cover (recursion, unbounded loops, function length,
   widened scope, swallowed errors, dynamic code). Recursion is found with a
-  call graph that follows Python's scoping rules.
+  call graph that follows Python's scoping rules, overrides in subclasses,
+  and the methods Python runs for you, such as property setters,
+  `__setattr__`, `__getattr__` and `__call__`.
 - `HEAD` requests on short links and `/health`. A `HEAD` shows where a link
   goes without counting a click.
 - Request bodies over 16 KB are refused with `413 Content Too Large` before
