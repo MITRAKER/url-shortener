@@ -136,6 +136,13 @@ jobs:
         run: docker compose up --build --detach --wait --wait-timeout 180
       - name: Smoke test against the running containers
         run: python scripts/smoke_test.py http://localhost:8000
+      - name: Clicks wait while the worker is stopped, and survive a Redis restart
+        run: |
+          docker compose stop worker
+          code="$(python -m scripts.check_clicks http://localhost:8000 click 5)"
+          docker compose restart redis
+          docker compose start worker
+          python -m scripts.check_clicks http://localhost:8000 expect "$code" 5
       - name: Nginx spreads requests over all 3 instances
         run: python -m scripts.check_instances http://localhost:8000 3
       - name: Losing an instance loses no requests

@@ -1,6 +1,6 @@
 # Shortcuts for everyday tasks. Run `make help` to list them.
 .DEFAULT_GOAL := help
-.PHONY: help install lock format lint typecheck power test audit check migrate up down
+.PHONY: help install lock format lint typecheck power test audit check migrate worker up down
 
 help: ## List the available commands
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  make %-10s %s\n", $$1, $$2}'
@@ -41,7 +41,10 @@ check: ## What CI checks, except Docker and the PostgreSQL test run
 migrate: ## Bring the database (DATABASE_URL) up to the latest migration
 	alembic upgrade head
 
-up: ## Start Nginx, 3 app instances, PostgreSQL and Redis in Docker
+worker: ## Count the clicks waiting in Redis (needs DATABASE_URL and REDIS_URL)
+	python -m app.worker
+
+up: ## Start Nginx, 3 app instances, the click worker, PostgreSQL and Redis in Docker
 	docker compose up --build
 
 down: ## Stop the Docker containers

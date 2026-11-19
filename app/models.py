@@ -30,3 +30,14 @@ class Link(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     clicks: Mapped[int] = mapped_column(BigInt, default=0)
+
+
+class ClickCheckpoint(Base):
+    """How far the click worker got in a Redis stream (app/worker.py)."""
+
+    __tablename__ = "click_checkpoints"
+
+    stream: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # The ID of the last stream entry whose click is already in links.clicks.
+    # It changes in the same transaction as the counts, so the two always agree.
+    last_id: Mapped[str] = mapped_column(String(64))
