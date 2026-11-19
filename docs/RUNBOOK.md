@@ -92,7 +92,9 @@ minutes. The others carry the load, so users are fine as long as they keep up.
 
 **Severity: ticket.** Prometheus can't reach the click worker. Clicks keep
 arriving in the Redis stream and wait there, safely; their counts lag until
-the worker is back. Nothing is lost while Redis has memory to spare. The app
+the worker is back. Nothing is lost: once a million clicks wait, redirects
+count new ones in PostgreSQL instead, and
+[ClicksBypassingTheStream](#clicksbypassingthestream) fires. The app
 instances measure the backlog too, so "Clicks waiting" and "Oldest waiting
 click" keep showing it, and if clicks keep coming,
 [ClicksWaitingTooLong](#clickswaitingtoolong) fires after about 6 minutes.
@@ -119,13 +121,21 @@ running but stuck.
 
 **Severity: ticket.** Redis is not taking clicks, so redirects count them in
 PostgreSQL directly: slower redirects, and more load on the database. Nothing
-is lost.
+is lost. Either Redis can't take them (down, too slow, or out of memory), or
+the stream is full: the app stops adding to it once a million clicks wait
+(`MAX_WAITING_CLICKS` in `app/clicks.py`). So a worker that has stopped, or
+runs but counts nothing, shows up here too, once that many clicks have piled
+up.
 
 1. Is Redis up? `docker compose ps redis`.
-2. Is it full? `docker compose exec redis redis-cli info memory`: when
-   `used_memory` reaches `maxmemory` with nothing left to evict, Redis refuses
-   new clicks. A long worker outage fills it with waiting clicks: bring the
-   worker back (see [ClickWorkerDown](#clickworkerdown)).
+2. Is the stream full? "Clicks waiting" at 1,000,000 means the worker isn't
+   counting: see [ClickWorkerDown](#clickworkerdown) and
+   [ClicksWaitingTooLong](#clickswaitingtoolong). Clicks go back to the
+   stream as soon as the worker has counted some.
+3. Out of memory anyway? `docker compose exec redis redis-cli info memory`:
+   when `used_memory` reaches `maxmemory` with nothing left to evict, Redis
+   refuses every write, not only new clicks: the rate limits fail open, and
+   the cache stops working.
 
 ## Dependencies
 
