@@ -65,8 +65,9 @@ Interactive API docs: http://localhost:8000/docs
 | `GET`, `HEAD` | `/health` | Health check |
 
 Redirects carry an `X-Cache` header: `HIT` (served from Redis), `MISS` (from
-PostgreSQL, now cached) or `BYPASS` (Redis not used: not configured, down, or
-skipped by the circuit breaker). Too many requests
+PostgreSQL, now cached) or `BYPASS` (from PostgreSQL, not cached: Redis not
+configured, down, or skipped by the circuit breaker, or the cache write did
+not go through). Too many requests
 from one client get `429 Too Many Requests` with a `Retry-After` header.
 
 ```bash

@@ -732,6 +732,13 @@ At step 5 the key exists, so nothing happens. If the steps happen in the other
 order, B's write simply replaces A's. Both orders are now correct, and
 `test_not_found_never_overwrites_a_real_entry` checks it.
 
+Both orders rely on B's write reaching Redis, though. If it fails (a Redis
+error or timeout, or the circuit is open), A's "not found" entry wins, and
+`/promo` answers 404 with `X-Cache: HIT` for up to 60 seconds
+(`CACHE_NEGATIVE_TTL_SECONDS`), although B got `201 Created`. We accept that
+window, and keep it short, rather than make creating a link depend on Redis.
+`test_failed_write_through_leaves_the_not_found_entry` shows it.
+
 #### What we deliberately don't cache
 
 Click counts change on every redirect, so the stats endpoint always reads the
@@ -865,9 +872,16 @@ or any part of it.
 #### Making the cache visible
 
 The `X-Cache` header is borrowed from CDNs: `HIT` (answered from Redis),
-`MISS` (read from the database and now cached) or `BYPASS` (Redis not used:
-not configured, down, or the circuit is open). It costs nothing, and
+`MISS` (read from the database and now cached) or `BYPASS` (read from the
+database and not cached: Redis is not configured, down, or the circuit is
+open, or the cache write did not go through). It costs nothing, and
 `curl -i` tells you at once what happened.
+
+A header like this is only useful if it tells the truth. The first version
+sent `MISS` even when the cache write had failed, so the next request missed
+again. Now the cache's writes report whether Redis stored the value, and
+`resolve()` sends `MISS` only when it did. If the write failed, or
+`SET ... NX` found a link created a moment ago, the header says `BYPASS`.
 
 ### Part 2: Rate limiting
 

@@ -4,9 +4,10 @@ Pattern: cache-aside (also called lazy loading):
   1. Look in Redis.
   2. On a miss, read Postgres, then copy the answer into Redis for next time.
 
-Redis errors never reach the caller. RedisGateway logs them, and the cache
-answers UNAVAILABLE, so the request carries on with the database alone: the
-cache may make us faster, but it must never make us unavailable.
+Redis errors never reach the caller. RedisGateway logs them, a read answers
+UNAVAILABLE and a write answers False, so the request carries on with the
+database alone: the cache may make us faster, but it must never make us
+unavailable.
 """
 
 import json
@@ -91,16 +92,19 @@ class LinkCache:
             log.warning("ignoring unreadable cache entry for %r: %s", code, exc)
             return Lookup.MISS
 
-    def set(self, code: str, link: CachedLink) -> None:
+    def set(self, code: str, link: CachedLink) -> bool:
+        """Cache `link`. True if Redis stored it."""
         exp = link.expires_at.timestamp() if link.expires_at else None
         payload = json.dumps({"url": link.target_url, "exp": exp})
         key, ttl = self.key(code), self.ttl_with_jitter()
-        self.gateway.call("cache write", lambda r: r.set(key, payload, ex=ttl), None)
+        return self.gateway.call("cache write", lambda r: bool(r.set(key, payload, ex=ttl)), False)
 
-    def set_not_found(self, code: str) -> None:
+    def set_not_found(self, code: str) -> bool:
+        """Remember that `code` does not exist. True if Redis stored it."""
         # nx=True: only write if the key is empty. If a create() cached the
-        # real link a moment ago, "not found" must not overwrite it.
+        # real link a moment ago, "not found" must not overwrite it, and
+        # nothing is stored.
         key, ttl = self.key(code), self.negative_ttl
-        self.gateway.call(
-            "cache write", lambda r: r.set(key, NOT_FOUND_VALUE, ex=ttl, nx=True), None
+        return self.gateway.call(
+            "cache write", lambda r: bool(r.set(key, NOT_FOUND_VALUE, ex=ttl, nx=True)), False
         )
