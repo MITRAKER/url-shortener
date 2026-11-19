@@ -1259,10 +1259,13 @@ from real requests.
 
 - `proxy_connect_timeout 2s`: on the same network, a live instance accepts a
   connection in well under a millisecond. Two seconds means it's gone.
-- `proxy_next_upstream error timeout`: when connecting fails, or no answer
-  comes, try the next instance. `proxy_next_upstream_tries 2` and
-  `proxy_next_upstream_timeout 10s` limit the retries: a retry is a loop, and
-  every loop needs a bound (NASA/JPL rule 2).
+- `proxy_next_upstream error timeout`: when connecting fails or takes over
+  2 s, or the instance closes the connection before it answers, try the next
+  instance. `proxy_next_upstream_tries 2` and `proxy_next_upstream_timeout 10s`
+  limit the retries: a retry is a loop, and every loop needs a bound
+  (NASA/JPL rule 2). An instance that takes the request and then says nothing
+  for 30 s (`proxy_read_timeout`) is past those 10 s, so that request is not
+  retried: the client gets a `504`.
 - `max_fails=3 fail_timeout=10s`: after 3 failures within 10 seconds, leave
   that instance out for 10 seconds, then give it another chance.
 
@@ -1376,9 +1379,12 @@ header, so it may be believed only when it comes from our own proxy.
 `tests/test_proxy.py` checks all of it: one bucket per client behind Nginx,
 the header ignored from anyone else, and a forged address in front ignored.
 
-Nginx must pass on one more header: `Host`, the name and port the client
+Nginx should pass on one more header: `Host`, the name and port the client
 asked for. Left to itself, Nginx would send the name its configuration gives
-the instances, `app_instances`. `proxy_set_header Host $http_host;` passes on
+the instances, `app_instances`. (Our redirects would survive that:
+`proxy_redirect`, on by default, rewrites a `Location` that starts with
+`http://app_instances/` to the address the client used. But the app would
+have the wrong idea of its own address.) `proxy_set_header Host $http_host;` passes on
 what the client sent, port included. The app uses it to build the few
 redirects that point back at itself: `/docs/` sends you to `/docs`, on the
 host and port you used. Our first version used the common `$host`, which
