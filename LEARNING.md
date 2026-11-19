@@ -1090,7 +1090,7 @@ POST /api/links, answered by instance 1:
 | `app/service.py` | `create_link` uses the IDs; the retry loop is now only a safety net |
 | `app/config.py` | `CODE_SECRET` and `TRUSTED_PROXIES` |
 | `scripts/check_instances.py` | For CI: does Nginx use every instance, and does losing one lose requests? |
-| `tests/test_ids.py`, `test_instances.py`, `test_migrations.py`, `test_proxy.py` | 62 more tests than step 2 |
+| `tests/test_ids.py`, `test_instances.py`, `test_migrations.py`, `test_proxy.py` | 63 more tests than step 2 |
 
 ### Part 1: Load balancing
 
@@ -1250,7 +1250,10 @@ header, so it may be believed only when it comes from our own proxy.
   left end of the header is whatever the client wrote. `TRUSTED_PROXIES="*"`
   would take the leftmost, so anyone could choose their own address and dodge
   their limit. The setting accepts only addresses and networks, so `*` (and
-  any typo) stops the app at startup.
+  any typo) stops the app at startup. So does `10.89.0.10/24`, an address
+  with a prefix length (`docker network inspect` prints addresses that way):
+  uvicorn would quietly ignore it, and every client would share Nginx's rate
+  limit. A network is written `10.89.0.0/24`.
 - **Compose** gives Nginx a fixed address, 10.89.0.10, and hands out addresses
   to other containers only from 10.89.0.128 up (`ip_range`), so no other
   container can ever get Nginx's.

@@ -94,7 +94,7 @@ request bodies up to 16 KB (`413 Content Too Large` above that).
 | `DATABASE_URL` | `sqlite:///./dev.db` | SQLAlchemy database URL |
 | `BASE_URL` | `http://localhost:8000` | Used to build `short_url` in responses |
 | `CODE_SECRET` | *(a public default)* | Key that scrambles IDs into codes. At least 16 characters, the same on every instance. Set your own in production: the app logs a warning while the default is in use |
-| `TRUSTED_PROXIES` | *(empty)* | IP addresses or networks of your proxies, comma-separated, e.g. `10.89.0.10`. Only requests from these may name the client's address in `X-Forwarded-For`. Empty: trust nobody |
+| `TRUSTED_PROXIES` | *(empty)* | IP addresses or networks of your proxies, comma-separated, e.g. `10.89.0.10` or `10.89.0.0/24`. Only requests from these may name the client's address in `X-Forwarded-For`. Empty: trust nobody. Checked at startup: anything else, such as `*` or `10.89.0.10/24`, stops the app |
 | `REDIS_URL` | *(empty)* | e.g. `redis://localhost:6379/0`. Empty: no cache, no rate limiting. Checked at startup: a malformed URL stops the app |
 | `CACHE_TTL_SECONDS` | `3600` | How long a link stays cached (±10% jitter) |
 | `CACHE_NEGATIVE_TTL_SECONDS` | `60` | How long "this code does not exist" is cached |

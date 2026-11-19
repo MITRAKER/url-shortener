@@ -93,6 +93,7 @@ def test_trusted_proxies_are_addresses_or_networks(value: str, proxies: list[str
         "nginx",  # a host name: not resolved, so it would never match
         "10.89.0.300",  # a typo
         "10.89.0.0/33",
+        "10.89.0.10/24",  # host bits set: uvicorn would ignore it, and trust nobody
     ],
 )
 def test_anything_else_in_trusted_proxies_is_rejected(value: str) -> None:

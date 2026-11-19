@@ -64,8 +64,11 @@ class Settings(BaseSettings):
     def _check_trusted_proxies(cls, value: str) -> str:
         # Likewise: a typo here would otherwise be ignored without a word, and
         # every client would share the proxy's address, and its rate limit.
+        # Strict, as uvicorn parses it: "10.89.0.10/24" (an address with a
+        # prefix length, as `docker network inspect` prints it) is no network,
+        # and uvicorn would keep it as text that no client address matches.
         for entry in _split(value):
-            ipaddress.ip_network(entry, strict=False)  # ValueError if malformed
+            ipaddress.ip_network(entry)  # ValueError if malformed, or host bits set
         return value
 
     @property
