@@ -12,6 +12,8 @@ with **exercises** so you can practise building it yourself.
   load balancing, distributed IDs, migrations)
 - [Lesson 5: Counting clicks without slowing redirects](#lesson-5-counting-clicks-without-slowing-redirects)
   (step 4: asynchronous processing, Redis Streams, exactly-once counting)
+- [Lesson 6: Seeing what the system does](#lesson-6-seeing-what-the-system-does)
+  (step 5: metrics, alerts, load testing, benchmarks)
 
 ---
 
@@ -1643,10 +1645,11 @@ clicks.
 #### The price: eventual consistency
 
 The count you read from `GET /api/links/{code}` may now lag a moment behind
-the clicks. Normally the lag is milliseconds (the worker wakes up as soon as
-a click arrives); while the worker is down, it grows until it comes back.
-Nothing is lost, but nothing is instant either. The count is **eventually
-consistent**: stop clicking, and it catches up to the truth.
+the clicks. Normally the lag is a fraction of a second (the worker lets
+clicks gather for 0.2 s, then counts them together: lesson 6 shows why);
+while the worker is down, it grows until it comes back. Nothing is lost, but
+nothing is instant either. The count is **eventually consistent**: stop
+clicking, and it catches up to the truth.
 
 For analytics, that's fine. For a bank balance it would not be: always ask
 "who reads this, and what happens if they read it a second late?" before
@@ -1703,7 +1706,9 @@ IDs only grow, so "everything after ID x" is a well-defined question, and an
 ID is all a reader needs to remember. The worker asks for up to 1000 entries
 and waits at most a second; it gets whatever has arrived. So batches adapt to
 the load by themselves: one click a second makes batches of one, with no
-waiting for a batch to fill; ten thousand a second make full batches.
+waiting for a batch to fill; ten thousand a second make full batches. (After
+a batch that wasn't full, the worker now pauses 0.2 s so that the next one
+gathers more clicks; lesson 6 tells how the metrics showed it was needed.)
 
 Redis also has **consumer groups** (`XREADGROUP`, `XACK`), which share a
 stream among several workers and remember, in Redis, what each one has
@@ -2012,3 +2017,712 @@ docker compose exec redis redis-cli CONFIG GET maxmemory-policy   # volatile-lfu
 
 **Next:** step 5 measures it all: metrics (Prometheus and Grafana, including
 the click backlog), a k6 load test, and benchmarks across every step.
+
+---
+
+## Lesson 6: Seeing what the system does
+
+Steps 1 to 4 built a service that is fast and survives failures, but we could
+only see it through tests and one-off benchmarks. Running for real, you need
+to know at any moment: is it working, how fast, for how many people, and
+what is about to break? And you need to know before your users tell you.
+
+Step 5 makes the system **observable**: every app instance and the click
+worker count what they do; **Prometheus** collects the numbers every 15
+seconds and checks **alerts**; **Grafana** draws them; a **load test** (k6)
+pushes realistic traffic through the whole stack; and the same load test
+**benchmarks** every step of the project. The first thing the numbers showed
+was a waste nobody had noticed: the click worker was committing a transaction
+for every click or two (Part 5).
+
+### What we built
+
+```
+                 every 15 s: GET /metrics
+   Prometheus ──────────────────────────────▶ app × 3   (found by DNS, port 8000)
+   │   │      ──────────────────────────────▶ click worker (port 8001)
+   │   │
+   │   └─ alerts.yml: recording rules and 10 alerts ─▶ localhost:9090/alerts
+   │                                                    each links to docs/RUNBOOK.md
+   ▼
+   Grafana, localhost:3000: one dashboard, 23 panels, each a PromQL query
+
+   k6: 200 redirects a second, Zipf-popular links ─▶ Nginx ─▶ app × 3
+```
+
+| File | What's new |
+|------|------------|
+| `app/metrics.py` | Every metric: requests (a middleware), cache, clicks, rate limits, Redis fallbacks, the circuit breaker; collectors for the connection pool and the click backlog |
+| `app/main.py` | `GET /metrics`, the middleware, the instance's version and number |
+| `app/worker.py` | The worker serves its own metrics on port 8001, and lingers 0.2 s after a batch that wasn't full |
+| `monitoring/prometheus/` | `prometheus.yml` (what to collect), `alerts.yml` (recording rules, alerts), `alerts_test.yml` (11 tests for promtool) |
+| `monitoring/grafana/` | The data source and the dashboard, as files: Grafana starts ready to use |
+| `docs/RUNBOOK.md` | What to do when each alert fires |
+| `loadtest/redirects.js` | The k6 load test; `make loadtest`, and a workflow to run it on GitHub |
+| `nginx/default.conf` | `/metrics` is refused from outside |
+| `scripts/check_metrics.py` | For CI: every target up, every rule working, every dashboard query valid |
+| `docs/BENCHMARKS.md` | Every step, measured with the same load test |
+| `tests/test_metrics.py`, `tests/test_monitoring.py` | 29 tests: each metric moves when it should; every query names metrics that exist |
+
+### Part 1: Metrics
+
+#### Three ways to see inside a running system
+
+- **Logs**: a line per event, with all its detail. "This request failed, with
+  this traceback." The answer to "what happened to *this* request?", but
+  costly at volume and hard to add up.
+- **Metrics**: numbers, added up as things happen. "18,234 redirects so far,
+  3 failed." Cheap (a counter costs the same whether it counts ten or ten
+  million), ideal for graphs and alerts, but with no detail about any single
+  request.
+- **Traces**: the path of one request through every service, with the time
+  spent in each. Essential with dozens of services; with two, logs and
+  metrics are enough.
+
+Metrics answer "is something wrong, and since when?"; logs and traces answer
+"why?". An incident needs both.
+
+#### Pull, not push
+
+Every 15 seconds, Prometheus **pulls** (it *scrapes*): it asks each target
+for its `/metrics` page, which is plain text.
+
+```
+# HELP http_requests_total HTTP requests answered, by method, route and status code.
+# TYPE http_requests_total counter
+http_requests_total{method="GET",route="/{code}",status="302"} 18234.0
+http_requests_total{method="GET",route="/{code}",status="404"} 951.0
+```
+
+Why pull rather than have each app push its numbers?
+
+- **Silence is a signal.** A target that doesn't answer is recorded as
+  `up == 0`. With push, silence is ambiguous: down, or nothing to say?
+- **The app doesn't depend on its monitoring.** It doesn't need to know
+  where Prometheus is, and a slow Prometheus can't slow it down.
+- **Prometheus sets the pace**, so a misbehaving app can't flood it.
+
+The price: Prometheus must find its targets (Part 2), and a job that lives
+two seconds may end between two scrapes. Such jobs push to a *Pushgateway*.
+
+#### Four kinds of metric
+
+| Kind | What it is | Ours, for example |
+|------|------------|-------------------|
+| **Counter** | Only goes up (and back to 0 when the process restarts). You never read its value, only how fast it grows | `http_requests_total`, `cache_lookups_total` |
+| **Gauge** | Goes up and down: a value right now | `http_requests_in_progress`, `click_backlog_entries` |
+| **Histogram** | Counts observations into buckets: how many took up to 1 ms, up to 2.5 ms... up to 5 s, plus their count and sum | `http_request_duration_seconds` |
+| **Info** | A constant (1) whose labels carry facts | `app_info{version="0.5.0", instance_number="2"}` |
+
+Why count requests rather than compute "requests per second" in the app?
+The app would have to choose a time window, and every graph would be stuck
+with it. A counter lets Prometheus compute the rate over any window
+afterwards, across all instances. And it survives a missed scrape: the next
+one still has the total.
+
+Why a histogram rather than "the p99" computed in the app? **Percentiles
+can't be averaged**: the p99 of three instances is not the average of their
+three p99s. Bucket counts, though, can be added across instances, and
+Prometheus estimates the percentile from the sum. The estimate is only as
+precise as the buckets, so ours are dense where redirects live (1 to 25 ms),
+and 0.1 s is a bucket boundary on purpose: it's our latency objective
+(Part 3), so "how many took 100 ms or less" is an exact count.
+
+#### Labels, and how to break Prometheus
+
+Every combination of label values is a separate **time series**, held in
+memory by the app and by Prometheus. `route="/{code}"` is one series.
+`route="/abc1234"` would be one per link, and a scanner requesting `/aaaa`,
+`/aaab`, ... would create new series without end, until Prometheus runs out
+of memory. That is a **cardinality explosion**, the most common way to break
+a Prometheus server, and anyone on the internet could trigger ours.
+
+So every label value comes from a short, fixed list:
+
+- **route**: the route's *template*. Starlette's router leaves the route it
+  matched in the request's `scope` (the dictionary handed down through every
+  middleware), and the middleware reads `scope["route"].path` once the app
+  has answered. A request that matched no route is `unmatched`.
+- **method**: one of the seven known methods, or `other`. Anyone can send a
+  method called `FOOBAR`.
+- **status**: in practice, a dozen codes.
+
+Link codes, user IDs, URLs and IP addresses are never labels; they belong in
+logs. One more detail: a labelled counter only appears once a label value is
+used. We create the known ones at start-up, at 0, so that a query for
+`cache_lookups_total{result="bypass"}` finds 0, not nothing.
+
+#### What to measure: RED and USE
+
+Two checklists cover most of it:
+
+- For anything that serves requests, the **RED** method: **R**ate, **E**rrors,
+  **D**uration. It describes what users experience.
+- For every resource, the **USE** method: **U**tilization (how busy),
+  **S**aturation (how much work waits), **E**rrors. It explains *why*.
+
+Google's "four golden signals" (latency, traffic, errors, saturation) are the
+same idea. Ours:
+
+| Question | Metric |
+|----------|--------|
+| How many requests, of which kind? | `http_requests_total{method, route, status}` |
+| How many fail? | the same, with `status=~"5.."` |
+| How long do they take? | `http_request_duration_seconds` |
+| Is an instance saturated? | `http_requests_in_progress`, `process_cpu_seconds_total` |
+| Is the connection pool saturated? | `db_pool_connections_in_use` / `db_pool_connections_limit` |
+| Is the cache working? | `cache_lookups_total{result}` |
+| Do clicks keep up? | `click_backlog_entries`, `click_backlog_oldest_age_seconds` |
+| Is Redis failing? | `redis_fallbacks_total`, `circuit_breaker_open` |
+
+#### How the numbers are counted
+
+- **A middleware** wraps every request: it starts a timer, notes the status
+  code when the answer starts, and in a `finally` (so that a crash still
+  counts, as a 500) adds 1 to the counter and records the duration.
+- **Counters in place**, where the event happens: a cache lookup, a 429, a
+  Redis call that fell back, the circuit breaker opening.
+- **Collectors**, for numbers cheaper to measure when asked than to keep up
+  to date. When Prometheus scrapes, one asks SQLAlchemy's pool how many
+  connections are lent out; another asks Redis, in one round trip, how many
+  clicks wait in the stream (`XLEN`), the oldest one (`XRANGE ... COUNT 1`),
+  and the time (`TIME`). A stream ID starts with its arrival time in
+  milliseconds, so the oldest click's age is Redis's clock minus its ID. Both
+  come from Redis's clock: a difference between two machines' clocks can't
+  skew it.
+- **A gauge misses what happens between scrapes.** A circuit breaker that
+  opens for 5 seconds and closes again between two scrapes never shows as
+  open. So the breaker also counts how many times it opened: a counter can't
+  miss it.
+
+The worker answers no HTTP requests, so it has a registry of its own, served
+on port 8001 by `prometheus_client`'s small built-in server, on a thread:
+batches, clicks counted, errors, time per batch, the backlog, and its
+process's CPU and memory.
+
+`/metrics` is for Prometheus only: it tells whoever reads it how much traffic
+you have and what fails. Nginx answers 404 to it from outside; Prometheus asks
+each instance directly, on Docker's internal network. And the route is `async
+def` on purpose: it runs on the event loop, not in the thread pool, so an
+instance whose threads are all busy still answers. The moment you need the
+numbers most is when an instance is overloaded.
+
+### Part 2: Prometheus and PromQL
+
+#### Finding the targets
+
+Prometheus asks every instance directly, not through Nginx: through Nginx,
+each scrape would reach a different instance, and every graph would show a
+random third of the truth. To find them, it uses lesson 4's trick: Docker's
+DNS server answers the name `app` with the address of every instance, and
+`dns_sd_configs` asks it every 15 seconds. Start a fourth instance and
+Prometheus finds it. (On Kubernetes, `kubernetes_sd_configs` asks the API
+server instead.)
+
+Prometheus adds two labels to every series it collects, `job` (`app`,
+`click-worker`) and `instance` (address and port), and records a few series
+of its own for every target, such as `up` (1 if the scrape worked) and
+`scrape_duration_seconds`.
+
+#### PromQL in five queries
+
+```promql
+# Requests per second, over the last 5 minutes, all instances together
+sum(rate(http_requests_total{job="app"}[5m]))
+
+# The same, by route
+sum by (route) (rate(http_requests_total{job="app"}[5m]))
+
+# The share of redirects that failed
+  sum(rate(http_requests_total{route="/{code}", status=~"5.."}[5m]))
+/ sum(rate(http_requests_total{route="/{code}"}[5m]))
+
+# The 99th percentile of redirect latency, across all instances
+histogram_quantile(0.99,
+  sum by (le) (rate(http_request_duration_seconds_bucket{route="/{code}"}[5m])))
+
+# Requests per second by instance *number*, not by IP address
+sum by (instance_number) (
+  rate(http_requests_total{job="app"}[5m])
+  * on (instance) group_left (instance_number) app_info)
+```
+
+- `rate(x[5m])` is how fast a counter grew, per second, over 5 minutes. It
+  understands restarts: a counter that drops to 0 started again, and the
+  count carries on from there.
+- `sum by (label)` adds series up, keeping only that label.
+- **`rate` first, then `sum`.** Summing raw counters first would turn one
+  instance's restart into a huge drop in the total.
+- `histogram_quantile` works on the rates of the buckets; the `le` label
+  ("less than or equal") is each bucket's upper bound.
+- The last query is a **join**. `app_info` has the value 1 and carries the
+  instance number as a label; multiplying by it copies that label onto the
+  request rates. IP addresses change at every restart, while the instance
+  numbers are the ones in the logs and in `/health`.
+
+#### Recording rules
+
+Some queries run all the time: the error ratios over 5 minutes, 30 minutes,
+1 hour and 6 hours, and the share of fast redirects. **Recording rules** make
+Prometheus compute them every 15 seconds and store the result as a new
+series, such as `slo:redirect_errors:ratio_rate5m`. The alerts and the
+dashboard read those: computed once, and defined once. The name follows
+Prometheus's convention, `level:metric:operations`.
+
+### Part 3: Alerts that mean something
+
+#### SLIs, SLOs and the error budget
+
+- An **SLI** (service level *indicator*) measures what users experience.
+  Ours: the share of redirects answered without a server error, and the
+  share answered within 100 ms.
+- An **SLO** (*objective*) is a target for an SLI over a period. Ours, over
+  30 days: 99.9% of redirects without a server error, 99% within 100 ms.
+- An **SLA** (*agreement*) is a contract that costs money when broken. It is
+  looser than the SLO, so that you hear about trouble before it's expensive.
+
+Why not 100%? Nothing is 100% reliable (not the network, not the user's
+phone), and a 100% target would forbid every change. The 0.1% left over is
+the **error budget**: 0.001 × 30 days × 24 hours × 60 minutes = about **43
+minutes** of total failure a month. While budget is left, ship features;
+once it's spent, work on reliability. An argument between "move fast" and
+"don't break things" becomes a number both sides can read.
+
+#### Alert on symptoms, not causes
+
+An alert that **pages** wakes someone up, so it should mean that users are
+hurt *now*: "redirects are failing", not "CPU at 90%". CPU at 90% while every
+request is fast is fine; a full disk on a spare machine may hurt no one.
+Causes belong on the dashboard, or in a **ticket** for working hours. And
+every alert must call for an action: if the right answer to a page is "wait
+and see", it shouldn't be a page. People learn to ignore alerts that cry
+wolf; that's **alert fatigue**, and it is how real alerts get missed.
+
+| Severity | Our alerts |
+|----------|------------|
+| **page** | Redirects failing fast (`RedirectErrorBudgetBurningFast`); no instance answering (`AppDown`) |
+| **ticket** | Errors burning the budget slowly; slow redirects; an instance missing; the worker down or behind; clicks bypassing the stream; the Redis circuit open; a saturated connection pool |
+
+#### Burn rates: how fast is the budget going?
+
+"Alert when more than 0.1% of requests fail" is a poor alert. A five-minute
+blip at 0.2% fires it, though it costs a sliver of the month's budget. A
+better question is: **how fast are we spending the budget?**
+
+The **burn rate** is the error rate divided by the budgeted rate (0.1%). At
+a burn rate of 1, the budget lasts exactly 30 days. At **14.4**, an hour
+spends 2% of it (14.4 × 1 hour ÷ 720 hours), and it's all gone in about two
+days. Google's SRE workbook suggests:
+
+| Severity | Burn rate | Long window | Short window | Budget spent before it fires |
+|----------|-----------|-------------|--------------|------------------------------|
+| page | 14.4 | 1 hour | 5 minutes | 2% |
+| ticket | 6 | 6 hours | 30 minutes | 5% |
+
+```yaml
+- alert: RedirectErrorBudgetBurningFast
+  expr: |
+    slo:redirect_errors:ratio_rate1h > (14.4 * 0.001)
+    and
+    slo:redirect_errors:ratio_rate5m > (14.4 * 0.001)
+  for: 2m
+  labels:
+    severity: page
+```
+
+Why two windows? The long one says "this is serious, not a blip". The short
+one says "and it's still going on": without it, the alert would keep firing
+for up to an hour after the fix, while the hourly average comes down.
+`for: 2m` makes the condition hold for 2 minutes (8 checks) before the alert
+fires, which filters out a single odd scrape.
+
+#### When nobody is left to count the errors
+
+If every app instance is down, Nginx answers every redirect with a 502, but
+no instance is left to count anything. `http_requests_total` gets no new
+data, the ratios have nothing to divide, and the burn-rate alerts stay
+quiet. The metric is *missing*, not bad. So `AppDown` counts instances
+instead:
+
+```yaml
+expr: (count(up{job="app"} == 1) or vector(0)) == 0
+```
+
+`count()` of nothing is not 0, it is *no result*, and "no result == 0" is
+no result again: without `or vector(0)`, this alert could never fire. An
+alert on a metric that disappears exactly when things go wrong is the most
+common silent failure in monitoring. (Better still would be to measure where
+the user stands: scrape Nginx, which sees every 502, or probe the service
+from outside, with Prometheus's blackbox exporter.)
+
+#### Runbooks
+
+Every alert links to its section of `docs/RUNBOOK.md`: what it means, what
+users feel, and the first things to check, with the commands. At 3 a.m., the
+person paged shouldn't have to work out what
+`slo:redirect_errors:ratio_rate1h` means. A test checks that every alert has
+its section, and links to it.
+
+#### Testing alerts
+
+An alert you have never seen fire is a guess. Prometheus's own tool,
+**promtool**, runs the rules against made-up history:
+
+```yaml
+- name: no instance at all pages someone
+  interval: 1m
+  input_series:
+    - series: 'up{job="click-worker", instance="worker:8001"}'
+      values: "1x5"          # the worker answers; no app instance exists at all
+  alert_rule_test:
+    - eval_time: 2m
+      alertname: AppDown
+      exp_alerts:
+        - exp_labels:
+            severity: page
+```
+
+Eleven such tests check that each alert fires when it should, and that the
+burn-rate alerts stay quiet within budget. `make monitoring-check` runs them
+in Docker, and CI on every pull request. One more test reads every query in
+`alerts.yml` and in the dashboard, and checks each metric name against the
+metrics the code defines. To Prometheus, a query on a metric that doesn't
+exist is not an error: it finds nothing. Rename a metric and forget an
+alert, and the alert can never fire, without a word.
+
+### Part 4: Load testing
+
+#### Open and closed models
+
+There are two ways to generate load:
+
+- **Closed**: N virtual users, each sending a request, waiting for the
+  answer, then sending the next. When the server slows down, the users wait,
+  so fewer requests are sent: the load drops exactly when the server
+  struggles.
+- **Open**: requests arrive at a fixed rate, whatever happened to the ones
+  before. Real users behave like this: a thousand people don't wait for each
+  other's pages to load.
+
+The closed model's flaw has a name, **coordinated omission** (Gil Tene).
+Say the server freezes for one second. A closed client with one user records
+one slow request, then carries on. An open client at 100 requests a second
+records 100 slow requests, which waited from 0 to 1 second each: that is
+what real users lived through. A closed test can report a p99 that is wrong
+by orders of magnitude.
+
+k6's `constant-arrival-rate` executor is an open model. It starts RATE
+requests every second and keeps a pool of virtual users only as workers. If
+all of them are busy waiting for answers, it can't start a request on time,
+and counts it in `dropped_iterations`: the server didn't keep up. Our
+threshold allows none.
+
+#### Traffic that looks real
+
+- **Popularity follows Zipf's law**: the k-th most popular link gets clicks
+  in proportion to 1/k. With 100 links, the most popular gets 19% of the
+  clicks, and the top ten 56%. Clicking a single link would measure only the
+  cache; clicking all links equally would hide the hot ones.
+- **5% of requests ask for codes that don't exist** (typos, scanners), which
+  exercises the 404 path and the negative cache.
+- **Rate limits are raised** (`loadtest/compose.yml`): every k6 request
+  comes from one IP address, which a real limit would rightly stop.
+- k6 runs in Docker and goes through Nginx, so the numbers include it.
+
+#### Thresholds: a load test that passes or fails
+
+```js
+thresholds: {
+  http_req_failed: ["rate<0.001"],                   // 99.9% succeed
+  "http_req_duration{kind:redirect}": ["p(99)<100"], // 99% within 100 ms
+  checks: ["rate>0.999"],
+  dropped_iterations: ["count==0"],                  // the server kept up
+},
+```
+
+These are the SLOs again, seen from outside. CI runs a 10-second load test on
+every pull request, to prove that the script and the stack work together;
+longer ones run when asked: `make loadtest RATE=500 DURATION=2m`, or from
+GitHub's Actions tab (Load test, Run workflow).
+
+#### Little's law
+
+**L = λ × W**: the average number of requests inside a system equals their
+arrival rate times the average time each one spends there. At 300 requests a
+second and 3 ms each, about one request is in flight at any moment. If the
+time grows to 1 second, 300 are, and each holds a thread, and maybe a
+database connection. Each instance runs requests on 40 threads, so past
+about 40 requests in progress, new ones queue for a thread. That's why the
+dashboard shows requests in progress next to latency: when W grows, L grows,
+until it hits a limit and everything queues. The law also tells k6 how many
+virtual users it needs: the rate times the slowest answer you expect.
+
+### Part 5: What the numbers showed
+
+#### The worker committed for every click or two
+
+The first run of the load test, with the dashboard open: 300 redirects a
+second, and PostgreSQL committing **805 transactions a second**. Redirects
+were served from Redis, and clicks were supposed to be counted in batches,
+so where did they all come from? The worker's own metrics answered: **259
+batches a second**, about one click each, and the worker using 55% of a CPU.
+
+Lesson 5 said batches adapt to the load by themselves, and they do, but not
+the way we hoped. `XREAD ... BLOCK` returns as soon as there is anything to
+read. At 300 clicks a second, a click arrives every 3.3 ms; a round of the
+worker (read, count, commit, trim) took about 4 ms, so each read found one or
+two new clicks, and each became a transaction. Batches only grew towards
+1000 when the worker fell behind.
+
+The fix is to wait a little before reading again, when the last batch wasn't
+full: a **linger**. Kafka's producers call it `linger.ms`; TCP's Nagle
+algorithm does the same with small packets. 0.2 seconds at 300 clicks a
+second gathers about 60 clicks per batch. A full batch means a backlog, and
+then the worker doesn't wait: a backlog still drains at full speed.
+
+| At 300 redirects a second | No linger | Linger 0.2 s |
+|---------------------------|-----------|--------------|
+| Batches per second | 259 | 4.8 |
+| PostgreSQL commits per second | 805 | 28 |
+| Worker CPU | 55% of a core | 2.2% |
+| Redirect p99, seen by k6 | 9.1 ms | 4.6 ms |
+
+The price is that a click is counted up to 0.2 seconds later; for a click
+counter, no one can tell. Redirects got faster too, because the worker no
+longer competed with the app instances for the same four cores.
+
+And why 805 commits for 259 batches, three per batch where we expected one?
+Logging every statement for one click (`ALTER SYSTEM SET log_statement =
+'all'`) showed it. Before it lends a connection, SQLAlchemy checks that the
+connection still works (`pool_pre_ping=True`), and for psycopg it sends an
+empty statement in autocommit mode, which PostgreSQL counts as a transaction
+of its own. The worker borrows a connection twice per batch, once to read
+the checkpoint and once to count, so each batch was two checks and one real
+commit. The checks are cheap (no disk write), but each is a round trip, and
+the linger removed most of them along with the batches.
+
+The lesson is bigger than the fix: a number we had no plan to look at
+contradicted what we believed about our own design. Observability is not for
+confirming what you know; it is for showing you what you didn't.
+
+### Part 6: Every step, measured
+
+With a load test that any step can run, we could finally answer what each
+lesson had only argued: what did each step buy, and what did it cost? We
+ran the same test against all five steps, each from its own branch, on the
+same machine, twice. [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the method
+and every number; this part is what to take from them.
+
+#### A fair comparison
+
+A benchmark compares, so everything but the thing compared must stay the
+same:
+
+- **The same test, the same machine, a fresh start.** Each step ran from its
+  own branch, with an empty database, after the same warm-up.
+- **The load generator on a core of its own.** k6 needs CPU too. Sharing
+  the cores of the system it measures, it would slow it down, and more so at
+  higher rates. The system under test got cores 0 to 2, k6 core 3.
+- **Several rates, not one.** A single number hides where things break.
+  Running 100, 300, 600 and 900 requests a second shows the *knee*: the rate
+  where latency stops being flat and starts to climb, because requests
+  queue.
+- **Twice.** With a single run, you can't tell a difference from noise.
+- **Resources, not only latency.** Latency tells you *that* a step is slow;
+  the CPU of each container tells you *where* the time goes.
+
+And measure the measurement. Our first CPU figures were samples from
+`docker stats`, each over about a second, and they were too high. Every 10
+seconds, Docker runs each app container's health check, which starts a
+Python interpreter to call `/health`: about a quarter of a second of CPU. A
+sample that catches one shows a quarter of a core more than the requests
+used. So we read each container's CPU counter instead (the total CPU time it
+has used, kept by its cgroup), before and after each run: an average over 30
+seconds, which no single moment can skew.
+
+#### What each step bought
+
+| Step | Answered a second, 900 asked | Median redirect, 600 asked |
+|------|-----------------------------:|---------------------------:|
+| 1: one instance | 254 to 260 | 2.2 to 2.3 s |
+| 2: a Redis cache | 152 to 244 | 2.3 to 2.5 s |
+| 3: three instances behind Nginx | 516 to 536 | 0.5 to 0.7 s |
+| 4: clicks counted by a worker | 879 to 880 | 3.6 to 3.9 ms |
+| 5: metrics, and the worker's linger | 876 to 881 | 3.0 to 3.1 ms |
+
+The ranges are the two runs. Each line has a lesson:
+
+- **A process is a ceiling.** One instance answered about 250 redirects a
+  second, however many arrived. Past that, they queued, and the median went
+  from 5 ms to seconds. Python runs Python code on one core at a time (the
+  global interpreter lock), and a redirect cost close to 5 ms of CPU.
+- **Speeding up what isn't the bottleneck changes nothing.** The cache
+  halved PostgreSQL's CPU per redirect, and the ceiling didn't move: the
+  limit was the app's process, and asking Redis costs Python about as much
+  as asking PostgreSQL. Find where the time goes before you optimize. The
+  cache isn't wasted, though. On a real system, the database is on another
+  machine, shared, with more data than fits in its memory, and it is often
+  the first thing to fall over; here, it sat on the same machine with every
+  link in memory. And step 4 builds on the cache: with the link from Redis
+  and the click into a stream, a redirect never touches PostgreSQL.
+- **Scaling out works until something shared saturates.** Three instances
+  doubled the throughput (not tripled: they share three cores with
+  PostgreSQL, Redis and Nginx). Then the hot rows took over. Every redirect
+  still ran `UPDATE links SET clicks = clicks + 1`, and only one transaction
+  at a time can update a row. With PostgreSQL logging every lock wait over
+  10 ms, a 30-second run logged 10 waits at 300 requests a second, and
+  29,037 at 600. A lock is a part of the work that runs one at a time, and
+  no number of instances makes that part faster (Amdahl's law).
+- **Take work off the request path.** Step 4 replaced the `UPDATE` with an
+  append to a Redis stream: no lock, no transaction, and the app's CPU per
+  redirect fell from about 3.5 ms to a little over 2 ms. At 900 requests a
+  second, it answered 880 with a median of 22 ms, where step 3 answered
+  about 520 with a median of 1.5 s.
+- **Observability is cheap, and it paid for itself.** Metrics cost 0.1 to
+  0.2 ms of CPU per redirect, and Prometheus and Grafana together about 3% of
+  a core. The linger they led to (Part 5) saved more: the worker went from
+  25-51% of a core to 4%, PostgreSQL from 11-23% to 3-4%, and step 5's p99 at
+  600 requests a second was 30 to 42 ms, against 51 to 140 ms for step 4.
+
+At 900 requests a second, steps 4 and 5 just keep up, with the three cores
+76 to 83% busy. The limit now is plain CPU: the app needs about 2 ms of it
+per redirect. More instances wouldn't help on this machine; more cores, or
+less work per request, would.
+
+#### Noise
+
+At 100 requests a second, the two runs agreed on every median within 0.3 ms,
+but not on the p99s: step 1's was 13 ms in one run and 43 ms in the other,
+step 3's 74 ms and 11 ms. Over 30 seconds at 100 a second, the p99 is decided
+by the 30 slowest requests, and a single hiccup (a slow disk flush, a busy
+neighbour on the same physical machine) moves it. Overloaded, even the
+throughput varies: step 2 answered 244 a second at 900 asked in one run, and
+152 in the other. Two rules follow. Compare p99s only over long runs or many
+runs. And don't believe a difference you haven't seen twice.
+
+### Going further
+
+- **Alertmanager** receives the alerts, groups them, silences them during
+  maintenance, and sends pages to PagerDuty or Opsgenie and tickets to a
+  chat channel. It can also *inhibit*: while `AppDown` fires, the burn-rate
+  alerts add nothing. We stop at Prometheus's alerts page.
+- **Tracing** with OpenTelemetry follows one redirect through Nginx, the app,
+  Redis and PostgreSQL. *Exemplars* link a histogram bucket to traces of
+  requests that landed in it: "show me one of those slow ones".
+- **Logs**, structured as JSON, collected in one place (Loki,
+  Elasticsearch), with a request ID shared with the traces.
+- **Long-term storage**: our Prometheus keeps 7 days (at most 1 GB). Thanos or
+  Mimir keep months, for many Prometheus servers at once.
+- **Native histograms** (Prometheus 3) choose their own exponential buckets,
+  at a much finer resolution, for about the cost of a few classic buckets.
+
+### Testing it
+
+- **Each metric moves when it should** (`tests/test_metrics.py`): a 404 on a
+  short code is counted under `/{code}`, an unknown path under `unmatched`, a
+  crash as a 500, a strange method as `other`; a cache hit, a click through
+  the stream or the database, a 429, three Redis errors and then a circuit
+  open; the pool collector, and the backlog with a click added 5 seconds in
+  the past (a stream ID chosen by the test).
+- **The worker's metrics**: batches, clicks counted, errors by system, and
+  its own `/metrics` page, served on a free port. A fake stop event records
+  every wait, to check the linger happens after a small batch only.
+- **Every query names real metrics** (`tests/test_monitoring.py`): a small
+  PromQL reader takes each query of the dashboard and the alerts apart, and
+  every name must be one the app, the worker or a recording rule defines.
+  Every alert has a runbook section, a link to it, and a test that fires it.
+- **The alerts behave** (promtool, `alerts_test.yml`).
+- **The real stack, in CI**: `scripts/check_metrics.py` waits until
+  Prometheus sees 3 app instances, the worker and itself, every rule works,
+  every dashboard query runs, and Grafana serves the dashboard; `/metrics` is
+  refused through Nginx. Then k6 runs for 10 seconds.
+- **The tests were tested**: we renamed a metric and changed a threshold on
+  purpose, and checked that the tests failed.
+
+### Try it yourself
+
+```bash
+make loadtest                         # starts the stack (limits raised), then 200 redirects/s for a minute
+# Grafana, no login needed to look: http://localhost:3000
+# Prometheus's targets and alerts:  http://localhost:9090/targets, http://localhost:9090/alerts
+make loadtest RATE=600 DURATION=2m    # where does it break? which panel shows it first?
+
+# One instance's own page (from inside: Nginx refuses it)
+docker compose exec app python -c "import urllib.request as u; print(u.urlopen('http://localhost:8000/metrics').read().decode())" | grep '^http_requests_total'
+
+# Ask Prometheus directly
+curl -s localhost:9090/api/v1/query --data-urlencode 'query=sum by (route) (rate(http_requests_total[1m]))'
+
+# Make two alerts fire: stop the worker while clicks keep coming
+docker compose stop worker
+docker compose -f docker-compose.yml -f loadtest/compose.yml run --rm --no-deps -e RATE=20 -e DURATION=8m k6
+#   ClickWorkerDown fires after 2 minutes; ClicksWaitingTooLong after about 6
+#   (the oldest click must have waited over a minute, for 5 minutes in a row)
+docker compose start worker           # the backlog is counted within seconds
+docker compose up --detach --wait     # back to the normal rate limits
+```
+
+### Exercises
+
+1. **A latency budget.** Write burn-rate alerts for the latency objective
+   (99% of redirects within 100 ms). What's the budget? Which windows? Test
+   them with promtool.
+2. **Count the 502s.** When every instance is down, the error-rate SLI sees
+   nothing. Export Nginx's status codes (the nginx-prometheus-exporter, or a
+   log-based exporter) and compute the SLI from Nginx instead. Which one is
+   closer to what users see, and why?
+3. **Alertmanager.** Add it to the stack: pages to one receiver, tickets to
+   another, `AppDown` inhibiting the burn-rate alerts. Test the routing with
+   `amtool`.
+4. **Cardinality.** Add a `code` label to `clicks_recorded_total`, run the
+   load test with `LINKS=10000`, and watch `prometheus_tsdb_head_series` and
+   the size of `/metrics`. Then remove it.
+5. **Coordinated omission, measured.** Run the load test with k6's
+   `constant-vus` executor (a closed model) while you `docker compose pause
+   redis` for 2 seconds. Compare its p99 with the open model's.
+6. **Tune the linger.** Measure batches, commits and the worker's CPU with a
+   linger of 0, 0.05, 0.2 and 1 second. Where is the knee? What happens to
+   the oldest click's age?
+7. **Find the limit.** Raise RATE until a threshold fails. Which resource ran
+   out first (the USE panels)? Add instances: does it scale linearly? Why
+   not on four cores?
+8. **Trace a click.** Add OpenTelemetry to the app and the worker, send
+   traces to Jaeger, and follow one click from the redirect to the worker's
+   commit.
+9. **Benchmark one change.** Pick one idea to make a redirect cheaper (an
+   `async` redirect with `redis.asyncio` instead of a thread per request, two
+   uvicorn processes per container, one middleware fewer) and measure it the
+   way `docs/BENCHMARKS.md` does: before and after, twice each, with the CPU
+   per redirect. Was it worth the code?
+
+### Interview questions this lesson prepares you for
+
+- "How would you monitor a web service? What would you alert on, and what would you only graph?"
+- "Logs, metrics and traces: what is each good for?"
+- "Pull or push for metrics? What are the trade-offs?"
+- "How do you get the p99 latency across ten instances? Why can't you average percentiles?"
+- "What is cardinality, and how can it take down a monitoring system?"
+- "What are SLIs, SLOs and SLAs? How do you choose an SLO? What is an error budget for?"
+- "Explain burn-rate alerting. Why two windows?"
+- "Your service was down for an hour and no alert fired. How could that happen?"
+- "How do you avoid alert fatigue?"
+- "What is coordinated omission? Open or closed load model?"
+- "State Little's law, and use it to size a thread pool or a connection pool."
+- "The RED and USE methods: what are they, and when do you use each?"
+- "How would you load test a service before launch? What traffic would you generate?"
+- "Your service tops out at 250 requests a second. How do you find the bottleneck?"
+- "A change made your benchmark 10% faster. How do you know it's real?"
+
+### Looking back
+
+Six lessons, one small service, and most of what a real system needs: an
+API with sound status codes and validation (lesson 1), the tooling and
+discipline of a professional team (lesson 2), a cache that survives its own
+failures and rate limits that hold across instances (lesson 3), load
+balancing, unique IDs without coordination and safe migrations (lesson 4),
+work taken off the request path with exactly-once counting (lesson 5), and
+now the means to see all of it, and to prove what each step was worth.
+
+The habits matter more than the tools: measure before you believe, decide
+how you want to fail before you do, test the failure paths as carefully as
+the happy one, and write down why. Those carry over to any system you build.

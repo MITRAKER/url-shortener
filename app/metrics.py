@@ -1,12 +1,12 @@
 """Prometheus metrics: what the app and the click worker count and time.
 
 Prometheus *pulls*: every 15 seconds it asks each app instance for its
-/metrics page, and the click worker for its own (monitoring/prometheus.yml).
-A page is plain text: counters, gauges and histograms with their current
-values. A process keeps only running totals since it started; Prometheus
-stores them over time and does the arithmetic: rates, ratios, percentiles.
-/metrics is for Prometheus, on the internal network: Nginx refuses it from
-outside.
+/metrics page, and the click worker for its own
+(monitoring/prometheus/prometheus.yml). A page is plain text: counters,
+gauges and histograms with their current values. A process keeps only
+running totals since it started; Prometheus stores them over time and does
+the arithmetic: rates, ratios, percentiles. /metrics is for Prometheus, on
+the internal network: Nginx refuses it from outside.
 
 Every label value comes from a short, fixed list (a route's template, a known
 method, a status code), never straight from the request: each distinct value
@@ -62,7 +62,8 @@ REQUESTS: Final = Counter(
 # A histogram counts the requests that took up to each bucket's time;
 # Prometheus estimates percentiles from the counts, across all instances at
 # once. 0.1 is a bucket on purpose: it is our latency objective
-# (monitoring/alerts.yml), so "how many took 100 ms or less" is exact.
+# (monitoring/prometheus/alerts.yml), so "how many took 100 ms or less" is
+# exact.
 DURATION: Final = Histogram(
     "http_request_duration_seconds",
     "Time from receiving a request to sending the end of the answer.",

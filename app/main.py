@@ -125,10 +125,11 @@ def health(ids: IdsDep) -> dict[str, str | int]:
     return {"status": "ok", "instance": ids.snowflake.instance_id}
 
 
-# For Prometheus (monitoring/prometheus.yml), which asks every instance
-# directly; Nginx refuses it from outside. Not rate limited, and async on
-# purpose: it runs on the event loop, so it answers even when every worker
-# thread is busy with requests. An overloaded instance must still report.
+# For Prometheus (monitoring/prometheus/prometheus.yml), which asks every
+# instance directly; Nginx refuses it from outside. Not rate limited, and
+# async on purpose: it runs on the event loop, so it answers even when every
+# worker thread is busy with requests. An overloaded instance must still
+# report.
 @app.get(metrics.METRICS_PATH, include_in_schema=False)
 async def prometheus_metrics() -> Response:
     return Response(metrics.generate_latest(), media_type=metrics.CONTENT_TYPE_LATEST)

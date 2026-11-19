@@ -38,10 +38,11 @@ the month's error budget (0.1% of redirects) is gone in about two days.
 
 ### RedirectErrorBudgetBurningSlowly
 
-**Severity: ticket.** Over the last six hours, more than 0.6% of redirects
-failed. Not an emergency, but the budget will be spent within the month at
-this pace. Same checks as above, with more time: look for a pattern (one
-instance, one time of day, one kind of link).
+**Severity: ticket.** Over the last six hours, and still in the last 30
+minutes, more than 0.6% of redirects failed. Not an emergency, but at this
+pace the month's error budget is gone in about five days. Same checks as
+above, with more time: look for a pattern (one instance, one time of day,
+one kind of link).
 
 ### RedirectsSlow
 
