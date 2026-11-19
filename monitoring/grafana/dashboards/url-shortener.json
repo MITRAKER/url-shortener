@@ -1056,7 +1056,7 @@
     {
       "type": "timeseries",
       "title": "Clicks waiting",
-      "description": "Clicks in the Redis stream, not counted yet. Near 0 while the worker keeps up.",
+      "description": "Clicks in the Redis stream, not counted yet. Near 0 while the worker keeps up. The app instances measure it as well as the worker, so it still shows while the worker is down.",
       "id": 18,
       "datasource": {
         "type": "prometheus",
@@ -1075,7 +1075,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max(click_backlog_entries{job=\"click-worker\"})",
+          "expr": "max(click_backlog_entries)",
           "legendFormat": "waiting",
           "range": true,
           "instant": false
@@ -1119,7 +1119,7 @@
     {
       "type": "timeseries",
       "title": "Oldest waiting click",
-      "description": "How long the oldest click in the stream has waited. The alert ClicksWaitingTooLong fires above a minute.",
+      "description": "How long the oldest click in the stream has waited. The alert ClicksWaitingTooLong fires once it has stayed above a minute for 5 minutes. The app instances measure it as well as the worker, so it still shows while the worker is down.",
       "id": 19,
       "datasource": {
         "type": "prometheus",
@@ -1138,7 +1138,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max(click_backlog_oldest_age_seconds{job=\"click-worker\"})",
+          "expr": "max(click_backlog_oldest_age_seconds)",
           "legendFormat": "age",
           "range": true,
           "instant": false

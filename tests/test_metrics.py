@@ -6,16 +6,24 @@ reads a metric before and after, and checks the difference.
 
 import asyncio
 import logging
+import threading
+import time
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
+import anyio
 import pytest
 import redis
 from fastapi.testclient import TestClient
 from prometheus_client import CollectorRegistry
+from prometheus_client.core import Metric
 from sqlalchemy import create_engine
 from starlette.types import Message, Receive, Scope, Send
 
 from app import __version__
+from app import main as main_module
 from app.breaker import CircuitBreaker
 from app.clicks import STREAM
 from app.metrics import (
@@ -25,8 +33,8 @@ from app.metrics import (
     DatabasePoolCollector,
     PrometheusMiddleware,
 )
-from app.redis_client import make_redis
-from tests.fakes import FakeClock
+from app.redis_client import RedisGateway, make_redis
+from tests.fakes import FakeClock, SilentServer
 
 URL = "https://example.com/"
 
@@ -91,6 +99,91 @@ def test_the_version_and_instance_number_are_published() -> None:
     # The instance number tells which /health answer goes with which target
     # in Prometheus (on SQLite there is only instance 0).
     assert value("app_info", version=__version__, instance_number="0") == 1
+
+
+@contextmanager
+def instance(gateway: RedisGateway, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    """A started app instance whose own Redis is `gateway`: the one it gets
+    from get_redis() at startup, to measure the backlog. (The `client`
+    fixtures set only the Redis that requests get.)"""
+    monkeypatch.setattr(main_module, "get_redis", lambda: gateway)
+    with TestClient(main_module.app) as client:
+        yield client
+
+
+def test_the_metrics_page_shows_the_clicks_waiting(
+    redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker shows them too, but its page goes when it stops, and that
+    is when the clicks pile up. So every instance shows them as well."""
+    redis_client.xadd(STREAM, {"code": "first"})
+    redis_client.xadd(STREAM, {"code": "second"})
+    with instance(RedisGateway(redis_client), monkeypatch) as client:
+        page = client.get("/metrics").text
+    assert "click_backlog_entries 2.0" in page
+    assert "click_backlog_oldest_age_seconds " in page
+
+
+@pytest.mark.parametrize("hung", [False, True], ids=["refused", "hung"])
+def test_with_redis_down_the_metrics_page_comes_quickly_without_the_backlog(
+    hung: bool,
+    silent_server: SilentServer,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Redis refuses at once, or never answers and the call gives up after
+    its 0.25 s timeout. Either way the rest of the page comes, well within
+    Prometheus's 10 s, and without the backlog: no number beats a wrong one."""
+    gateway = RedisGateway(make_redis(silent_server.url if hung else "redis://127.0.0.1:1/0"))
+    with instance(gateway, monkeypatch) as client:
+        start = time.perf_counter()
+        response = client.get("/metrics")
+        elapsed = time.perf_counter() - start
+    gateway.client.close()
+    assert response.status_code == 200
+    assert "http_requests_total" in response.text
+    assert "click_backlog_entries" not in response.text
+    assert "could not measure the clicks waiting" in caplog.text
+    assert elapsed < 1
+
+
+class SlowCollector:
+    """Stands for a Redis that takes its time: collects only when let go."""
+
+    def __init__(self) -> None:
+        self.waiting = threading.Event()
+        self.go = threading.Event()
+        self.request_threads_taken: int | None = None
+
+    def describe(self) -> list[Metric]:
+        return []  # so that registering it doesn't collect
+
+    def collect(self) -> list[Metric]:
+        # Asked of the event loop: how many of the requests' threads are taken?
+        self.request_threads_taken = anyio.from_thread.run_sync(
+            lambda: anyio.to_thread.current_default_thread_limiter().borrowed_tokens
+        )
+        self.waiting.set()
+        self.go.wait(timeout=5)
+        return []
+
+
+def test_a_slow_scrape_holds_up_no_request(client: TestClient) -> None:
+    """The page is put together on a thread of its own: requests are answered
+    meanwhile, and the scrape takes none of the threads they share."""
+    slow = SlowCollector()
+    REGISTRY.register(slow)
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            scrape = pool.submit(client.get, "/metrics")
+            assert slow.waiting.wait(timeout=5)
+            assert client.get("/health").status_code == 200  # while the scrape waits
+            slow.go.set()
+            assert scrape.result(timeout=5).status_code == 200
+    finally:
+        slow.go.set()
+        REGISTRY.unregister(slow)
+    assert slow.request_threads_taken == 0
 
 
 # ------------------------------------------------------------ requests ----
@@ -309,3 +402,15 @@ def test_without_redis_the_backlog_is_left_out(caplog: pytest.LogCaptureFixture)
         registry = backlog(client)
         assert registry.get_sample_value("click_backlog_entries") is None
     assert "could not measure the clicks waiting" in caplog.text
+
+
+def test_the_backlog_collector_is_registered_without_asking_redis(
+    silent_server: SilentServer,
+) -> None:
+    """The app's registry checks the names of a collector as it registers it.
+    The collector names its metrics itself: otherwise the registry would
+    collect them, and an instance would wait for Redis as it starts."""
+    client = make_redis(silent_server.url)
+    CollectorRegistry(auto_describe=True).register(BacklogCollector(client, STREAM))
+    assert silent_server.connections_made() == 0
+    client.close()

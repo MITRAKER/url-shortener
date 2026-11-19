@@ -2053,16 +2053,16 @@ for every click or two (Part 5).
 | File | What's new |
 |------|------------|
 | `app/metrics.py` | Every metric: requests (a middleware), cache, clicks, rate limits, Redis fallbacks, the circuit breaker; collectors for the connection pool and the click backlog |
-| `app/main.py` | `GET /metrics`, the middleware, the instance's version and number |
+| `app/main.py` | `GET /metrics`, put together on a thread of its own; the middleware; the instance's version and number; the click backlog, on every instance's page too |
 | `app/worker.py` | The worker serves its own metrics on port 8001, and lingers 0.2 s after a batch that wasn't full |
-| `monitoring/prometheus/` | `prometheus.yml` (what to collect), `alerts.yml` (recording rules, alerts), `alerts_test.yml` (11 tests for promtool) |
+| `monitoring/prometheus/` | `prometheus.yml` (what to collect), `alerts.yml` (recording rules, alerts), `alerts_test.yml` (12 tests for promtool) |
 | `monitoring/grafana/` | The data source and the dashboard, as files: Grafana starts ready to use |
 | `docs/RUNBOOK.md` | What to do when each alert fires |
 | `loadtest/redirects.js` | The k6 load test; `make loadtest`, and a workflow to run it on GitHub |
 | `nginx/default.conf` | `/metrics` is refused from outside |
 | `scripts/check_metrics.py` | For CI: every target up, every rule working, every dashboard query valid |
 | `docs/BENCHMARKS.md` | Every step, measured with the same load test |
-| `tests/test_metrics.py`, `tests/test_monitoring.py` | 32 tests: each metric moves when it should; every query names metrics that exist |
+| `tests/test_metrics.py`, `tests/test_monitoring.py` | 37 tests: each metric moves when it should; every query names metrics that exist |
 
 ### Part 1: Metrics
 
@@ -2207,14 +2207,19 @@ same idea. Ours:
 The worker answers no HTTP requests, so it has a registry of its own, served
 on port 8001 by `prometheus_client`'s small built-in server, on a thread:
 batches, clicks counted, errors, time per batch, the backlog, and its
-process's CPU and memory.
+process's CPU and memory. Every app instance serves the backlog too, from
+the same collector: the worker's page goes when the worker stops, and that
+is exactly when the clicks pile up (Part 3 tells how we found out).
 
 `/metrics` is for Prometheus only: it tells whoever reads it how much traffic
 you have and what fails. Nginx answers 404 to it from outside; Prometheus asks
-each instance directly, on Docker's internal network. And the route is `async
-def` on purpose: it runs on the event loop, not in the thread pool, so an
-instance whose threads are all busy still answers. The moment you need the
-numbers most is when an instance is overloaded.
+each instance directly, on Docker's internal network. And the page is put
+together on a thread of its own (`anyio.to_thread.run_sync`, with a
+`CapacityLimiter(1)` of its own). Not on the event loop: measuring the
+backlog asks Redis, and a slow Redis would hold up every request meanwhile.
+Not under the requests' limit of 40 threads either: an instance whose
+threads are all busy must still answer. The moment you need the numbers most
+is when an instance is overloaded.
 
 ### Part 2: Prometheus and PromQL
 
@@ -2364,6 +2369,15 @@ common silent failure in monitoring. (Better still would be to measure where
 the user stands: scrape Nginx, which sees every 502, or probe the service
 from outside, with Prometheus's blackbox exporter.)
 
+We fell into this trap ourselves. At first only the worker measured the
+backlog, so a stopped worker took the backlog off the dashboard, and
+`ClicksWaitingTooLong` (`max(click_backlog_oldest_age_seconds) > 60`) had
+nothing left to compare: it could not fire while the worker was down, the
+very moment clicks pile up. Our promtool test fed it a backlog that kept
+growing on the worker's own page, so it passed. The review found it. Now
+every app instance measures the backlog too, and a test stops the worker:
+both `ClickWorkerDown` and `ClicksWaitingTooLong` fire.
+
 #### Runbooks
 
 Every alert links to its section of `docs/RUNBOOK.md`: what it means, what
@@ -2391,7 +2405,7 @@ An alert you have never seen fire is a guess. Prometheus's own tool,
             severity: page
 ```
 
-Eleven such tests check that each alert fires when it should, and that the
+Twelve such tests check that each alert fires when it should, and that the
 burn-rate alerts stay quiet within budget. `make monitoring-check` runs them
 in Docker, and CI on every pull request. One more test reads every query in
 `alerts.yml` and in the dashboard, and checks each metric name against the
@@ -2634,7 +2648,10 @@ runs. And don't believe a difference you haven't seen twice.
   the stream or the database, a 429, three Redis errors and then a circuit
   open, which reads closed again once its cool-down is over, without a call;
   the pool collector, and the backlog with a click added 5 seconds in the
-  past (a stream ID chosen by the test).
+  past (a stream ID chosen by the test), whose collector is registered
+  without a call to Redis. An instance's own page shows the backlog, and
+  comes quickly without it when Redis refuses or never answers; a scrape
+  held up on purpose holds up no request, and takes none of their threads.
 - **The worker's metrics**: batches, clicks counted, entries skipped (once,
   even when a failed batch is read again), errors by system, and its own
   `/metrics` page, served on a free port. A fake stop event records every
@@ -2643,7 +2660,8 @@ runs. And don't believe a difference you haven't seen twice.
   PromQL reader takes each query of the dashboard and the alerts apart, and
   every name must be one the app, the worker or a recording rule defines.
   Every alert has a runbook section, a link to it, and a test that fires it.
-- **The alerts behave** (promtool, `alerts_test.yml`).
+- **The alerts behave** (promtool, `alerts_test.yml`), including a worker
+  stopped while clicks pile up: both click alerts fire.
 - **The real stack, in CI**: `scripts/check_metrics.py` waits until
   Prometheus sees 3 app instances, the worker and itself, every rule works,
   every dashboard query runs, and Grafana serves the dashboard; `/metrics` is
@@ -2669,7 +2687,8 @@ curl -s localhost:9090/api/v1/query --data-urlencode 'query=sum by (route) (rate
 docker compose stop worker
 docker compose -f docker-compose.yml -f loadtest/compose.yml run --rm --no-deps -e RATE=20 -e DURATION=8m k6
 #   ClickWorkerDown fires after 2 minutes; ClicksWaitingTooLong after about 6
-#   (the oldest click must have waited over a minute, for 5 minutes in a row)
+#   (the oldest click must have waited over a minute, for 5 minutes in a row).
+#   "Clicks waiting" keeps climbing meanwhile: the app instances measure it.
 docker compose start worker           # the backlog is counted within seconds
 docker compose up --detach --wait     # back to the normal rate limits
 ```

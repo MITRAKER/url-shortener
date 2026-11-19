@@ -88,7 +88,10 @@ minutes. The others carry the load, so users are fine as long as they keep up.
 
 **Severity: ticket.** Prometheus can't reach the click worker. Clicks keep
 arriving in the Redis stream and wait there, safely; their counts lag until
-the worker is back. Nothing is lost while Redis has memory to spare.
+the worker is back. Nothing is lost while Redis has memory to spare. The app
+instances measure the backlog too, so "Clicks waiting" and "Oldest waiting
+click" keep showing it, and if clicks keep coming,
+[ClicksWaitingTooLong](#clickswaitingtoolong) fires after about 6 minutes.
 
 1. `docker compose ps worker`, then `docker compose logs --tail 100 worker`.
 2. `docker compose up -d worker`. It carries on from its checkpoint in
@@ -96,13 +99,16 @@ the worker is back. Nothing is lost while Redis has memory to spare.
 
 ### ClicksWaitingTooLong
 
-**Severity: ticket.** The oldest click in the stream has waited over a minute
-for 5 minutes: the worker is running but not counting.
+**Severity: ticket.** The oldest click in the stream has waited over a minute,
+for 5 minutes: the worker is not counting. The app instances measure the
+backlog as well as the worker, so this fires whether the worker is down or
+running but stuck.
 
-1. The worker's logs: "counting clicks failed" means PostgreSQL or Redis
+1. Is [ClickWorkerDown](#clickworkerdown) firing too? Then start there.
+2. The worker's logs: "counting clicks failed" means PostgreSQL or Redis
    keeps failing; the worker retries every second, by design.
-2. "Click worker: batches and errors": errors by system tell which one.
-3. Batches of 1,000 back to back mean a backlog it is still working through;
+3. "Click worker: batches and errors": errors by system tell which one.
+4. Batches of 1,000 back to back mean a backlog it is still working through;
    the age should then be falling.
 
 ### ClicksBypassingTheStream

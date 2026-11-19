@@ -9,3 +9,4 @@ pydantic-settings==2.16.3
 redis==8.1.0
 alembic==1.20.1  # database migrations (step 3)
 prometheus-client==0.26.0  # metrics for Prometheus (step 5)
+anyio==4.16.0  # /metrics on a thread of its own, with its own limit (step 5)

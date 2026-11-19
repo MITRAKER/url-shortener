@@ -4,11 +4,12 @@ import asyncio
 import contextlib
 import logging
 import signal
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from functools import partial
-from typing import Annotated
+from typing import Annotated, Final
 
+from anyio import CapacityLimiter, to_thread
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
@@ -16,7 +17,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app import __version__, instances, metrics, service
 from app.cache import LinkCache
-from app.clicks import ClickStream
+from app.clicks import STREAM, ClickStream
 from app.config import DEFAULT_CODE_SECRET, settings
 from app.db import POOL_MAX_OVERFLOW, POOL_SIZE, engine, get_session
 from app.ids import CodeCipher, LinkIds, RetiredError, Snowflake
@@ -37,6 +38,23 @@ def give_up(snowflake: Snowflake) -> None:
     signal.raise_signal(signal.SIGTERM)
 
 
+@contextmanager
+def backlog_reported(gateway: RedisGateway | None) -> Iterator[None]:
+    """Show the clicks waiting in the stream on this instance's /metrics page
+    while the `with` block runs. The worker shows them too, but its page goes
+    when it stops, and that is when the clicks pile up: from the instances'
+    pages, ClicksWaitingTooLong still sees them (monitoring/prometheus)."""
+    if gateway is None:
+        yield  # no Redis, no stream
+        return
+    collector = metrics.BacklogCollector(gateway.client, STREAM)
+    metrics.REGISTRY.register(collector)
+    try:
+        yield
+    finally:
+        metrics.REGISTRY.unregister(collector)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The tables are not created here: migrations do that (`alembic upgrade
@@ -47,7 +65,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.warning("CODE_SECRET is not set: anyone can work out the codes. Set it in production.")
     # Hold a unique instance number for as long as this instance runs, and
     # keep checking that we still do.
-    with instances.lease_instance_id(engine) as lease:
+    with instances.lease_instance_id(engine) as lease, backlog_reported(get_redis()):
         metrics.APP.info({"version": __version__, "instance_number": str(lease.number)})
         snowflake = Snowflake(lease.number)
         app.state.ids = LinkIds(snowflake, CodeCipher(secret))
@@ -129,14 +147,21 @@ def health(ids: IdsDep) -> dict[str, str | int]:
     return {"status": "ok", "instance": ids.snowflake.instance_id}
 
 
+# One scrape at a time, on a thread that isn't one of the requests' (below).
+SCRAPE_LIMITER: Final = CapacityLimiter(1)
+
+
 # For Prometheus (monitoring/prometheus/prometheus.yml), which asks every
-# instance directly; Nginx refuses it from outside. Not rate limited, and
-# async on purpose: it runs on the event loop, so it answers even when every
-# worker thread is busy with requests. An overloaded instance must still
-# report.
+# instance directly; Nginx refuses it from outside. Not rate limited. The page
+# is put together on a thread of its own, for two reasons. Measuring the click
+# backlog asks Redis, which may take up to its timeout: on the event loop,
+# that wait would hold up every request. And the thread runs under a limiter
+# of its own, not under the requests' limit of 40 threads: an overloaded
+# instance, every thread busy, must still report.
 @app.get(metrics.METRICS_PATH, include_in_schema=False)
 async def prometheus_metrics() -> Response:
-    return Response(metrics.generate_latest(), media_type=metrics.CONTENT_TYPE_LATEST)
+    page = await to_thread.run_sync(metrics.generate_latest, limiter=SCRAPE_LIMITER)
+    return Response(page, media_type=metrics.CONTENT_TYPE_LATEST)
 
 
 @app.post("/api/links", status_code=status.HTTP_201_CREATED, dependencies=[limit_create])

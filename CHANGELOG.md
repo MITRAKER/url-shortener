@@ -16,9 +16,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   bucket at the 100 ms objective), requests in progress, cache lookups by
   result, clicks by path (the stream or the database), requests refused with
   429, Redis calls that fell back, the circuit breaker's state and openings,
-  the database connection pool, and the app's version and instance number.
-  Label values come from fixed lists only. Nginx refuses `/metrics` from
-  outside.
+  the database connection pool, the clicks waiting in the stream with the age
+  of the oldest (the worker serves them too, but they must still show while
+  it is down), and the app's version and instance number. Label values come
+  from fixed lists only. The page is put together on a thread of its own: a
+  slow Redis can't hold up requests, and busy request threads can't hold up
+  the page. Nginx refuses `/metrics` from outside.
 - The click worker serves its own metrics on port 8001: batches, clicks
   counted, entries skipped, errors by system, time per batch, and the clicks
   waiting in the stream with the age of the oldest.

@@ -26,7 +26,8 @@ log = logging.getLogger(__name__)
 # redirect path, so one Redis call may wait at most this long.
 SOCKET_TIMEOUT_SECONDS = 0.25
 # A fixed maximum number of connections (NASA/JPL rule 3). FastAPI runs sync
-# endpoints on at most 40 threads, and each uses one connection at a time.
+# endpoints on at most 40 threads, and each uses one connection at a time;
+# /metrics uses one more, from a thread of its own (app/main.py).
 MAX_CONNECTIONS = 50
 # A redirect makes up to three Redis calls. If Redis hangs, each would wait for
 # the timeout, so after 3 failures in a row we stop calling Redis for 5 seconds.

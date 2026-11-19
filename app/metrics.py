@@ -230,11 +230,18 @@ class DatabasePoolCollector(Collector):
 class BacklogCollector(Collector):
     """The clicks waiting in the stream, measured when Prometheus asks: how
     many, and how long ago the oldest arrived. The worker removes the clicks
-    it has counted (app/worker.py), so whatever is in the stream is waiting."""
+    it has counted (app/worker.py), so whatever is in the stream is waiting.
+    The worker serves these, and so does every app instance (app/main.py)."""
 
     def __init__(self, client: redis.Redis, stream: str) -> None:
         self._client = client
         self._stream = stream
+
+    def describe(self) -> Iterator[Metric]:
+        """The metrics, without values. The app's registry asks for them when
+        the collector is registered, to check their names; without this, it
+        would collect them, and wait for Redis."""
+        return self._metrics(None, None)
 
     def collect(self) -> Iterator[Metric]:
         try:
@@ -252,11 +259,15 @@ class BacklogCollector(Collector):
         now_ms = seconds * 1000 + micros // 1000
         # An entry ID starts with the time it was added, in milliseconds.
         oldest_ms = int(first[0][0].partition("-")[0]) if first else now_ms
+        yield from self._metrics(length, max(0, now_ms - oldest_ms) / 1000)
+
+    @staticmethod
+    def _metrics(length: float | None, age: float | None) -> Iterator[Metric]:
         yield GaugeMetricFamily(
             "click_backlog_entries", "Clicks waiting in the stream to be counted.", length
         )
         yield GaugeMetricFamily(
             "click_backlog_oldest_age_seconds",
             "How long the oldest click waiting in the stream has waited (0 when none waits).",
-            max(0, now_ms - oldest_ms) / 1000,
+            age,
         )

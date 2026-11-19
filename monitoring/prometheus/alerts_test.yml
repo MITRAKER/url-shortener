@@ -173,6 +173,38 @@ tests:
               summary: A click has waited over a minute to be counted. The click worker is not keeping up.
               runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#clickswaitingtoolong
 
+  # The worker stops at minute 1 while clicks keep coming. Its own series
+  # stop with it (there are none here), but the app instances measure the
+  # backlog too, so both alerts fire.
+  - name: the click worker is down while clicks pile up
+    interval: 1m
+    input_series:
+      - series: 'up{job="click-worker", instance="worker:8001"}'
+        values: "1 0x10"
+      - series: 'click_backlog_oldest_age_seconds{job="app", instance="a:8000"}'
+        values: "0 0+60x10"
+      - series: 'click_backlog_oldest_age_seconds{job="app", instance="b:8000"}'
+        values: "0 0+60x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ClickWorkerDown
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: click-worker
+              instance: worker:8001
+            exp_annotations:
+              summary: The click worker is not answering Prometheus. Clicks wait in Redis, uncounted.
+              runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#clickworkerdown
+      - eval_time: 10m
+        alertname: ClicksWaitingTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: A click has waited over a minute to be counted. The click worker is not keeping up.
+              runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#clickswaitingtoolong
+
   - name: clicks bypass the stream
     interval: 1m
     input_series:
