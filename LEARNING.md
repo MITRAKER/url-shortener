@@ -563,7 +563,7 @@ with 200 old warnings nobody notices the 201st.
 
 Ruff and mypy can't check rules 1, 2, 4, 6 and 8 the way JPL meant them (nor
 the `suppress` trap of rule 7), so we wrote
-[`scripts/check_power_of_ten.py`](scripts/check_power_of_ten.py), about 650
+[`scripts/check_power_of_ten.py`](scripts/check_power_of_ten.py), about 800
 lines. It uses Python's `ast` module, which turns source code into a tree:
 
 ```python
@@ -597,10 +597,14 @@ setter and `__setattr__`, `del self.x` its deleter and `__delattr__`, and
 though no line says `x(...)`. The checker follows these calls on `self`.
 "Nothing defines `x`" is a judgment: the checker looks for `x` in the class
 bodies and for code that sets it on `self` (`self.x = v`,
-`setattr(self, "x", v)`, `self.__dict__["x"] = v`). When a class gets
-attributes from code it cannot read (a base class from another module, such
-as `dict` or `Exception`, a metaclass, or `setattr(self, key, v)` with a name
-known only at run time), it assumes `x` may be there and says nothing.
+`setattr(self, "x", v)`, `self.__dict__["x"] = v`, `vars(self).update(x=v)`).
+When a class gets attributes from code it cannot read, it assumes `x` may be
+there and says nothing. That covers a metaclass, a base class it cannot trace
+to a `class` statement in the module (one from another module, such as `dict`
+or `Exception`, but also an alias such as `Shape = Base`: only `Base` and
+`Outer.Inner` are traced), and names known only at run time
+(`setattr(self, key, v)`, `self.__dict__.update(values)`, or a whole new
+`self.__dict__`).
 
 It is still an approximation, like every static analyzer for a dynamic
 language: it only knows the classes of one module, and it cannot see calls
@@ -620,8 +624,9 @@ Knowing what your tool can't see is part of using it well. The first version
 was simpler, and an independent review found seven kinds of recursion it
 missed; a later review found six more, through properties, special methods
 and subclasses. A third review found the opposite mistake: false alarms on
-classes whose attributes come from outside the module. Each one is now a test
-case.
+classes whose attributes come from outside the module. A fourth found gaps in
+both directions in how it decides what a class defines, such as taking
+`vars(self).update(x=v)` to set any name at all. Each one is now a test case.
 
 Rules sometimes need breaking. A waiver must name the rule and give a reason,
 right on the line, so a reviewer can judge it:
@@ -1197,7 +1202,7 @@ POST /api/links, answered by instance 1:
 | `app/service.py` | `create_link` uses the IDs; the retry loop is now only a safety net |
 | `app/config.py` | `CODE_SECRET` and `TRUSTED_PROXIES` |
 | `scripts/check_instances.py` | For CI: does Nginx use every instance, and does losing one lose requests? |
-| `tests/test_ids.py`, `test_instances.py`, `test_migrations.py`, `test_proxy.py` | 64 more tests than step 2 |
+| `tests/test_ids.py`, `test_instances.py`, `test_migrations.py`, `test_proxy.py` | 65 more tests than step 2 |
 
 ### Part 1: Load balancing
 
@@ -1643,7 +1648,10 @@ then `docker compose up --build`.
 `tests/test_migrations.py` checks that the migrations build exactly what the
 models describe (Alembic's autogenerate finds no difference), that each can be
 undone, that a v0.2.0 database is adopted with its links, that the SQL can be
-printed for review (`--sql`), and that a second run waits its turn.
+printed for review (`--sql`), and that a second run waits its turn. Each test
+starts by dropping every table it finds, not only the ones this step knows,
+so tables that a later step's tests left in the same database can't make it
+fail.
 
 ### Testing it
 

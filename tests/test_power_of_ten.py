@@ -183,6 +183,45 @@ def test_clean_code_passes() -> None:
             def __getattr__(self, name):
                 return self.target
         """,
+        # ... nor names spelled out in update() or setdefault(), a read of
+        # self.__dict__, or an annotation without a value
+        """
+        class Proxy:
+            def __init__(self, inner):
+                self.__dict__.update(_inner=inner)
+                vars(self).update({"_hits": 0})
+                self.__dict__.setdefault("_cache", {})
+                self.__dict__["target"]: object
+                self.seen = "target" in self.__dict__ and self.__dict__["target"]
+
+            def __getattr__(self, name):
+                return self.target
+        """,
+        # ... nor `super().target = v`, which fails, or a super() of another object
+        """
+        class Base:
+            pass
+
+        class Node(Base):
+            def __init__(self, parent):
+                try:
+                    super().target = None
+                except AttributeError:
+                    super(Node, parent).__setattr__("target", self)
+
+            def __getattr__(self, name):
+                return self.target
+        """,
+        # ... nor a base of this module reached through another class
+        """
+        class Shapes:
+            class Base:
+                sides = 0
+
+        class Proxy(Shapes.Base):
+            def __getattr__(self, name):
+                return self.target
+        """,
         # every read of an attribute runs __getattribute__
         """
         class Logged:
@@ -343,7 +382,28 @@ def test_recursion_is_rejected(source: str) -> None:
         """,
         # ... or from a base or metaclass that this module does not define
         """
+        import abc
         from plugins import Registry
+        from shapes import Shape
+
+        try:
+            from shapes import Shapes
+        except ImportError:
+            class Shapes:
+                class Base:
+                    pass
+
+        class Circle(Shape):
+            def __getattr__(self, name):
+                return self.radius
+
+        class Square(Shapes.Base):
+            def __getattr__(self, name):
+                return self.side
+
+        class Abstract(abc.ABC):
+            def __getattr__(self, name):
+                return self.impl
 
         class Settings(dict):
             pass
@@ -367,12 +427,32 @@ def test_recursion_is_rejected(source: str) -> None:
                 object.__setattr__(self, "_target", target)
                 setattr(self, "_log", log)
                 super().__setattr__("_hits", 0)
-                self.__dict__["_misses"] = 0
-                vars(self)["_name"] = "proxy"
+                super(Proxy, self).__setattr__("_misses", 0)
+                self.__dict__["_name"] = "proxy"
+                vars(self)["_size"] = 0
 
             def __getattr__(self, name):
                 self._log.append(self._name)
-                return getattr(self._target, name, self._hits + self._misses)
+                return getattr(self._target, name, self._hits + self._misses + self._size)
+
+        class Lazy:
+            def __init__(self, load):
+                self.__dict__.update(_loader=load)
+                vars(self).update({"_suffix": "!"})
+                self.__dict__.setdefault("_cache", {})
+
+            def __getattr__(self, name):
+                return self._cache.setdefault(name, self._loader(name) + self._suffix)
+        """,
+        # ... or reached through another class (Outer.Inner)
+        """
+        class Shapes:
+            class Base:
+                target = None
+
+        class Proxy(Shapes.Base):
+            def __getattr__(self, name):
+                return self.target
         """,
         """
         class Record:
@@ -396,6 +476,20 @@ def test_recursion_is_rejected(source: str) -> None:
 
             def __getattr__(self, name):
                 return self.default
+
+        class Defaults:
+            def __init__(self, key, value):
+                self.__dict__.setdefault(key, value)
+
+            def __getattr__(self, name):
+                return self.fallback
+
+        class Loaded:
+            def __init__(self, **values):
+                vars(self).update(**values)
+
+            def __getattr__(self, name):
+                return self.fallback
         """,
         """
         class Logged:
