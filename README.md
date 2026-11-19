@@ -101,7 +101,9 @@ make help      # all commands
 ```
 
 Tests run on SQLite and an in-memory fake Redis by default. To use the real ones:
-`TEST_DATABASE_URL=postgresql+psycopg://app:app@localhost:5432/shortener_test TEST_REDIS_URL=redis://localhost:6379/0 pytest`.
+`TEST_DATABASE_URL=postgresql+psycopg://app:app@localhost:5432/shortener_test TEST_REDIS_URL=redis://localhost:6379/15 pytest`.
+The tests empty that Redis database (number 15, not the app's 0) and drop and recreate
+the app's tables in `TEST_DATABASE_URL`, so never point them at data you want to keep.
 
 ## Quality and CI/CD
 
