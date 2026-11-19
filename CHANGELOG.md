@@ -59,6 +59,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   shell scripts with a pinned shellcheck, locally as in CI.
 - Exceptions renamed to `AliasTakenError` and `CodeSpaceExhaustedError`.
 
+### Fixed
+
+- The database health check in Docker Compose and CI probes over TCP, so the
+  app no longer starts while Postgres is still initialising; the app container
+  restarts if it fails at startup.
+- The large-file check now looks at every file in CI, not only newly staged ones.
+
 ## [0.1.0] - 2026-11-17
 
 ### Added
@@ -69,13 +76,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Docker Compose setup with PostgreSQL.
 - GitHub Actions CI running the tests on SQLite and PostgreSQL.
 - Lesson 1 in LEARNING.md.
-
-### Fixed
-
-- The database health check in Docker Compose and CI probes over TCP, so the
-  app no longer starts while Postgres is still initialising; the app container
-  restarts if it fails at startup.
-- The large-file check now looks at every file in CI, not only newly staged ones.
 
 [Unreleased]: https://github.com/MITRAKER/url-shortener/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/MITRAKER/url-shortener/releases/tag/v0.1.0
