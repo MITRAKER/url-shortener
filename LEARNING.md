@@ -2331,12 +2331,22 @@ better question is: **how fast are we spending the budget?**
 The **burn rate** is the error rate divided by the budgeted rate (0.1%). At
 a burn rate of 1, the budget lasts exactly 30 days. At **14.4**, an hour
 spends 2% of it (14.4 × 1 hour ÷ 720 hours), and it's all gone in about two
-days. Google's SRE workbook suggests:
+days. For a 99.9% objective, Google's SRE workbook (the chapter "Alerting on
+SLOs") recommends three rules:
 
-| Severity | Burn rate | Long window | Short window | Budget spent before it fires |
-|----------|-----------|-------------|--------------|------------------------------|
-| page | 14.4 | 1 hour | 5 minutes | 2% |
-| ticket | 6 | 6 hours | 30 minutes | 5% |
+| Severity | Burn rate | Long window | Short window | Budget spent before it fires | Ours |
+|----------|-----------|-------------|--------------|------------------------------|------|
+| page | 14.4 | 1 hour | 5 minutes | 2% | `RedirectErrorBudgetBurningFast`, a page |
+| page | 6 | 6 hours | 30 minutes | 5% | `RedirectErrorBudgetBurningSlowly`, a **ticket** |
+| ticket | 1 | 3 days | 6 hours | 10% | None |
+
+We make the second rule a ticket on purpose. At 6 times the budgeted rate,
+0.6% of redirects fail, and the month's budget would last five days: time
+enough to fix it in working hours, without waking anyone. The price: from
+Friday evening to Monday morning, that pace spends about half the month's
+budget. We also leave out the third rule, so a steady burn below 6 times the
+budgeted rate raises no alert at all: at 3 times, the budget is gone in ten
+days.
 
 ```yaml
 - alert: RedirectErrorBudgetBurningFast

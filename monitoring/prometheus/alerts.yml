@@ -44,10 +44,13 @@ groups:
 
   - name: url-shortener
     rules:
-      # Burn rates from Google's SRE workbook. Failing 14.4 times faster than
-      # the budget allows spends 2% of the month's budget in one hour: wake
-      # someone up. 6 times faster spends 5% in six hours: it can wait for
-      # working hours.
+      # Burn rates from Google's SRE workbook (LEARNING.md lesson 6). Failing
+      # 14.4 times faster than the budget allows spends 2% of the month's
+      # budget in one hour: wake someone up. 6 times faster spends 5% in six
+      # hours. The workbook pages for that too; we open a ticket on purpose,
+      # as the month's budget would last five days at that pace, time enough
+      # to fix it in working hours. We leave out its third rule, a ticket
+      # when three days spend 10% of the budget.
       - alert: RedirectErrorBudgetBurningFast
         expr: |
           slo:redirect_errors:ratio_rate1h > (14.4 * 0.001)
