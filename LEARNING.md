@@ -2218,7 +2218,9 @@ is exactly when the clicks pile up (Part 3 tells how we found out).
 
 `/metrics` is for Prometheus only: it tells whoever reads it how much traffic
 you have and what fails. Nginx answers 404 to it from outside; Prometheus asks
-each instance directly, on Docker's internal network. And the page is put
+each instance directly, on Docker's internal network. Taking the path makes
+`metrics` a reserved code, which breaks a link that already had that alias:
+it stops redirecting (the CHANGELOG says so, under 0.5.0). And the page is put
 together on a thread of its own (`anyio.to_thread.run_sync`, with a
 `CapacityLimiter(1)` of its own). Not on the event loop: measuring the
 backlog asks Redis, and a slow Redis would hold up every request meanwhile.

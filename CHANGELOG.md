@@ -54,6 +54,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- `metrics` is now a reserved code, like `api` and `health`: a new link
+  can't have it as its alias (409). This breaks a link that already has that
+  alias: it no longer redirects, because an instance answers `/metrics` with
+  Prometheus's page, and Nginx answers it with 404. The link itself is kept;
+  `GET /api/links/metrics` tells whether you have one.
 - After a batch that wasn't full, the click worker waits 0.2 s before reading
   again, so that clicks gather into bigger batches. At 300 clicks a second,
   it went from 259 transactions a second to 4.8, and from 55% of a CPU to
