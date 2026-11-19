@@ -46,13 +46,28 @@ def test_malformed_redis_url_stops_the_app_at_startup(monkeypatch: pytest.Monkey
         "redis//:hunter2@redis:6379/0",  # missing colon
         "http://:hunter2@redis:6379/0",  # wrong scheme
         "redis://:hunter2@redis:port/0",  # port is not a number
+        # A '#', '/' or '?' that is not percent-encoded: the parser stops
+        # there and reads the start of the password as the port.
+        "redis://:hun#ter2@redis:6379/0",
+        "redis://:hun/ter2@redis:6379/0",
+        "redis://:hun?ter2@redis:6379/0",
+        # A full-width '#': Python's URL parser quotes all of ":password@host:port".
+        "redis://:hun\uff03ter2@redis:6379/0",
+        # The same, but the start of the password is a valid port number: the
+        # URL parses, without the password, and the app would run without Redis.
+        "redis://:4711#hunter2@redis:6379/0",
+        "redis://:4711/hunter2@redis:6379/0",
+        "redis://:4711?hunter2@redis:6379/0",
     ],
 )
 def test_error_for_a_malformed_redis_url_does_not_show_the_password(url: str) -> None:
-    """The error is printed when the app stops, so it ends up in the logs."""
+    """The error is printed when the app stops, so it ends up in the logs.
+    Not even a part of the password may appear in it."""
     with pytest.raises(ValidationError, match="redis_url") as error:
         Settings(redis_url=url)
-    assert "hunter2" not in str(error.value)
+    assert "hun" not in str(error.value)
+    assert "ter2" not in str(error.value)
+    assert "4711" not in str(error.value)
 
 
 def test_a_short_code_secret_stops_the_app_without_showing_it(
@@ -93,6 +108,7 @@ def test_trusted_proxies_are_addresses_or_networks(value: str, proxies: list[str
         "nginx",  # a host name: not resolved, so it would never match
         "10.89.0.300",  # a typo
         "10.89.0.0/33",
+        "10.89.0.10/24",  # host bits set: uvicorn would ignore it, and trust nobody
     ],
 )
 def test_anything_else_in_trusted_proxies_is_rejected(value: str) -> None:

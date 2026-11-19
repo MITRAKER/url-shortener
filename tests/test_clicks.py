@@ -6,7 +6,10 @@ import pytest
 import redis
 from fastapi.testclient import TestClient
 
-from app.clicks import STREAM
+from app import clicks as clicks_module
+from app.breaker import CircuitBreaker
+from app.clicks import STREAM, ClickStream
+from app.redis_client import RedisGateway
 from app.worker import ClickWorker
 
 
@@ -53,11 +56,41 @@ def test_without_redis_a_click_is_counted_at_once(client_without_redis: TestClie
     assert clicks(client_without_redis, code) == 1
 
 
+def test_the_stream_takes_clicks_up_to_its_limit(
+    redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Then it refuses them, so that waiting clicks can't fill Redis. A full
+    stream is an answer, not a Redis failure: the circuit breaker stays shut."""
+    monkeypatch.setattr(clicks_module, "MAX_WAITING_CLICKS", 2)
+    breaker = CircuitBreaker("Redis", failure_threshold=1, reset_after=60)
+    stream = ClickStream(RedisGateway(redis_client, breaker))
+    assert [stream.append("abc") for _ in range(3)] == [True, True, False]
+    assert redis_client.xlen(STREAM) == 2
+    assert not breaker.is_open
+
+
+def test_when_the_stream_is_full_a_click_is_counted_at_once(
+    client: TestClient,
+    redis_client: redis.Redis,
+    click_worker: ClickWorker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(clicks_module, "MAX_WAITING_CLICKS", 1)
+    code = create(client)
+    client.get(f"/{code}")  # waits in the stream
+    assert client.get(f"/{code}").status_code == 302  # the stream is full
+    assert redis_client.xlen(STREAM) == 1
+    assert clicks(client, code) == 1  # counted at once
+    assert click_worker.process_batch() == 1
+    assert clicks(client, code) == 2  # and the one that waited: none lost
+
+
 def test_when_redis_is_full_a_click_is_counted_at_once(
     client: TestClient, redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Redis refuses writes when its memory is full of keys it may not evict,
-    such as the stream itself. The click is then counted the old way."""
+    """The limit above keeps the stream from filling Redis. Should Redis fill
+    up anyway, with nothing left to evict, it refuses every write, the click's
+    too. The click is then counted the old way."""
 
     def full(*_args: object, **_kwargs: object) -> None:
         raise redis.exceptions.OutOfMemoryError(
@@ -65,6 +98,7 @@ def test_when_redis_is_full_a_click_is_counted_at_once(
         )
 
     code = create(client)
-    monkeypatch.setattr(redis_client, "xadd", full)
+    monkeypatch.setattr(redis_client, "evalsha", full)  # how scripts run
     assert client.get(f"/{code}").status_code == 302
+    assert redis_client.xlen(STREAM) == 0
     assert clicks(client, code) == 1

@@ -137,8 +137,9 @@ def test_the_lease_leaves_no_transaction_open(pg_engine: Engine) -> None:
 
 @needs_postgres
 def test_the_number_of_an_instance_that_died_comes_back(pg_engine: Engine) -> None:
-    """No clean shutdown this time: the instance's database session is killed,
-    as when its machine dies. The session's locks go with it."""
+    """No clean shutdown this time: the server ends the instance's session, as
+    its keepalives do once the instance's machine is gone (app/db.py). The
+    session's locks go with it."""
     with lease_instance_id(pg_engine) as lease:
         session = holder(pg_engine, lease.number)
         assert session is not None

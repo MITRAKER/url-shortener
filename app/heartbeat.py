@@ -2,7 +2,9 @@
 
 The worker touches the file on every round of its loop (app/worker.py); the
 container's health check runs `python -m app.heartbeat`, which asks how long
-ago that was: exit code 0 if recently, 1 if not.
+ago that was: exit code 0 if recently, 1 if not. Docker only marks a
+container that fails its health check as unhealthy, so the worker's own
+watchdog asks the same question, and ends the worker when its loop is stuck.
 
 This module uses nothing but the standard library, on purpose. The health
 check runs every 10 seconds, and importing the worker (SQLAlchemy, Pydantic,

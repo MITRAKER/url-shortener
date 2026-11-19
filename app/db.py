@@ -7,8 +7,15 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import settings
 
-# Every wait has an upper bound (NASA/JPL rule 2, applied to I/O). Talking to
-# Postgres involves four different waits, and each one needs its own limit:
+# Every wait should have an upper bound (NASA/JPL rule 2, applied to I/O).
+# Talking to Postgres involves four different waits, and each one needs its own
+# limit (listed below). One case still has none. Limits 3 and 3b are enforced by
+# the server, so they need a server that answers. Limits 4 and 4b only notice a
+# dead peer or network: when Postgres is stuck, the kernel of its machine still
+# acknowledges our packets. And libpq has no client-side read timeout. So when
+# the server is alive but stuck (a paused container, a hung pooler or proxy), a
+# query on an open connection waits until the server answers, and so does the
+# request that sent it.
 CONNECT_TIMEOUT_SECONDS = 5  # 1. opening a new connection
 POOL_TIMEOUT_SECONDS = 10  # 2. waiting for a free connection from our pool
 STATEMENT_TIMEOUT_MS = 5_000  # 3. running one SQL statement (Postgres cancels it)
@@ -37,8 +44,19 @@ def postgres_connect_args(
     """Connection settings for psycopg (libpq), applied to every connection."""
     return {
         "connect_timeout": CONNECT_TIMEOUT_SECONDS,
-        # Server-side limits for every session we open.
-        "options": f"-c statement_timeout={statement_timeout_ms} -c lock_timeout={lock_timeout_ms}",
+        # Server-side settings for every session we open: the limits on each
+        # statement and lock wait, and the same keepalives as below, for the
+        # other direction. When a client vanishes without closing its
+        # connection (its machine lost power, say), PostgreSQL ends the
+        # session about 25 s after it went quiet, not after the system's
+        # default of over 2 hours. That frees the instance number the session
+        # leased (app/instances.py).
+        "options": (
+            f"-c statement_timeout={statement_timeout_ms} -c lock_timeout={lock_timeout_ms}"
+            f" -c tcp_keepalives_idle={KEEPALIVE_IDLE_SECONDS}"
+            f" -c tcp_keepalives_interval={KEEPALIVE_INTERVAL_SECONDS}"
+            f" -c tcp_keepalives_count={KEEPALIVE_COUNT}"
+        ),
         # Client-side: notice a dead server or network instead of waiting forever.
         "tcp_user_timeout": TCP_USER_TIMEOUT_MS,
         "keepalives": 1,

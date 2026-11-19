@@ -37,8 +37,12 @@ services:
     # memory budget (NASA/JPL rule 3). When it is full, Redis evicts the least
     # frequently used keys that expire anyway (cache entries, rate limits),
     # never the click stream, which doesn't expire: evicting it would lose
-    # clicks without a word. With nothing left to evict, Redis refuses new
-    # clicks, and the app counts them in PostgreSQL instead (app/clicks.py).
+    # clicks without a word. So that waiting clicks can't fill it, the app
+    # stops adding to the stream at a million (about 21 MB, app/clicks.py)
+    # and counts further clicks in PostgreSQL. Should Redis fill up anyway,
+    # with nothing left to evict, it refuses every write: new clicks, but also
+    # the rate limiter's (the limits fail open) and the cache's (the cache
+    # stops working).
     # The append-only file keeps the stream across restarts; it goes to disk
     # every second, so a crash of the whole machine loses one second at most.
     command:
@@ -113,7 +117,10 @@ services:
     healthcheck:
       # Healthy while it goes round its loop (a heartbeat file, see
       # app/heartbeat.py). The image's own check asks for /health over HTTP,
-      # which the worker doesn't serve.
+      # which the worker doesn't serve. A failing check restarts nothing:
+      # Docker only marks the container unhealthy, and `restart` acts only
+      # when the process exits. So when the loop is stuck, the worker's own
+      # watchdog ends the process (app/worker.py), and Docker starts it again.
       test: ["CMD", "python", "-m", "app.heartbeat"]
       interval: 10s
       timeout: 5s

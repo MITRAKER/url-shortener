@@ -40,11 +40,17 @@ def make_ids(instance_id: int = 0) -> LinkIds:
 
 @pytest.fixture
 def redis_client() -> Iterator[redis.Redis]:
-    """A clean Redis for every test."""
+    """A clean Redis for every test, read the way the app reads it."""
     if TEST_REDIS_URL:
         client = make_redis(TEST_REDIS_URL)
     else:
-        client = fakeredis.FakeRedis(server=fakeredis.FakeServer(), decode_responses=True)
+        # In memory, but decoding replies as the app's own clients do (make_redis).
+        decoding = make_redis("redis://unused/0").get_encoder()
+        client = fakeredis.FakeRedis(
+            server=fakeredis.FakeServer(),
+            decode_responses=decoding.decode_responses,
+            encoding_errors=decoding.encoding_errors,
+        )
     client.flushdb()
     yield client
     client.flushdb()

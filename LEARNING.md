@@ -184,7 +184,12 @@ from the code.
 3. **Race condition lab.** Temporarily rewrite `record_click` the naive way
    (`link.clicks += 1`), then fire 200 concurrent requests
    (`seq 200 | xargs -P 50 -I{} curl -s -o /dev/null localhost:8000/<code>`).
-   Compare the final count with the atomic version.
+   Compare the final count with the atomic version. Since step 4, a redirect
+   appends its click to a Redis stream instead, and calls `record_click` only
+   when Redis can't take the click: so stop Redis first
+   (`docker compose stop redis`), or run the app without `REDIS_URL`. And use
+   PostgreSQL, as Docker Compose does: on SQLite the race hardly ever shows
+   (in our runs, SQLite lost none of 1,000 clicks; PostgreSQL lost most).
 4. **Math check.** How many characters would you need to store 1 trillion
    links with less than a 1% chance that any single new code collides?
 
@@ -310,21 +315,34 @@ skips that check without a word. So `shellcheck-py` is pinned too.
 Extra hooks: `actionlint` checks the GitHub workflow files, `hadolint` checks
 the Dockerfile, `detect-private-key` stops you committing a secret key.
 
+Every hook in `.pre-commit-config.yaml` is a `repo: local` hook with
+`language: system`: pre-commit runs its command in your environment, where
+the tools from `requirements-dev.txt` are installed. That includes the file
+hygiene hooks such as `trailing-whitespace` and `check-yaml`, which come from
+the `pre-commit-hooks` package. The usual setup points pre-commit at the
+hooks' GitHub repository instead, by a tag such as `rev: v6.0.0`. pre-commit
+then clones that repository and installs it with pip, without hashes, taking
+whatever versions of its dependencies are newest at that moment. That code
+would escape our lock files, and a tag can be moved, as the next section
+shows. With local hooks pre-commit downloads nothing, so CI has nothing to
+cache for it.
+
 #### Supply-chain security: pip-audit, Dependabot, pinned actions
 
 Most code we run, we didn't write: it comes from dependencies. A **supply-chain
 attack** hides malicious code in one of them.
 
-- **Lock files with hashes.** `requirements.in` lists the 7 packages the app
-  imports. Those need about 18 more (Starlette, anyio, h11, ...). Pinning only
-  the direct ones, as this repo first did, still lets pip pick the newest version of the
-  other 18 at install time, so CI, the Docker build and your laptop could each
-  get different code. `pip-compile` (from pip-tools) resolves the whole tree
-  once and writes `requirements.txt`: every package at an exact version, plus
-  the SHA-256 hash of every file pip may download for it. `pip install
-  --require-hashes` refuses any file whose hash differs, so a package that was
-  tampered with, or quietly re-uploaded, cannot get in. You edit the `.in`
-  files and run `make lock`; Dependabot does the same for updates.
+- **Lock files with hashes.** `requirements.in` lists the handful of packages
+  the app imports. Those need about twenty more (Starlette, anyio, h11, ...).
+  Pinning only the direct ones, as this repo first did, still lets pip pick the
+  newest version of all the others at install time, so CI, the Docker build
+  and your laptop could each get different code. `pip-compile` (from
+  pip-tools) resolves the whole tree once and writes `requirements.txt`: every
+  package at an exact version, plus the SHA-256 hash of every file pip may
+  download for it. `pip install --require-hashes` refuses any file whose hash
+  differs, so a package that was tampered with, or quietly re-uploaded, cannot
+  get in. You edit the `.in` files and run `make lock`; Dependabot does the
+  same for updates.
 - **The base image pinned by digest:** `FROM python:3.13-slim@sha256:e48f…`.
   `3.13-slim` is a moving name: Docker rebuilds it for every Python patch and
   every Debian security fix. The digest is the hash of one exact image, so the
@@ -442,8 +460,8 @@ for _ in range(MAX_LENGTH):
 
 The distributed-systems version of this rule: **every wait has a timeout**.
 A network call without a timeout is an unbounded loop in disguise. Talking to
-Postgres involves four different waits, and each needs its own limit
-(see `app/db.py`):
+Postgres involves several different waits, and each needs its own limit
+(see `app/db.py`). One of them still has none:
 
 | Wait | Limit | What happens without it |
 |------|-------|-------------------------|
@@ -452,18 +470,44 @@ Postgres involves four different waits, and each needs its own limit
 | Running one SQL statement | `statement_timeout` = 5 s (Postgres cancels it) | One slow query holds a connection forever |
 | Waiting for a row lock | `lock_timeout` = 2 s | A transaction that holds a lock freezes everyone behind it |
 | A dead network | TCP keepalives and `tcp_user_timeout` | The server vanished, but we keep waiting for its answer |
+| A server that is alive but stuck (a paused container, a hung pooler or proxy) | **None** in the app | The request's thread and its pooled connection wait until the server answers |
 
-Our first version only had the first two. An independent review caught the
-gap: once a connection is open, nothing stopped a query from waiting forever
-for a lock. That is a lesson in itself: "we have timeouts" is not the same as
-"every wait has a timeout". Every CI job also has `timeout-minutes`.
+Each limit covers only its own case. `statement_timeout` and `lock_timeout`
+are enforced by Postgres itself, so they need a server that answers.
+Keepalives and `tcp_user_timeout` only notice a dead peer or network: they
+fire when the other machine stops acknowledging our packets, and the kernel of
+a machine whose Postgres is frozen still acknowledges them. (A paused VM is
+different: its own kernel stops too, nothing acknowledges our packets, and
+`tcp_user_timeout` ends the wait as it does for a dead network, unless a port
+forwarder on the host keeps answering for it.) libpq, the C library under
+psycopg, has no client-side read timeout. So nothing in the app
+bounds a query sent on an open connection to a server that is alive but stuck.
+(Opening a new connection to it still fails after 5 s: `connect_timeout`
+covers the whole handshake.)
+
+Our first version only had the first two limits. An independent review caught
+the gap: once a connection was open, nothing stopped a query from waiting
+forever for its answer. The limits we added next cover a slow query, a lock
+and a dead network. A later review froze the database with `docker pause`, and
+a lookup waited exactly as long as the pause (the last row). That is a lesson
+in itself: "we have timeouts" is not the same as "every wait has a timeout",
+and only a test of each case shows which waits are covered. Every CI job also
+has `timeout-minutes`.
 
 **Rule 3: no dynamic memory allocation after start-up.** In C, `malloc` can
 fail or fragment memory at the worst moment. Python allocates constantly, so we
 keep the *purpose*: **resources are bounded**. The connection pool has a fixed
-size, and every input has a maximum: URLs up to 2048 characters (new, with a
-test), aliases up to 32. Without a limit, one request with a 50 MB "URL" would
+size, and every input has a maximum: URLs up to 2048 characters (new, with
+tests), aliases up to 32. Without a limit, one request with a 50 MB "URL" would
 be stored, and later cached, forever.
+
+The limit must hold for what we store, not only for what we were sent.
+Pydantic normalizes a URL, which percent-encodes non-ASCII characters in the
+path: `é` (2 bytes in UTF-8) is stored as `%C3%A9` (6 characters). Its
+`max_length` counts the bytes of the input as typed, so on its own it accepted
+a 2048-byte URL made mostly of emoji, then stored it, and sent it back in
+`Location`, as 6104 characters. `app/schemas.py` keeps it as a cheap first
+check, then measures the normalized URL.
 
 There is a catch: Pydantic checks the URL only *after* FastAPI has read and
 parsed the whole request body. A 200 MB request would fill the server's memory
@@ -507,7 +551,10 @@ doesn't exist yet.
 danger is the same: two parts of the program changing one object through
 different references. Hence no mutable default arguments (`def f(x=[])` is a
 classic Python bug), immutable data where possible, and no function pointers
-except framework hooks like FastAPI's `Depends`.
+except framework hooks like FastAPI's `Depends`, standard-library factories
+like `defaultdict(list)`, and injected dependencies that keep side effects
+testable: a clock that a test can move by hand, or the operation given to
+`RedisGateway.call` (both in lesson 3).
 
 **Rule 10: all warnings on from day one, zero warnings, daily analysis.** This
 is the whole lesson in one rule: Ruff with a broad rule set, `mypy --strict`,
@@ -518,13 +565,13 @@ with 200 old warnings nobody notices the 201st.
 
 Ruff and mypy can't check rules 1, 2, 4, 6 and 8 the way JPL meant them (nor
 the `suppress` trap of rule 7), so we wrote
-[`scripts/check_power_of_ten.py`](scripts/check_power_of_ten.py), about 500
+[`scripts/check_power_of_ten.py`](scripts/check_power_of_ten.py), about 650
 lines. It uses Python's `ast` module, which turns source code into a tree:
 
 ```python
 >>> import ast
 >>> print(ast.dump(ast.parse("while True: pass")))
-Module(body=[While(test=Constant(value=True), body=[Pass()], orelse=[])], ...)
+Module(body=[While(test=Constant(value=True), body=[Pass()])])
 ```
 
 Each rule is a function that walks the tree looking for a node type: `While`
@@ -533,21 +580,50 @@ Imports are resolved first, so `import itertools as it; it.count()` is caught
 as surely as `itertools.count()`.
 
 Rule 1 is the interesting one. The checker builds a **call graph** (which
-function may call which) and reports every function that can reach itself.
-To know what a name like `walk` refers to, it applies Python's own scoping
-rule, **LEGB**: Local, then Enclosing functions, then Global (the module),
-then Builtins. Class bodies are skipped, which is why a method `sleep` that
-calls `sleep(1)` calls `time.sleep`, not itself. It also follows `self.m()`,
-`ClassName.m()`, `super().m()`, `ClassName(...)` (which runs `__init__`), and
-functions passed as values, as in `map(walk, nodes)`. The checker follows its
-own rules, so even that graph search is a bounded `for` loop instead of the
-usual recursive depth-first search.
+function may call which) and reports every function that can reach itself in
+that graph. To know what a name like `walk` refers to, it applies Python's own
+scoping rule, **LEGB**: Local, then Enclosing functions, then Global (the
+module), then Builtins. Class bodies are skipped, which is why a method `sleep`
+that calls `sleep(1)` calls `time.sleep`, not itself. It also follows
+`self.m()` (including an override of `m` in a subclass), `ClassName.m()`,
+`super().m()`, `ClassName(...)` and `cls(...)` (which run `__init__` and
+`__new__`), and functions passed as values, as in `map(walk, nodes)`. The
+checker follows its own rules, so even that graph search is a bounded `for`
+loop instead of the usual recursive depth-first search.
+
+Python also calls methods for you, and those calls can recurse just as well.
+Reading `self.x` runs a property's getter, `__getattribute__`, and
+`__getattr__` when nothing defines `x`. `self.x = v` runs the property's
+setter and `__setattr__`, `del self.x` its deleter and `__delattr__`, and
+`self(...)` runs `__call__`. So a setter that does `self.x = v` calls itself,
+though no line says `x(...)`. The checker follows these calls on `self`.
+"Nothing defines `x`" is a judgment: the checker looks for `x` in the class
+bodies and for code that sets it on `self` (`self.x = v`,
+`setattr(self, "x", v)`, `self.__dict__["x"] = v`). When a class gets
+attributes from code it cannot read (a base class from another module, such
+as `dict` or `Exception`, a metaclass, or `setattr(self, key, v)` with a name
+known only at run time), it assumes `x` may be there and says nothing.
 
 It is still an approximation, like every static analyzer for a dynamic
-language: it cannot see calls through other objects (`node.walk()`), across
-modules, or through `getattr`. Knowing what your tool can't see is part of
-using it well. The first version was simpler, and an independent review found
-seven kinds of recursion it missed; each one is now a test case.
+language: it only knows the classes of one module, and it cannot see calls
+through other objects (`node.walk()`, `self.__class__(...)`), across modules,
+through `getattr`, `setattr` or metaclasses, through descriptors other than
+decorated methods, or through the special methods that operators and
+built-ins run (`len(self)`, `self == other`, `self[k]`, `with self`,
+`str(self)`). It takes `super().m` to mean `m` in the bases of the class that
+calls it, though with multiple inheritance Python picks the next class in the
+instance's method resolution order (MRO). It can also be wrong the other way:
+`self` and `cls` stand for every subclass in the module, so a factory such as
+`Base.make()`, which runs `cls(...)`, is reported when a subclass's `__init__`
+calls it, though `cls` is `Base` there. Code like that needs a waiver,
+`# p10-waiver: R1 <reason>` (see below).
+
+Knowing what your tool can't see is part of using it well. The first version
+was simpler, and an independent review found seven kinds of recursion it
+missed; a later review found six more, through properties, special methods
+and subclasses. A third review found the opposite mistake: false alarms on
+classes whose attributes come from outside the module. Each one is now a test
+case.
 
 Rules sometimes need breaking. A waiver must name the rule and give a reason,
 right on the line, so a reviewer can judge it:
@@ -635,7 +711,7 @@ GET /abc1234
 | `app/main.py` | Rate limits on the routes, the `X-Cache` header, the code-shape check |
 | `app/config.py` | `REDIS_URL`, checked when the app starts |
 | `docker-compose.yml` | A `redis` container with a 64 MB memory budget |
-| `tests/test_cache.py`, `test_ratelimit.py`, `test_redis_client.py`, `test_breaker.py`, `test_config.py` | 78 new tests |
+| `tests/test_cache.py`, `test_ratelimit.py`, `test_redis_client.py`, `test_breaker.py`, `test_config.py` | 92 new tests |
 | `tests/fakes.py` | `SilentServer`: a fake Redis that accepts connections and never answers |
 
 ### Part 1: Caching
@@ -693,8 +769,11 @@ send millions of made-up codes, and the cache doesn't help at all. That is
 **cache penetration**. Two defenses:
 
 1. **Validate first.** A code must look like a code: 3 to 32 characters of
-   `A-Z a-z 0-9 _ -`. `/../../etc/passwd` or a 10 KB string is rejected with
-   404 before touching Redis or the database.
+   `A-Z a-z 0-9 _ -`. `/bad.code` or a 10 KB string is rejected with 404
+   before touching the cache or the database (only the rate limiter's script
+   runs in Redis). A path with a `/` in it, like `/../../etc/passwd`, doesn't
+   even match the `/{code}` route, so the router answers 404 before the rate
+   limiter runs.
 2. **Cache the absence.** If the database says "not found", we store an empty
    string under that key for 60 seconds. Repeated lookups now hit Redis.
 
@@ -742,6 +821,13 @@ flag: A writes "not found" with `SET ... NX` ("only if the key doesn't exist").
 At step 5 the key exists, so nothing happens. If the steps happen in the other
 order, B's write simply replaces A's. Both orders are now correct, and
 `test_not_found_never_overwrites_a_real_entry` checks it.
+
+Both orders rely on B's write reaching Redis, though. If it fails (a Redis
+error or timeout, or the circuit is open), A's "not found" entry wins, and
+`/promo` answers 404 with `X-Cache: HIT` for up to 60 seconds
+(`CACHE_NEGATIVE_TTL_SECONDS`), although B got `201 Created`. We accept that
+window, and keep it short, rather than make creating a link depend on Redis.
+`test_failed_write_through_leaves_the_not_found_entry` shows it.
 
 #### What we deliberately don't cache
 
@@ -863,15 +949,34 @@ bad deploy never looks healthy.
 
 One more detail: that error ends up in the logs, and a URL can hold a password
 (`redis://:password@host`). By default, Pydantic's error message repeats the
-value it rejected, so `Settings` sets `hide_input_in_errors=True`: the message
-names the setting and the problem, never the value.
+value it rejected, so `Settings` sets `hide_input_in_errors=True`. A review
+showed that this was not enough, because redis-py's own message can quote part
+of the URL. In `redis://:S3cret#Pass@redis:6379/0`, the `#` in the password is
+not percent-encoded, so the parser stops there and takes `S3cret` for the
+port. The error read "Port could not be cast to integer value as 'S3cret'".
+A `/` or a `?` does the same, and generated passwords often contain a `/`.
+If the text before the `#` is a number, the URL even parses, as that port and
+without the password, and the app would start without Redis. So the check
+also refuses a URL whose `@` is not in the host part.
+Now `_check_redis_url` catches redis-py's `ValueError` and raises its own,
+with a fixed message, `from None`: unlike lesson 2's `from exc`, this
+deliberately keeps the original error, which quotes the URL, out of the
+traceback. The message names the setting and the problem, never the value or
+any part of it.
 
 #### Making the cache visible
 
 The `X-Cache` header is borrowed from CDNs: `HIT` (answered from Redis),
-`MISS` (read from the database and now cached) or `BYPASS` (Redis not used:
-not configured, down, or the circuit is open). It costs nothing, and
+`MISS` (read from the database and now cached) or `BYPASS` (read from the
+database and not cached: Redis is not configured, down, or the circuit is
+open, or the cache write did not go through). It costs nothing, and
 `curl -i` tells you at once what happened.
+
+A header like this is only useful if it tells the truth. The first version
+sent `MISS` even when the cache write had failed, so the next request missed
+again. Now the cache's writes report whether Redis stored the value, and
+`resolve()` sends `MISS` only when it did. If the write failed, or
+`SET ... NX` found a link created a moment ago, the header says `BYPASS`.
 
 ### Part 2: Rate limiting
 
@@ -1094,7 +1199,7 @@ POST /api/links, answered by instance 1:
 | `app/service.py` | `create_link` uses the IDs; the retry loop is now only a safety net |
 | `app/config.py` | `CODE_SECRET` and `TRUSTED_PROXIES` |
 | `scripts/check_instances.py` | For CI: does Nginx use every instance, and does losing one lose requests? |
-| `tests/test_ids.py`, `test_instances.py`, `test_migrations.py`, `test_proxy.py` | 62 more tests than step 2 |
+| `tests/test_ids.py`, `test_instances.py`, `test_migrations.py`, `test_proxy.py` | 64 more tests than step 2 |
 
 ### Part 1: Load balancing
 
@@ -1163,10 +1268,13 @@ from real requests.
 
 - `proxy_connect_timeout 2s`: on the same network, a live instance accepts a
   connection in well under a millisecond. Two seconds means it's gone.
-- `proxy_next_upstream error timeout`: when connecting fails, or no answer
-  comes, try the next instance. `proxy_next_upstream_tries 2` and
-  `proxy_next_upstream_timeout 10s` limit the retries: a retry is a loop, and
-  every loop needs a bound (NASA/JPL rule 2).
+- `proxy_next_upstream error timeout`: when connecting fails or takes over
+  2 s, or the instance closes the connection before it answers, try the next
+  instance. `proxy_next_upstream_tries 2` and `proxy_next_upstream_timeout 10s`
+  limit the retries: a retry is a loop, and every loop needs a bound
+  (NASA/JPL rule 2). An instance that takes the request and then says nothing
+  for 30 s (`proxy_read_timeout`) is past those 10 s, so that request is not
+  retried: the client gets a `504`.
 - `max_fails=3 fail_timeout=10s`: after 3 failures within 10 seconds, leave
   that instance out for 10 seconds, then give it another chance.
 
@@ -1197,30 +1305,42 @@ doesn't pick the retry from the new list: it answers 502, and its log says
 `no live upstreams`, although two instances are up. We ran CI's sequence 8
 times: 7 runs had one 502 each.
 
-The fix is a second chance for what is safe to ask twice:
+The fix is a second chance for what is safe to repeat:
 
 ```nginx
 location / {
     proxy_pass http://app_instances;
-    error_page 502 = @once_more;   # a 502 made by Nginx: it reached no instance
+    error_page 502 = @once_more;   # a 502 made by Nginx: no instance answered
 }
 location @once_more {
     if ($request_method !~ ^(GET|HEAD)$) {
         return 502;                # a POST is never asked twice
     }
     proxy_pass http://app_instances;   # a fresh try, with the new list
+    proxy_next_upstream_tries 1;       # one try, not 2 more
 }
 ```
 
 The proxy settings moved up to the `server` block, so both locations share
-them. After the fix, CI's sequence ran 11 times without a single 502. And to
-be sure the changing list was the trigger, we ran the old configuration with
-DNS asked only every 5 minutes (`valid=300s`): 4 runs, no 502 either. Two
-lessons in one: the same failure can be harmless or not depending on
-*when* requests arrive, so test more than one timing; and a second chance is
-only for requests that are safe to repeat. (Is a `GET` safe? In HTTP's terms,
-yes. Ours counts a click, the one side effect we accept repeating: a click
-counted twice when an instance dies mid-answer.)
+them, all but one: the second chance makes a single try. So a `GET` or `HEAD`
+reaches the instances at most 3 times, 2 tries and then 1. After the fix, CI's
+sequence ran 11 times without a single 502. And to be sure the changing list
+was the trigger, we ran the old configuration with DNS asked only every 5
+minutes (`valid=300s`): 4 runs, no 502 either. Two lessons in one: the same
+failure can be harmless or not depending on *when* requests arrive, so test
+more than one timing; and a second chance is only for requests that are safe
+to repeat. (Is a `GET` safe? In HTTP's terms, yes. Ours counts a click, the
+one side effect we accept repeating. "No instance answered" doesn't mean no
+instance received the request: one may count the click and die before it
+answers. With 3 tries, a click can be counted up to 3 times.)
+
+A later review found that our first version of `@once_more` had no
+`proxy_next_upstream_tries` of its own. It inherited the `server` block's 2,
+so a `GET` could reach the instances 4 times, not 3. A setting made once for
+every location applies to every location, wanted or not. With the single try,
+we replayed the race with stand-in instances, 10 runs each way: without the
+second chance, 4 runs had a 502; with it, the race struck in 8 runs and every
+request succeeded.
 
 #### Keepalive, and a race at the edge of a timeout
 
@@ -1254,7 +1374,10 @@ header, so it may be believed only when it comes from our own proxy.
   left end of the header is whatever the client wrote. `TRUSTED_PROXIES="*"`
   would take the leftmost, so anyone could choose their own address and dodge
   their limit. The setting accepts only addresses and networks, so `*` (and
-  any typo) stops the app at startup.
+  any typo) stops the app at startup. So does `10.89.0.10/24`, an address
+  with a prefix length (`docker network inspect` prints addresses that way):
+  uvicorn would quietly ignore it, and every client would share Nginx's rate
+  limit. A network is written `10.89.0.0/24`.
 - **Compose** gives Nginx a fixed address, 10.89.0.10, and hands out addresses
   to other containers only from 10.89.0.128 up (`ip_range`), so no other
   container can ever get Nginx's.
@@ -1264,6 +1387,19 @@ header, so it may be believed only when it comes from our own proxy.
 
 `tests/test_proxy.py` checks all of it: one bucket per client behind Nginx,
 the header ignored from anyone else, and a forged address in front ignored.
+
+Nginx should pass on one more header: `Host`, the name and port the client
+asked for. Left to itself, Nginx would send the name its configuration gives
+the instances, `app_instances`. (Our redirects would survive that:
+`proxy_redirect`, on by default, rewrites a `Location` that starts with
+`http://app_instances/` to the address the client used. But the app would
+have the wrong idea of its own address.) `proxy_set_header Host $http_host;` passes on
+what the client sent, port included. The app uses it to build the few
+redirects that point back at itself: `/docs/` sends you to `/docs`, on the
+host and port you used. Our first version used the common `$host`, which
+drops the port: `http://localhost:8000/docs/` sent you to
+`http://localhost/docs`, on port 80, where the app isn't. The smoke test now
+checks one such redirect.
 
 ### Part 2: Unique IDs without asking anyone
 
@@ -1345,16 +1481,25 @@ which silently makes duplicate IDs. So each instance **leases** a free number
 from PostgreSQL when it starts:
 
 ```sql
-SELECT pg_try_advisory_lock(1970498675, 0);   -- true: number 0 is ours
-SELECT pg_try_advisory_lock(1970498675, 1);   -- false would mean "taken": try the next
+SELECT pg_try_advisory_lock(1970433139, 0);   -- true: number 0 is ours
+SELECT pg_try_advisory_lock(1970433139, 1);   -- false would mean "taken": try the next
 ```
 
 An **advisory lock** is a lock on numbers we choose; PostgreSQL attaches no
 meaning to them. The first number is a namespace, "urls" in ASCII
-(0x75726C73), so our locks never clash with another app's. The lock belongs
-to the database **session**: when the connection closes (a clean shutdown, a
-crash, a machine losing power) PostgreSQL releases it. No expiry to tune, no
-clean-up job. ZooKeeper's ephemeral nodes and etcd's leases are the same idea.
+(0x75726C73, which is 1970433139), so our locks never clash with another
+app's. The lock belongs to the database **session**, and PostgreSQL releases
+it when the session ends: no clean-up job. A clean shutdown or a crash closes
+the connection, and the number is free at once. A machine that loses power, or
+a network that fails, closes nothing: PostgreSQL learns of it only through TCP
+**keepalives**, probes it sends on a connection that has gone quiet. Its
+defaults are the operating system's: on Linux, 2 hours of silence, then 9
+probes 75 s apart, about 2 h 11 min in all, while the number stays taken. So
+every session the app opens asks for a probe after 10 s of silence, then one
+every 5 s, and for the session to end after 3 go unanswered (`app/db.py`):
+about 25 s. That is the lease's real expiry. ZooKeeper's ephemeral nodes and
+etcd's leases are the same idea, with the expiry in plain sight: a session
+timeout, a TTL.
 
 Two details from building it:
 
@@ -1376,7 +1521,11 @@ seconds (`watch` in `app/instances.py`). When the check fails, it retires its
 `Snowflake` (no more IDs, so creating a link answers 503), and sends itself
 `SIGTERM`, the signal `docker stop` sends. uvicorn finishes the requests in
 progress and exits, and Docker starts it again (`restart: unless-stopped`)
-with a fresh lease.
+with a fresh lease. The same check covers a network that fails between an
+instance and PostgreSQL: the instance gives up within about 15 s (its next
+check, plus 10 s of `tcp_user_timeout`), before the server's keepalives free
+its number. We cut one off the network: it noticed after 14 s, and its number
+was free after 23.
 
 That's **crash-only design**: there is one well-tested way to start, and
 recovering is just starting again. We tried it with `docker compose restart
@@ -1483,6 +1632,16 @@ what is missing: `alembic upgrade head` (`make migrate`).
   run side by side, so every migration must work with both: add a column,
   deploy code that uses it, and remove the old one a release later.
 
+Migration `0002` breaks that rule: it removes the sequence in the same
+release that stops using it, instead of a release later. A v0.2.0 instance
+that is still running afterwards can't create links: it leaves out the ID,
+the database refuses the row, and the instance answers 503 (or 409, "Alias
+is already taken", for an alias that is free). We accept that for this one
+upgrade because it can't be rolling anyway: Nginx takes over port 8000 from
+the single v0.2.0 instance, so that instance has to stop. Stop it before the
+migrations run: `docker compose down` (which keeps the database's volume),
+then `docker compose up --build`.
+
 `tests/test_migrations.py` checks that the migrations build exactly what the
 models describe (Alembic's autogenerate finds no difference), that each can be
 undone, that a v0.2.0 database is adopted with its links, that the SQL can be
@@ -1498,9 +1657,10 @@ printed for review (`--sql`), and that a second run waits its turn.
   codes that are already taken, to prove each retry path: an ID clash, a code
   that clashes with an alias, and giving up after exactly 5 tries.
 - **PostgreSQL-only tests** (skipped on SQLite): instances get different
-  numbers; a number is free again when its instance stops, or when its session
-  is killed (`pg_terminate_backend`, as if the machine died); the lease leaves
-  no transaction open; a second migration run waits its turn.
+  numbers; a number is free again when its instance stops, or when the server
+  ends its session (`pg_terminate_backend`, as its keepalives do once a machine
+  is gone); every session asks the server for those keepalives; the lease
+  leaves no transaction open; a second migration run waits its turn.
 - **Pretending to be Nginx.** `TestClient(app, client=("10.89.0.10", 40000))`
   sends requests from Nginx's address.
 - **The real stack, in CI.** `scripts/check_instances.py` checks that 30
@@ -1591,8 +1751,8 @@ PostgreSQL. Step 4 takes that write off the request path: a redirect only
 appends a small **event** ("a click on `abc`") to a **Redis stream**, and a
 separate **worker** process adds the events up and writes the totals to
 PostgreSQL in batches. The hard part is not speed but correctness: every
-click must be counted **exactly once**, even when the worker, Redis or
-PostgreSQL fails halfway through.
+click in the stream must be counted **exactly once**, even when the worker,
+Redis or PostgreSQL fails halfway through.
 
 ### What we built
 
@@ -1613,14 +1773,14 @@ GET /abc1234 ─▶ Nginx ─▶ app ── XADD clicks:v1 * code abc1234 ──
 
 | File | What's new |
 |------|------------|
-| `app/clicks.py` | `ClickStream.append()`: one `XADD`, through the Redis gateway |
+| `app/clicks.py` | `ClickStream.append()`: one `XADD`, unless a million clicks already wait (a small Lua script), through the Redis gateway |
 | `app/service.py` | `count_click()`: the stream, or PostgreSQL straight away when Redis can't take the click |
-| `app/worker.py` | The click worker: read a batch, add it up, count it with its checkpoint in one transaction |
+| `app/worker.py` | The click worker: read a batch, add it up, count it with its checkpoint in one transaction; a watchdog that ends it when its loop is stuck |
 | `app/heartbeat.py` | The worker's health check: was its last round recent? |
 | `app/models.py`, migration `0003` | `click_checkpoints`: how far the worker got |
 | `docker-compose.yml` | The `worker` service; Redis keeps the stream on disk and never evicts it |
 | `scripts/check_clicks.py` | For CI: clicks wait while the worker is stopped, and survive a Redis restart |
-| `tests/test_clicks.py`, `tests/test_worker.py` | 32 tests: the redirect path, batching, every failure in between, two workers at once |
+| `tests/test_clicks.py`, `tests/test_worker.py` | 39 tests: the redirect path, batching, every failure in between, two workers at once |
 
 ### Part 1: Why take work off the request path?
 
@@ -1808,6 +1968,14 @@ logged**, but the checkpoint still moves past it. The alternative, stopping
 at it, would make it a **poison message**: the worker would read it, fail,
 read it again, forever, and no click behind it would ever be counted.
 
+The review found one we had missed: bytes that aren't UTF-8. Redis stores
+bytes, and redis-py, asked for `str`, decoded every reply strictly, so such
+an entry raised `UnicodeDecodeError` before our checks ever saw it. That is
+not a Redis error, so the worker crashed, started again, read the same
+entry, and crashed again: a poison message after all. Now `make_redis()`
+decodes with `encoding_errors="replace"`: the bad bytes become U+FFFD (�),
+and the entry fails validation like any other junk.
+
 #### The stream holds only what is left to count
 
 After each batch, `XTRIM ... MINID <the ID right after the last one counted>`
@@ -1831,14 +1999,13 @@ worst kind**: it is found by a customer, weeks later.
 #### Redis down or full: fall back, don't drop
 
 `count_click()` appends to the stream; if Redis can't take the click (not
-configured, down, circuit breaker open, or out of memory), the click is
-counted the old way, with an `UPDATE`. The system degrades to step 3's
-speed instead of losing clicks or failing redirects.
+configured, down, circuit breaker open, out of memory, or the stream full),
+the click is counted the old way, with an `UPDATE`. The system degrades to
+step 3's speed instead of losing clicks or failing redirects.
 
-Redis has a fixed memory budget (64 MB), so the stream is a **bounded
-buffer**. That matters: a buffer without a bound turns a slow consumer into
-an out-of-memory crash. When it fills up, something must give, and the
-choices are the classic three:
+The stream must be a **bounded buffer**: a buffer without a bound turns a
+slow consumer into an out-of-memory crash. When it fills up, something must
+give, and the choices are the classic three:
 
 - **Drop** the oldest (`XADD ... MAXLEN 1000000`): quiet data loss. No.
 - **Block** the producer until there is room: a redirect waiting on the
@@ -1846,9 +2013,31 @@ choices are the classic three:
 - **Push back**: refuse the write and let the producer take another path.
   That's our fallback, and it's called **backpressure**.
 
-Measured: 100,000 waiting clicks take 2.53 MB, about 25 bytes each, so 64 MB
-holds up to some 2.5 million of them (cache entries are evicted first to
-make room, see below).
+Where does the bound go? Our first version let Redis's memory budget (64 MB)
+be the bound, and the review showed why that is the wrong place: the stream
+shares those 64 MB with the cache and the rate limits. A long worker outage
+filled Redis with waiting clicks, and a full Redis refuses every command that
+needs more memory, not only new clicks. The rate limiter's script failed, so
+the limits failed open (lesson 3), and every cache write failed too. Each
+refusal also counted as a Redis failure, so the circuit breaker kept opening.
+A stopped worker had switched off a security control.
+
+So the stream has a bound of its own, `MAX_WAITING_CLICKS`: a million
+clicks. The append is a small Lua script, atomic like the rate limiter's:
+
+```lua
+if redis.call('XLEN', KEYS[1]) >= tonumber(ARGV[2]) then
+  return false  -- full: nil for the app, which counts the click itself
+end
+return redis.call('XADD', KEYS[1], '*', 'code', ARGV[1])
+```
+
+At the bound the script returns nil, and the click goes to PostgreSQL like
+any other refusal. A full stream is an answer, not an error, so the circuit
+breaker doesn't count it. Measured on Redis 7.4, a million waiting clicks
+take about 21 MB (with 8-character codes; 43 MB if every click were on a
+32-character alias), so the cache and the rate limits keep the rest. The
+script costs about 10 to 20 microseconds more per click than a bare `XADD`.
 
 #### The eviction policy that would have lost clicks
 
@@ -1858,8 +2047,11 @@ same Redis, that policy could evict the stream itself, and every click
 waiting in it would vanish without an error. Step 4 switches to
 `volatile-lfu`: evict only keys that have an expiry time anyway (cache
 entries, rate limit buckets). The stream never expires, so it is never
-evicted; when nothing else is left to evict, Redis refuses the `XADD` with an
-out-of-memory error, and the fallback above takes over.
+evicted, and its bound keeps it from crowding out the keys that can be.
+Should Redis still reach its limit with nothing left to evict, it refuses
+every write: the click's (the fallback above takes over), but also the rate
+limiter's, so the limits fail open, and the cache's, so the cache stops
+working until there is room again.
 
 #### Redis restarts: persistence
 
@@ -1881,13 +2073,22 @@ through the fallback, the test would prove nothing.
 
 #### Ambiguous failures
 
-A timeout on `XADD` doesn't say whether the click landed. We count it in
+A timeout on the append doesn't say whether the click landed. We count it in
 PostgreSQL to be safe, so if it did land, the worker counts it a second time.
-That's a choice, not an accident: when you can't know, decide which way to
-be wrong. For click counts, a rare double count beats a lost click. (The
-**two generals problem** says no protocol removes this doubt over an
+A connection can also break after Redis ran the `XADD`, before the reply
+arrived. The client then retries once, as it does on any broken connection
+([lesson 3](#retries-and-a-lesson-about-measuring)), and the click lands
+twice. That's a choice, not an accident: when you can't know, decide which
+way to be wrong. For click counts, a rare double count beats a lost click.
+(The **two generals problem** says no protocol removes this doubt over an
 unreliable network; idempotency keys only move it somewhere you can deal
 with it.)
+
+So "exactly once" is a promise about the worker: it counts each click in
+the stream once, whatever fails. Around it, a click can still be counted
+twice: after an ambiguous failure, or when Nginx retries a redirect on
+another instance (lesson 4). And a crash of the whole machine can lose up to
+about a second of clicks (see "Redis restarts" above).
 
 #### The worker: crash-only, and alive is not the same as working
 
@@ -1897,16 +2098,39 @@ with it.)
 - **It's stopped** (`docker stop` sends SIGTERM): it finishes the round it is
   in and exits. Uncounted clicks wait in the stream.
 - **PostgreSQL or Redis is down**: it logs the error and tries again every
-  second. Restarting it wouldn't help, so its health check must not fail.
+  second. Restarting it wouldn't help, so nothing should restart it.
+- **Its loop is stuck**, by a bug or a wait without a limit: restarting it
+  would help, but a stuck process never exits by itself.
 
-That's why the health check asks "is the worker going round its loop?" and
-not "is it making progress?". The worker touches a **heartbeat** file on
-every round; `python -m app.heartbeat` checks that the last touch is less
-than 30 seconds old. Every wait inside a round has a limit (2 seconds for
-Redis; for PostgreSQL, 10 to get a connection and 5 per statement), so in
-practice only a stuck loop misses it. **Progress** is
-a different signal: the backlog (`XLEN`) and the age of its oldest entry (its
-ID is a timestamp). That's a metric to graph and alert on, which is step 5.
+Restarting is the cure for the last case only, so whatever restarts the
+worker must ask "is it going round its loop?", not "is it making progress?".
+The worker touches a **heartbeat** file on every round, failed or not;
+`python -m app.heartbeat` checks that the last touch is less than 30 seconds
+old. Every wait inside a round has a limit (2 seconds for Redis; for
+PostgreSQL, 10 to get a connection and 5 per statement), with the one gap
+that lesson 2 names: a PostgreSQL that is alive but stuck holds a query on an
+open connection until it answers. So the heartbeat goes stale only when the
+loop is stuck, in our code or in that one wait. (After a restart, a new
+connection to a stuck PostgreSQL gives up after 5 seconds, so the worker's
+rounds fail, and go on, until the database answers again.)
+
+That check is the container's health check, but a failing health check
+restarts nothing. Docker and Docker Compose only mark the container
+**unhealthy**: `docker compose ps` shows it, and `docker compose up --wait`
+and `depends_on: condition: service_healthy` wait for a healthy one. A
+restart policy acts only when the process exits. (Restarting on a failed
+check is what a Kubernetes **liveness probe** does.) So the worker brings
+its own **watchdog**: a thread that reads the heartbeat every 5 seconds and,
+once the health check would fail, ends the process with `os._exit(1)`. The
+restart policy does the rest, and crash-only design makes that safe.
+`sys.exit` would end only the watchdog's thread, and SIGTERM only asks the
+loop to stop, which a stuck loop never notices. A new worker gets 30 seconds
+for its first round: Docker restarts a container with its files, the old
+heartbeat included.
+
+**Progress** is a different signal: the backlog (`XLEN`) and the age of its
+oldest entry (its ID is a timestamp). That's a metric to graph and alert on,
+which is step 5.
 
 The health check imports nothing but the standard library, on purpose: our
 first version ran `python -m app.worker --alive`, which imports SQLAlchemy,
@@ -1940,12 +2164,20 @@ heartbeat module takes 0.15 s.
   No threads, no timing, the same result every run.
 - **A race, made likely.** Two threads drain 300 clicks with a batch size of
   7, so they collide again and again: every link must end up at exactly 100.
+- **A bound, without a million clicks.** The tests lower `MAX_WAITING_CLICKS`
+  to 1 or 2 with `monkeypatch`: at the bound, a click is counted in
+  PostgreSQL at once, and the circuit breaker stays shut.
 - **The checkpoint's birth.** Two workers starting together both find no
   checkpoint and both insert one. A SQLAlchemy `before_flush` event inserts
   the row from "another worker" just before ours: one row, no error.
 - **Shapes and junk.** Replies of other shapes (RESP3's dict, a broken entry)
-  raise; entries that aren't clicks are skipped without blocking the clicks
-  behind them.
+  raise; entries that aren't clicks, bytes that aren't UTF-8 among them, are
+  skipped without blocking the clicks behind them.
+- **A watchdog that can't end pytest.** The watchdog takes its clock and its
+  exit function as arguments. The tests pass a fake clock, and an exit
+  function that only notes the status: a heartbeat 30 seconds old ends the
+  worker with status 1; rounds less than 30 seconds apart, and a new
+  worker's first 30 seconds, don't.
 - **The real stack, in CI.** The smoke test waits for its click to be counted;
   `scripts/check_clicks.py` checks clicks across a Redis restart.
 
