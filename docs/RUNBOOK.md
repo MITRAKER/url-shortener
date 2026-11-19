@@ -28,9 +28,13 @@ change, a traffic spike. Most incidents start with a change.
 more than 1.44% of redirects failed with a server error (5xx). At that pace,
 the month's error budget (0.1% of redirects) is gone in about two days.
 
-1. Dashboard, "Responses per second, by status": which 5xx? A 500 is a bug
-   or an unexpected error in the app; a 503 means the app refused on purpose
-   (it could not allocate a code, for example).
+1. Which 5xx? A redirect answers 500 when something fails that the app
+   doesn't handle: a bug, or PostgreSQL down or too slow (step 4). It never
+   answers 503: the app sends that only when it can't allocate a code for a
+   new link, which this alert doesn't count. The dashboard's "Responses per
+   second, by status" adds up every route, link creation included. For
+   redirects alone, ask Prometheus (<http://localhost:9090>):
+   `sum by (status) (rate(http_requests_total{job="app", route="/{code}"}[5m]))`.
 2. `docker compose logs --tail 200 app`: the errors and their tracebacks.
 3. If it began with a deployment, roll it back first and investigate after.
 4. Is PostgreSQL down or slow? A redirect needs it on every cache miss.
