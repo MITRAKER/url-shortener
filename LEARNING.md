@@ -1345,16 +1345,17 @@ which silently makes duplicate IDs. So each instance **leases** a free number
 from PostgreSQL when it starts:
 
 ```sql
-SELECT pg_try_advisory_lock(1970498675, 0);   -- true: number 0 is ours
-SELECT pg_try_advisory_lock(1970498675, 1);   -- false would mean "taken": try the next
+SELECT pg_try_advisory_lock(1970433139, 0);   -- true: number 0 is ours
+SELECT pg_try_advisory_lock(1970433139, 1);   -- false would mean "taken": try the next
 ```
 
 An **advisory lock** is a lock on numbers we choose; PostgreSQL attaches no
 meaning to them. The first number is a namespace, "urls" in ASCII
-(0x75726C73), so our locks never clash with another app's. The lock belongs
-to the database **session**: when the connection closes (a clean shutdown, a
-crash, a machine losing power) PostgreSQL releases it. No expiry to tune, no
-clean-up job. ZooKeeper's ephemeral nodes and etcd's leases are the same idea.
+(0x75726C73, which is 1970433139), so our locks never clash with another
+app's. The lock belongs to the database **session**: when the connection
+closes (a clean shutdown, a crash, a machine losing power) PostgreSQL releases
+it. No expiry to tune, no clean-up job. ZooKeeper's ephemeral nodes and etcd's
+leases are the same idea.
 
 Two details from building it:
 
