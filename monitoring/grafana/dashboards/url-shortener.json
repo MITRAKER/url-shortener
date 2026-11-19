@@ -702,7 +702,7 @@
     {
       "type": "timeseries",
       "title": "Cache lookups, by result",
-      "description": "hit: from Redis. miss: from PostgreSQL, then cached. bypass: Redis not used.",
+      "description": "hit: from Redis. miss: from PostgreSQL, then cached. bypass: from PostgreSQL, not cached: Redis not configured, down or skipped (circuit open), or the cache write did not go through.",
       "id": 12,
       "datasource": {
         "type": "prometheus",
@@ -982,7 +982,7 @@
     {
       "type": "timeseries",
       "title": "Clicks recorded and counted",
-      "description": "stream: a redirect added the click to Redis. database: Redis couldn't take it, so it was counted at once in PostgreSQL. counted: what the click worker added to PostgreSQL.",
+      "description": "stream: a redirect added the click to Redis. database: Redis couldn't take it (down, out of memory, or a million clicks already waiting), so it was counted at once in PostgreSQL. counted: what the click worker added to PostgreSQL.",
       "id": 17,
       "datasource": {
         "type": "prometheus",

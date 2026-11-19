@@ -2383,7 +2383,8 @@ So every label value comes from a short, fixed list:
   (`/docs`, `/docs/oauth2-redirect`, `/redoc`, `/openapi.json`) are labelled
   with their paths, a fixed list the middleware is given at startup. A
   request that matched no route is `unmatched`: a 404 for `/no/such/page`,
-  or the router's redirect from `/health/` to `/health`.
+  the router's redirect from `/health/` to `/health`, or a request refused
+  before it reaches the router, such as a 413 for a body over 16 KB.
 - **method**: one of the seven known methods, or `other`. Anyone can send a
   method called `FOOBAR`.
 - **status**: in practice, a dozen codes.
@@ -2861,7 +2862,7 @@ about 880 a second, but k6 can't start 61 to 145 requests on time, and the
 p99 rises to 237-321 ms: both miss their thresholds (Part 4). Step 5 keeps
 up at 300 a second, and at 600 in one run of two (the other left 2
 requests unsent): at 600 it is near its limit on three cores, and 900 is
-past it. The cores are 76 to 83% busy, and the limit now is plain CPU: the
+past it. At 900, the cores are 76 to 83% busy, and the limit now is plain CPU: the
 app needs about 2 ms of it per redirect. More instances wouldn't help on
 this machine; more cores, or less work per request, would.
 
@@ -3004,8 +3005,9 @@ API with sound status codes and validation (lesson 1), the tooling and
 discipline of a professional team (lesson 2), a cache that survives its own
 failures and rate limits that hold across instances (lesson 3), load
 balancing, unique IDs without coordination and safe migrations (lesson 4),
-work taken off the request path with exactly-once counting (lesson 5), and
-now the means to see all of it, and to prove what each step was worth.
+work taken off the request path, with each click in the stream counted
+exactly once (lesson 5), and now the means to see all of it, and to prove
+what each step was worth.
 
 The habits matter more than the tools: measure before you believe, decide
 how you want to fail before you do, test the failure paths as carefully as

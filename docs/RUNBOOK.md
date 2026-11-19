@@ -29,7 +29,7 @@ more than 1.44% of redirects failed with a server error (5xx). At that pace,
 the month's error budget (0.1% of redirects) is gone in about two days.
 
 1. Which 5xx? A redirect answers 500 when something fails that the app
-   doesn't handle: a bug, or PostgreSQL down or too slow (step 4). It never
+   doesn't handle: a bug, or PostgreSQL down or too slow (see 4 below). It never
    answers 503: the app sends that only when it can't allocate a code for a
    new link, which this alert doesn't count. The dashboard's "Responses per
    second, by status" adds up every route, link creation included. For
@@ -111,10 +111,13 @@ backlog as well as the worker, so this fires whether the worker is down or
 running but stuck.
 
 1. Is [ClickWorkerDown](#clickworkerdown) firing too? Then start there.
-2. The worker's logs: "counting clicks failed" means PostgreSQL or Redis
+2. `docker compose ps worker`: a worker that keeps restarting has a loop that
+   gets stuck. Its watchdog ends it after 30 s without a heartbeat (the log
+   says "the loop is stuck, exiting"), and Docker starts it again.
+3. The worker's logs: "counting clicks failed" means PostgreSQL or Redis
    keeps failing; the worker retries every second, by design.
-3. "Click worker: batches and errors": errors by system tell which one.
-4. Batches of 1,000 back to back mean a backlog it is still working through;
+4. "Click worker: batches and errors": errors by system tell which one.
+5. Batches of 1,000 back to back mean a backlog it is still working through;
    the age should then be falling.
 
 ### ClicksBypassingTheStream

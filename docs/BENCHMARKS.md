@@ -156,7 +156,9 @@ changed: an `XADD` to a Redis stream instead of an `UPDATE`. At 900 requests
 a second asked, step 4 answered 880 with a median of 22 ms, where step 3
 managed about 520 with a median of 1.5 s. The app's CPU per redirect fell
 from about 3.5 ms to 2 ms, and PostgreSQL only sees the click worker's
-batches.
+batches. (These runs used a bare `XADD`. Since then a small Lua script checks
+the stream's length first, so that a million waiting clicks are the limit,
+which adds about 10 to 20 microseconds per click.)
 
 ### Observability (step 5): almost free, and it paid for itself
 
