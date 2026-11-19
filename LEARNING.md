@@ -2112,7 +2112,11 @@ two seconds may end between two scrapes. Such jobs push to a *Pushgateway*.
 | **Counter** | Only goes up (and back to 0 when the process restarts). You never read its value, only how fast it grows | `http_requests_total`, `cache_lookups_total` |
 | **Gauge** | Goes up and down: a value right now | `http_requests_in_progress`, `click_backlog_entries` |
 | **Histogram** | Counts observations into buckets: how many took up to 1 ms, up to 2.5 ms... up to 5 s, plus their count and sum | `http_request_duration_seconds` |
-| **Info** | A constant (1) whose labels carry facts | `app_info{version="0.5.0", instance_number="2"}` |
+| **Summary** | Counts and sums observations too, and can work out quantiles (the p50, the p99) inside the process. The Python client keeps only the count and sum | None: quantiles worked out in each process can't be added up across instances, so we use histograms (below) |
+
+`prometheus_client` adds a shorthand, **Info**: a constant (1) whose labels
+carry facts, such as `app_info{version="0.5.0", instance_number="2"}`. On the
+/metrics page it is a gauge (`# TYPE app_info gauge`).
 
 Why count requests rather than compute "requests per second" in the app?
 The app would have to choose a time window, and every graph would be stuck
@@ -2120,13 +2124,14 @@ with it. A counter lets Prometheus compute the rate over any window
 afterwards, across all instances. And it survives a missed scrape: the next
 one still has the total.
 
-Why a histogram rather than "the p99" computed in the app? **Percentiles
-can't be averaged**: the p99 of three instances is not the average of their
-three p99s. Bucket counts, though, can be added across instances, and
-Prometheus estimates the percentile from the sum. The estimate is only as
-precise as the buckets, so ours are dense where redirects live (1 to 25 ms),
-and 0.1 s is a bucket boundary on purpose: it's our latency objective
-(Part 3), so "how many took 100 ms or less" is an exact count.
+Why a histogram rather than a summary, with "the p99" computed in the app?
+**Percentiles can't be averaged**: the p99 of three instances is not the
+average of their three p99s. Bucket counts, though, can be added across
+instances, and Prometheus estimates the percentile from the sum. The
+estimate is only as precise as the buckets, so ours are dense where
+redirects live (1 to 25 ms), and 0.1 s is a bucket boundary on purpose: it's
+our latency objective (Part 3), so "how many took 100 ms or less" is an
+exact count.
 
 #### Labels, and how to break Prometheus
 
