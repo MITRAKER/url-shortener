@@ -127,7 +127,7 @@ jobs:
   docker:
     name: Docker build and smoke test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -135,8 +135,12 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
+      # promtool, Prometheus's own checker: the configuration is valid, and
+      # each alert fires when it should (monitoring/prometheus/alerts_test.yml).
+      - name: Check the Prometheus configuration and test the alerts
+        run: make monitoring-check
       - name: Build and start the whole stack (waits until healthy)
-        run: docker compose up --build --detach --wait --wait-timeout 180
+        run: docker compose up --build --detach --wait --wait-timeout 300
       - name: Smoke test against the running containers
         run: python scripts/smoke_test.py http://localhost:8000
       - name: Clicks wait while the worker is stopped, and survive a Redis restart
@@ -146,6 +150,12 @@ jobs:
           docker compose restart redis
           docker compose start worker
           python -m scripts.check_clicks http://localhost:8000 expect "$code" 5
+      - name: Prometheus collects the metrics, Grafana shows them, /metrics stays inside
+        run: >-
+          python -m scripts.check_metrics
+          http://localhost:8000 http://localhost:9090 http://localhost:3000
+      - name: The load test runs (briefly and lightly, to keep it working)
+        run: docker compose run --rm --no-deps -e RATE=20 -e DURATION=10s -e LINKS=5 k6
       - name: Nginx spreads requests over all 3 instances
         run: python -m scripts.check_instances http://localhost:8000 3
       - name: Losing an instance loses no requests

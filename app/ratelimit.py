@@ -15,6 +15,7 @@ from typing import Annotated, Final
 import redis
 from fastapi import Depends, HTTPException, Request, status
 
+from app import metrics
 from app.redis_client import RedisGateway, get_redis
 
 # This script runs inside Redis, atomically: no other command can run between
@@ -109,6 +110,7 @@ class RateLimit:
     def __init__(self, name: str, rate: str) -> None:
         self.name = name
         self.rate = Rate.parse(rate)  # a bad setting fails at startup, not later
+        metrics.RATE_LIMITED.labels(name)  # 0 until the first refusal (app/metrics.py)
 
     def __call__(
         self, request: Request, gateway: Annotated[RedisGateway | None, Depends(get_redis)]
@@ -122,6 +124,7 @@ class RateLimit:
         # Fail open: if Redis is unavailable (no decision), we prefer serving
         # without limits over refusing everyone.
         if decision is not None and not decision.allowed:
+            metrics.RATE_LIMITED.labels(self.name).inc()
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 "Too many requests, please slow down",

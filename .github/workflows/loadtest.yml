@@ -1,0 +1,60 @@
+# A load test on GitHub's machines, started by hand: Actions > Load test >
+# Run workflow. It starts the Docker stack with the rate limits raised, runs
+# k6 (loadtest/redirects.js), and shows k6's summary on the run's page. It
+# fails if a threshold fails. GitHub's machines are shared, so the numbers
+# vary from run to run: compare runs on your own machine (docs/BENCHMARKS.md).
+name: Load test
+
+on:
+  workflow_dispatch:
+    inputs:
+      rate:
+        description: Requests per second
+        required: true
+        default: "200"
+      duration:
+        description: How long, such as 30s or 2m
+        required: true
+        default: "1m"
+
+permissions:
+  contents: read
+
+jobs:
+  loadtest:
+    name: k6 against the Docker stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Start the stack, rate limits raised
+        run: >-
+          docker compose -f docker-compose.yml -f loadtest/compose.yml
+          up --build --detach --wait --wait-timeout 300
+      - name: Run k6
+        # The inputs go in through the environment, never pasted into the
+        # script: text pasted into a script could run as commands.
+        env:
+          RATE: ${{ inputs.rate }}
+          DURATION: ${{ inputs.duration }}
+        shell: bash
+        run: |
+          docker compose -f docker-compose.yml -f loadtest/compose.yml \
+            run --rm --no-deps -e RATE -e DURATION k6 | tee k6.txt
+      - name: Show k6's summary on the run's page
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          {
+            echo '```'
+            sed -n '/THRESHOLDS/,$p' k6.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Show container logs
+        if: failure()
+        run: docker compose logs
+      - name: Stop the stack
+        if: always()
+        run: docker compose down --volumes

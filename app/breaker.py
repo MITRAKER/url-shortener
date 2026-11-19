@@ -16,6 +16,8 @@ import threading
 import time
 from collections.abc import Callable
 
+from app import metrics
+
 log = logging.getLogger(__name__)
 
 
@@ -39,6 +41,8 @@ class CircuitBreaker:
         self._lock = threading.Lock()
         self._failures = 0  # failures in a row, capped at failure_threshold
         self._blocked_until = 0.0  # while open, calls are skipped until this time
+        metrics.CIRCUIT_OPEN.labels(name).set(0)
+        metrics.CIRCUIT_OPENED.labels(name)  # 0 until it first opens
 
     @property
     def is_open(self) -> bool:
@@ -63,6 +67,7 @@ class CircuitBreaker:
             self._failures = 0
             self._blocked_until = 0.0
         if was_open:
+            metrics.CIRCUIT_OPEN.labels(self.name).set(0)
             log.warning("%s is answering again, circuit closed", self.name)
 
     def record_failure(self) -> None:
@@ -72,6 +77,8 @@ class CircuitBreaker:
             if self._failures >= self.failure_threshold:
                 self._blocked_until = self._clock() + self.reset_after
         if just_opened:
+            metrics.CIRCUIT_OPEN.labels(self.name).set(1)
+            metrics.CIRCUIT_OPENED.labels(self.name).inc()
             log.warning(
                 "%s failed %d times in a row, circuit open: skipping it for %.0f s",
                 self.name,

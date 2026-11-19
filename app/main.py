@@ -9,16 +9,16 @@ from contextlib import asynccontextmanager
 from functools import partial
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-from app import __version__, instances, service
+from app import __version__, instances, metrics, service
 from app.cache import LinkCache
 from app.clicks import ClickStream
 from app.config import DEFAULT_CODE_SECRET, settings
-from app.db import engine, get_session
+from app.db import POOL_MAX_OVERFLOW, POOL_SIZE, engine, get_session
 from app.ids import CodeCipher, LinkIds, RetiredError, Snowflake
 from app.limits import LimitBodySize
 from app.models import Link
@@ -48,6 +48,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Hold a unique instance number for as long as this instance runs, and
     # keep checking that we still do.
     with instances.lease_instance_id(engine) as lease:
+        metrics.APP.info({"version": __version__, "instance_number": str(lease.number)})
         snowflake = Snowflake(lease.number)
         app.state.ids = LinkIds(snowflake, CodeCipher(secret))
         watchdog = asyncio.create_task(instances.watch(lease, partial(give_up, snowflake)))
@@ -67,6 +68,13 @@ app.add_middleware(LimitBodySize)
 # it only on requests from a proxy listed in TRUSTED_PROXIES. After this,
 # request.client is the real client (the rate limiter counts per client).
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=settings.trusted_proxy_list)
+# Count and time every request (app/metrics.py). Added last, so it runs
+# first: it also sees the requests that the middleware above refuses.
+app.add_middleware(metrics.PrometheusMiddleware)
+# How busy the connection pool is. PostgreSQL only: that is the server whose
+# connections run out (SQLite's pool, a file on this machine, sizes itself).
+if engine.dialect.name == "postgresql":
+    metrics.REGISTRY.register(metrics.DatabasePoolCollector(engine, POOL_SIZE + POOL_MAX_OVERFLOW))
 
 
 def get_cache(gateway: Annotated[RedisGateway | None, Depends(get_redis)]) -> LinkCache | None:
@@ -117,6 +125,15 @@ def health(ids: IdsDep) -> dict[str, str | int]:
     return {"status": "ok", "instance": ids.snowflake.instance_id}
 
 
+# For Prometheus (monitoring/prometheus.yml), which asks every instance
+# directly; Nginx refuses it from outside. Not rate limited, and async on
+# purpose: it runs on the event loop, so it answers even when every worker
+# thread is busy with requests. An overloaded instance must still report.
+@app.get(metrics.METRICS_PATH, include_in_schema=False)
+async def prometheus_metrics() -> Response:
+    return Response(metrics.generate_latest(), media_type=metrics.CONTENT_TYPE_LATEST)
+
+
 @app.post("/api/links", status_code=status.HTTP_201_CREATED, dependencies=[limit_create])
 def create(body: LinkCreate, session: SessionDep, cache: CacheDep, ids: IdsDep) -> LinkOut:
     try:
@@ -153,6 +170,7 @@ def redirect(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Link not found")
 
     link, cache_status = service.resolve(session, cache, code)
+    metrics.CACHE_LOOKUPS.labels(cache_status.value.lower()).inc()
     headers = {"X-Cache": cache_status.value}
     if link is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Link not found", headers=headers)

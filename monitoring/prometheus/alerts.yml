@@ -1,0 +1,149 @@
+# What Prometheus checks every 15 s. Recording rules work out a number once
+# and store it as a new series; alerts fire when their expression has been
+# true for the time in `for`. Each alert links to what to do about it, in
+# docs/RUNBOOK.md. alerts_test.yml tests every alert: `make monitoring-check`.
+#
+# Our objectives (SLOs, LEARNING.md lesson 6), for redirects, over 30 days:
+#   - 99.9% are answered without a server error (5xx). The 0.1% left is the
+#     "error budget": about 43 minutes of failures a month.
+#   - 99% are answered within 100 ms, measured by the app.
+
+groups:
+  - name: redirect-slo
+    rules:
+      # The share of redirects that failed, over four windows. The alerts
+      # below compare a long window (is it serious?) with a short one (is it
+      # still going on?).
+      - record: slo:redirect_errors:ratio_rate5m
+        expr: |
+          sum(rate(http_requests_total{job="app", route="/{code}", status=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total{job="app", route="/{code}"}[5m]))
+      - record: slo:redirect_errors:ratio_rate30m
+        expr: |
+          sum(rate(http_requests_total{job="app", route="/{code}", status=~"5.."}[30m]))
+          /
+          sum(rate(http_requests_total{job="app", route="/{code}"}[30m]))
+      - record: slo:redirect_errors:ratio_rate1h
+        expr: |
+          sum(rate(http_requests_total{job="app", route="/{code}", status=~"5.."}[1h]))
+          /
+          sum(rate(http_requests_total{job="app", route="/{code}"}[1h]))
+      - record: slo:redirect_errors:ratio_rate6h
+        expr: |
+          sum(rate(http_requests_total{job="app", route="/{code}", status=~"5.."}[6h]))
+          /
+          sum(rate(http_requests_total{job="app", route="/{code}"}[6h]))
+      # The share of redirects answered within 100 ms. 0.1 s is one of the
+      # histogram's buckets (app/metrics.py), so this is a count, not a guess.
+      - record: slo:redirects_fast:ratio_rate10m
+        expr: |
+          sum(rate(http_request_duration_seconds_bucket{job="app", route="/{code}", le="0.1"}[10m]))
+          /
+          sum(rate(http_request_duration_seconds_count{job="app", route="/{code}"}[10m]))
+
+  - name: url-shortener
+    rules:
+      # Burn rates from Google's SRE workbook. Failing 14.4 times faster than
+      # the budget allows spends 2% of the month's budget in one hour: wake
+      # someone up. 6 times faster spends 5% in six hours: it can wait for
+      # working hours.
+      - alert: RedirectErrorBudgetBurningFast
+        expr: |
+          slo:redirect_errors:ratio_rate1h > (14.4 * 0.001)
+          and
+          slo:redirect_errors:ratio_rate5m > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Redirects are failing fast enough to spend 2% of the month's error budget in an hour.
+          runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#redirecterrorbudgetburningfast
+
+      - alert: RedirectErrorBudgetBurningSlowly
+        expr: |
+          slo:redirect_errors:ratio_rate6h > (6 * 0.001)
+          and
+          slo:redirect_errors:ratio_rate30m > (6 * 0.001)
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Redirects are failing fast enough to spend 5% of the month's error budget in six hours.
+          runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#redirecterrorbudgetburningslowly
+
+      - alert: RedirectsSlow
+        expr: slo:redirects_fast:ratio_rate10m < 0.99
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Fewer than 99% of redirects were answered within 100 ms over the last 10 minutes.
+          runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#redirectsslow
+
+      # With every instance down, no instance is left to count the errors:
+      # the alerts above see no requests at all. So we also count instances.
+      # `or vector(0)`: count() of nothing is not 0 but no answer at all.
+      - alert: AppDown
+        expr: (count(up{job="app"} == 1) or vector(0)) == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: No app instance is answering Prometheus.
+          runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#appdown
+
+      - alert: AppInstancesMissing
+        expr: (count(up{job="app"} == 1) or vector(0)) < 3
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Fewer than 3 app instances are answering Prometheus.
+          runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#appinstancesmissing
+
+      - alert: ClickWorkerDown
+        expr: up{job="click-worker"} == 0
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: The click worker is not answering Prometheus. Clicks wait in Redis, uncounted.
+          runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#clickworkerdown
+
+      - alert: ClicksWaitingTooLong
+        expr: max(click_backlog_oldest_age_seconds) > 60
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: A click has waited over a minute to be counted. The click worker is not keeping up.
+          runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#clickswaitingtoolong
+
+      - alert: ClicksBypassingTheStream
+        expr: sum(rate(clicks_recorded_total{job="app", path="database"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Redis is not taking clicks, so redirects count them in PostgreSQL, slowly.
+          runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#clicksbypassingthestream
+
+      - alert: RedisCircuitOpen
+        expr: max(circuit_breaker_open{job="app", name="Redis"}) == 1
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: An app instance has stopped calling Redis after repeated failures.
+          runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#rediscircuitopen
+
+      - alert: DatabasePoolSaturated
+        expr: |
+          max by (instance) (db_pool_connections_in_use / db_pool_connections_limit) > 0.8
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Instance {{ $labels.instance }} has used over 80% of its database connections for 5 minutes."
+          runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#databasepoolsaturated
