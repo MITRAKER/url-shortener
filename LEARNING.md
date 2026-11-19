@@ -1277,6 +1277,16 @@ header, so it may be believed only when it comes from our own proxy.
 `tests/test_proxy.py` checks all of it: one bucket per client behind Nginx,
 the header ignored from anyone else, and a forged address in front ignored.
 
+Nginx must pass on one more header: `Host`, the name and port the client
+asked for. Left to itself, Nginx would send the name its configuration gives
+the instances, `app_instances`. `proxy_set_header Host $http_host;` passes on
+what the client sent, port included. The app uses it to build the few
+redirects that point back at itself: `/docs/` sends you to `/docs`, on the
+host and port you used. Our first version used the common `$host`, which
+drops the port: `http://localhost:8000/docs/` sent you to
+`http://localhost/docs`, on port 80, where the app isn't. The smoke test now
+checks one such redirect.
+
 ### Part 2: Unique IDs without asking anyone
 
 #### The problem with random codes
