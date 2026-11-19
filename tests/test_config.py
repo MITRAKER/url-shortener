@@ -53,6 +53,11 @@ def test_malformed_redis_url_stops_the_app_at_startup(monkeypatch: pytest.Monkey
         "redis://:hun?ter2@redis:6379/0",
         # A full-width '#': Python's URL parser quotes all of ":password@host:port".
         "redis://:hun\uff03ter2@redis:6379/0",
+        # The same, but the start of the password is a valid port number: the
+        # URL parses, without the password, and the app would run without Redis.
+        "redis://:4711#hunter2@redis:6379/0",
+        "redis://:4711/hunter2@redis:6379/0",
+        "redis://:4711?hunter2@redis:6379/0",
     ],
 )
 def test_error_for_a_malformed_redis_url_does_not_show_the_password(url: str) -> None:
@@ -62,3 +67,4 @@ def test_error_for_a_malformed_redis_url_does_not_show_the_password(url: str) ->
         Settings(redis_url=url)
     assert "hun" not in str(error.value)
     assert "ter2" not in str(error.value)
+    assert "4711" not in str(error.value)

@@ -100,11 +100,17 @@ class LinkCache:
         return self.gateway.call("cache write", lambda r: bool(r.set(key, payload, ex=ttl)), False)
 
     def set_not_found(self, code: str) -> bool:
-        """Remember that `code` does not exist. True if Redis stored it."""
+        """Remember that `code` does not exist. True if Redis now holds that answer."""
         # nx=True: only write if the key is empty. If a create() cached the
-        # real link a moment ago, "not found" must not overwrite it, and
-        # nothing is stored.
+        # real link a moment ago, "not found" must not overwrite it. A refused
+        # write can still mean the answer is cached: a request for the same
+        # code may have stored it a moment ago, so we look. (SET with both NX
+        # and GET would tell in one command, but needs Redis 7.)
         key, ttl = self.key(code), self.negative_ttl
         return self.gateway.call(
-            "cache write", lambda r: bool(r.set(key, NOT_FOUND_VALUE, ex=ttl, nx=True)), False
+            "cache write",
+            lambda r: (
+                bool(r.set(key, NOT_FOUND_VALUE, ex=ttl, nx=True)) or r.get(key) == NOT_FOUND_VALUE
+            ),
+            False,
         )

@@ -3,6 +3,8 @@
 Example: DATABASE_URL=postgresql+psycopg://user:pass@db:5432/shortener
 """
 
+from urllib.parse import urlsplit
+
 import redis
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -40,18 +42,25 @@ class Settings(BaseSettings):
         # Parse it now, so a typo stops the app at startup instead of breaking
         # every request later. Building a pool parses the URL but opens no
         # connection; it raises ValueError, e.g. for a missing redis:// scheme.
-        if url:
-            try:
-                redis.ConnectionPool.from_url(url)
-            except ValueError:
-                # redis-py's message can quote part of the URL, and so part of
-                # the password: in redis://:abc#def@host, the parser stops at
-                # the '#' and reports "abc" as a bad port. So we never pass its
-                # message on.
-                raise ValueError(
-                    "not a valid redis://, rediss:// or unix:// URL"
-                    " (percent-encode special characters in the password)"
-                ) from None
+        if not url:
+            return url
+        problem = ValueError(
+            "not a valid redis://, rediss:// or unix:// URL"
+            " (percent-encode special characters in the password)"
+        )
+        try:
+            redis.ConnectionPool.from_url(url)
+        except ValueError:
+            # redis-py's message can quote part of the URL, and so part of
+            # the password: in redis://:abc#def@host, the parser stops at
+            # the '#' and reports "abc" as a bad port. So we never pass its
+            # message on.
+            raise problem from None
+        # If the text before that '#' (or '/' or '?') is a number, the URL
+        # still parses, as that port and without the password. The '@' that
+        # ends the password then sits outside the host part.
+        if "@" in url and "@" not in urlsplit(url).netloc:
+            raise problem
         return url
 
 

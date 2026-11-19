@@ -534,9 +534,10 @@ doesn't exist yet.
 danger is the same: two parts of the program changing one object through
 different references. Hence no mutable default arguments (`def f(x=[])` is a
 classic Python bug), immutable data where possible, and no function pointers
-except framework hooks like FastAPI's `Depends` and injected dependencies that
-keep side effects testable: a clock that a test can move by hand, or the
-operation given to `RedisGateway.call` (both in lesson 3).
+except framework hooks like FastAPI's `Depends`, standard-library factories
+like `defaultdict(list)`, and injected dependencies that keep side effects
+testable: a clock that a test can move by hand, or the operation given to
+`RedisGateway.call` (both in lesson 3).
 
 **Rule 10: all warnings on from day one, zero warnings, daily analysis.** This
 is the whole lesson in one rule: Ruff with a broad rule set, `mypy --strict`,
@@ -693,7 +694,7 @@ GET /abc1234
 | `app/main.py` | Rate limits on the routes, the `X-Cache` header, the code-shape check |
 | `app/config.py` | `REDIS_URL`, checked when the app starts |
 | `docker-compose.yml` | A `redis` container with a 64 MB memory budget |
-| `tests/test_cache.py`, `test_ratelimit.py`, `test_redis_client.py`, `test_breaker.py`, `test_config.py` | 89 new tests |
+| `tests/test_cache.py`, `test_ratelimit.py`, `test_redis_client.py`, `test_breaker.py`, `test_config.py` | 92 new tests |
 | `tests/fakes.py` | `SilentServer`: a fake Redis that accepts connections and never answers |
 
 ### Part 1: Caching
@@ -751,9 +752,11 @@ send millions of made-up codes, and the cache doesn't help at all. That is
 **cache penetration**. Two defenses:
 
 1. **Validate first.** A code must look like a code: 3 to 32 characters of
-   `A-Z a-z 0-9 _ -`. `/../../etc/passwd` or a 10 KB string is rejected with
-   404 before touching the cache or the database (only the rate limiter's
-   script runs in Redis).
+   `A-Z a-z 0-9 _ -`. `/bad.code` or a 10 KB string is rejected with 404
+   before touching the cache or the database (only the rate limiter's script
+   runs in Redis). A path with a `/` in it, like `/../../etc/passwd`, doesn't
+   even match the `/{code}` route, so the router answers 404 before the rate
+   limiter runs.
 2. **Cache the absence.** If the database says "not found", we store an empty
    string under that key for 60 seconds. Repeated lookups now hit Redis.
 
@@ -935,9 +938,14 @@ of the URL. In `redis://:S3cret#Pass@redis:6379/0`, the `#` in the password is
 not percent-encoded, so the parser stops there and takes `S3cret` for the
 port. The error read "Port could not be cast to integer value as 'S3cret'".
 A `/` or a `?` does the same, and generated passwords often contain a `/`.
+If the text before the `#` is a number, the URL even parses, as that port and
+without the password, and the app would start without Redis. So the check
+also refuses a URL whose `@` is not in the host part.
 Now `_check_redis_url` catches redis-py's `ValueError` and raises its own,
-with a fixed message: it names the setting and the problem, never the value
-or any part of it.
+with a fixed message, `from None`: unlike lesson 2's `from exc`, this
+deliberately keeps the original error, which quotes the URL, out of the
+traceback. The message names the setting and the problem, never the value or
+any part of it.
 
 #### Making the cache visible
 

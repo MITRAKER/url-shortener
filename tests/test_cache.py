@@ -141,6 +141,7 @@ def test_not_found_never_overwrites_a_real_entry(redis_client: redis.Redis) -> N
 def test_writes_report_whether_redis_stored_them(redis_client: redis.Redis) -> None:
     cache = make_cache(redis_client)
     assert cache.set_not_found("abc") is True
+    assert cache.set_not_found("abc") is True  # another request cached "not found" already
     assert cache.set("abc", CachedLink("https://example.com", None)) is True
     assert cache.set_not_found("abc") is False  # SET NX: the real entry stays
 
