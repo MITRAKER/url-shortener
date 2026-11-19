@@ -1,0 +1,81 @@
+# Continuous delivery: pushing a version tag (for example v0.2.0) runs the
+# full CI pipeline, then publishes a Docker image to the GitHub Container
+# Registry and creates a GitHub release with notes from CHANGELOG.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Full CI
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish image and GitHub release
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # create the GitHub release
+      packages: write # push the image to ghcr.io
+      id-token: write # sign the build provenance attestation (Sigstore)
+      attestations: write # store that attestation on GitHub
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Check the tag matches app.__version__
+        run: |
+          version="$(python -c 'import app; print(app.__version__)')"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match app.__version__ (${version})"
+            exit 1
+          fi
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - name: Extract release notes from CHANGELOG.md
+        run: python scripts/release_notes.py "${VERSION}" > release-notes.md
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Supply-chain metadata stored next to the image: a list of
+          # everything inside it (SBOM) and a record of how it was built.
+          sbom: true
+          provenance: mode=max
+      # A signed statement, verifiable by anyone, that this exact image was
+      # built by this workflow from this commit:
+      #   gh attestation verify oci://IMAGE:TAG --repo OWNER/REPO
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Create the GitHub release
+        run: gh release create "${GITHUB_REF_NAME}" --verify-tag --title "${GITHUB_REF_NAME}" --notes-file release-notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}

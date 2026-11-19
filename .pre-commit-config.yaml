@@ -1,0 +1,112 @@
+# Checks that run on every `git commit` once you have run `pre-commit install`.
+# CI runs exactly the same hooks with `pre-commit run --all-files`.
+#
+# Every hook is `repo: local` with `language: system`: it runs a program that
+# requirements-dev.txt installs, locked to an exact version with its hash, or a
+# script in this repository (the Power of Ten checker).
+# A remote hook repository is usually named by a tag, which can be moved, and
+# pre-commit installs it with pip, without hashes, taking whatever versions of
+# its dependencies are newest at that moment.
+repos:
+  # File hygiene, from the pre-commit-hooks package. Each hook copies the
+  # settings of the hook with the same id in that package's
+  # .pre-commit-hooks.yaml (version 6.0.0), except `language`, so it runs on
+  # the same files. The `args` are our own. When pre-commit-hooks is updated,
+  # compare these hooks with the new version's .pre-commit-hooks.yaml.
+  - repo: local
+    hooks:
+      - id: trailing-whitespace
+        name: trim trailing whitespace
+        entry: trailing-whitespace-fixer
+        language: system
+        types: [text]
+        stages: [pre-commit, pre-push, manual]
+        minimum_pre_commit_version: 3.2.0
+      - id: end-of-file-fixer
+        name: fix end of files
+        entry: end-of-file-fixer
+        language: system
+        types: [text]
+        stages: [pre-commit, pre-push, manual]
+        minimum_pre_commit_version: 3.2.0
+      - id: mixed-line-ending
+        name: mixed line ending
+        entry: mixed-line-ending
+        language: system
+        types: [text]
+        args: [--fix=lf]
+      - id: check-yaml
+        name: check yaml
+        entry: check-yaml
+        language: system
+        types: [yaml]
+      - id: check-toml
+        name: check toml
+        entry: check-toml
+        language: system
+        types: [toml]
+      - id: check-merge-conflict
+        name: check for merge conflicts
+        entry: check-merge-conflict
+        language: system
+        types: [text]
+      - id: check-case-conflict
+        name: check for case conflicts
+        entry: check-case-conflict
+        language: system
+      - id: check-added-large-files
+        name: check for added large files
+        entry: check-added-large-files
+        language: system
+        stages: [pre-commit, pre-push, manual]
+        minimum_pre_commit_version: 3.2.0
+        # --enforce-all: also check files already committed. Without it, the
+        # hook only looks at newly staged files, so in CI it checks nothing.
+        args: [--maxkb=500, --enforce-all]
+      - id: detect-private-key
+        name: detect private key
+        entry: detect-private-key
+        language: system
+        types: [text]
+
+  # These tools are pinned in requirements-dev.in (locked, with hashes, in
+  # requirements-dev.txt), so your laptop, the pre-commit hook and CI run the
+  # very same versions. That includes shellcheck, which actionlint uses to
+  # check the shell scripts inside workflows.
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff (lint)
+        entry: ruff check --fix
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: ruff-format
+        name: ruff (format)
+        entry: ruff format
+        language: system
+        # Markdown too: Ruff formats the Python examples in the docs.
+        types_or: [python, pyi, markdown]
+        require_serial: true
+      - id: mypy
+        name: mypy (strict types)
+        entry: mypy
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+      - id: power-of-ten
+        name: NASA/JPL Power of Ten
+        entry: python scripts/check_power_of_ten.py app scripts tests
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: actionlint
+        name: actionlint (GitHub workflows)
+        entry: actionlint
+        language: system
+        files: ^\.github/workflows/.*\.ya?ml$
+      - id: hadolint
+        name: hadolint (Dockerfile)
+        entry: hadolint
+        language: system
+        types: [dockerfile]

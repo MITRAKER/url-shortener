@@ -1,0 +1,36 @@
+name: Bug report
+description: Something does not work as expected.
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. curl -X POST localhost:8000/api/links -d '{"url": "..."}'
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect instead?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.2.0 or a commit SHA
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      render: shell
