@@ -43,7 +43,9 @@ class CacheStatus(StrEnum):
 
     HIT = "HIT"  # answered from Redis
     MISS = "MISS"  # answered from the database, now cached
-    BYPASS = "BYPASS"  # Redis not used: not configured, down, or circuit open
+    # Answered from the database, not cached: Redis not configured, down, or
+    # circuit open, or the cache write did not go through.
+    BYPASS = "BYPASS"
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -65,7 +67,9 @@ def _insert(session: Session, link: Link) -> bool:
 def _write_through(cache: LinkCache | None, link: Link) -> None:
     # Write-through on create: new links are usually clicked right after they
     # are shared, so we cache them now. This also replaces any "not found"
-    # entry left by someone who tried the code before it existed.
+    # entry left by someone who tried the code before it existed. If the write
+    # fails (RedisGateway logs it), that entry stays: the new link answers 404
+    # until the entry expires, at most cache_negative_ttl_seconds later.
     if cache is not None:
         expires_at = None if link.expires_at is None else _as_utc(link.expires_at)
         cache.set(link.code, CachedLink(link.target_url, expires_at))
@@ -131,13 +135,13 @@ def resolve(
     if cache is None or found is Lookup.UNAVAILABLE:
         # No cache, or Redis just failed: don't wait on it a second time to write.
         return result, CacheStatus.BYPASS
-    if result is None:
-        # Negative caching: remember "does not exist" briefly, so a flood of
-        # requests for made-up codes can't all reach the database.
-        cache.set_not_found(code)
-    else:
-        cache.set(code, result)
-    return result, CacheStatus.MISS
+    # Negative caching: if the code does not exist, remember that briefly, so a
+    # flood of requests for made-up codes can't all reach the database.
+    stored = cache.set_not_found(code) if result is None else cache.set(code, result)
+    # MISS says the answer is now cached. If Redis did not store it (the write
+    # failed, the circuit opened, or a link created a moment ago is already
+    # cached), say BYPASS.
+    return result, CacheStatus.MISS if stored else CacheStatus.BYPASS
 
 
 def is_expired(link: Link | CachedLink) -> bool:

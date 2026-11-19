@@ -19,9 +19,41 @@ Like every static analyzer for a dynamic language, this is an approximation.
 For R1 it builds a call graph of one module, resolving names with Python's own
 scoping rules (local, enclosing functions, module; class bodies are skipped).
 It follows plain names, whether called or passed on (`map(f, xs)`),
-`self.m` and `cls.m`, `ClassName.m`, `super().m`, and `ClassName(...)`, which
-runs `__init__`. It cannot follow calls through other objects (`obj.m()`),
-through other modules, or through `getattr`.
+`ClassName.m`, `super().m`, and `ClassName(...)`, which runs `__init__` and
+`__new__`. Through `self` and `cls` it also follows what Python runs for you,
+as the class or any subclass in the module defines it:
+    self.m, cls.m     m, or an override of m in a subclass
+    reading self.x    a property getter and `__getattribute__`; also
+                      `__getattr__`, unless x is in `dir(object)` or is
+                      `__dict__`, `__module__` or `__weakref__`, or the class
+                      or a base binds x in its body or sets it on `self` in a
+                      method: `self.x = v`, `setattr(self, "x", v)`,
+                      `object.__setattr__(self, "x", v)`, `self.__dict__["x"] = v`
+    self.x = v        a property setter and `__setattr__` (`+=` reads first)
+    del self.x        a property deleter and `__delattr__`
+    self(...)         `__call__`
+    cls(...)          `__init__` and `__new__`
+Because `self` and `cls` stand for every subclass in the module, a factory
+such as `Base.make()`, which runs `cls(...)`, is reported when a subclass's
+`__init__` calls it, though `cls` is `Base` there. Code like that needs a
+waiver: `# p10-waiver: R1 <reason>`.
+
+It only sees classes defined in the module. It cannot follow calls through
+other objects (`obj.m()`, `type(self)(...)`, `self.__class__(...)`), through
+other modules (base classes defined there included), through `getattr`,
+`setattr` or metaclasses, or through descriptors made any other way than by
+decorating a method (such as `x = property(get, put)`). Nor does it follow the
+special methods that operators, statements and built-in functions call:
+`len(self)` (`__len__`), `self == other` (`__eq__`), `self[k]` (`__getitem__`,
+`__missing__`), `str(self)`, `repr(self)` and f-strings (`__str__`,
+`__repr__`, `__format__`), `iter(self)` and `for x in self` (`__iter__`),
+`bool(self)` and `if self:` (`__bool__`), `with self:` (`__enter__`). It
+resolves `super().m` to the bases of the class that calls it, not to the next
+class in the instance's MRO. And it assumes that an instance may have any
+attribute when its class or a base has a base other than `object` from
+outside the module, or a metaclass, or sets attributes by names known only at
+run time (`setattr(self, key, v)`, `self.__dict__.update(d)`): a `__getattr__`
+there that reads a missing attribute is not reported.
 """
 
 import ast
@@ -32,6 +64,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 MAX_FUNCTION_LINES = 60
 WAIVER = re.compile(r"#\s*p10-waiver:\s*(R\d+)\s+\S")
@@ -95,12 +128,26 @@ def _qualified(expr: ast.expr, imports: dict[str, str]) -> str | None:
 
 # ----------------------------------------------------------------- R1 ----
 
+# What a use of a name or attribute does. Reading a property runs its getter,
+# assigning it runs its setter, and `del` runs its deleter.
+Access = Literal["load", "store", "delete"]
+# Methods that Python passes the class to, not an instance, with no decorator.
+IMPLICIT_CLASSMETHODS = frozenset({"__new__", "__init_subclass__", "__class_getitem__"})
+# Attributes every instance has, from `object` or from its class: reading one
+# never falls through to `__getattr__`.
+ALWAYS_THERE = frozenset(dir(object)) | {"__dict__", "__module__", "__weakref__"}
+# Stands for every name, among the attributes a class sets on `self`, when it
+# sets some by names known only at run time: `setattr(self, key, value)`.
+ANY_NAME = "*"
+
 
 @dataclass(frozen=True)
 class Instance:
-    """`self` or `cls` inside a method: `self.name` is looked up on this class."""
+    """`self` or `cls` inside a method of `cls`. At run time, `self` is an
+    instance of that class or of a subclass, and `cls` is one of those classes."""
 
     cls: ast.ClassDef
+    is_class: bool = False  # `cls` of a classmethod or of `__new__`: a class
 
 
 # What a name can be bound to. None means something we cannot follow, such as
@@ -110,11 +157,12 @@ Target = FunctionNode | ast.ClassDef | Instance | None
 
 @dataclass(frozen=True)
 class Reference:
-    """A name or attribute read inside a function: a possible call."""
+    """A name or attribute used inside a function: a possible call."""
 
-    owner: FunctionNode  # the function whose execution reads it
+    owner: FunctionNode  # the function whose execution uses it
     chain: Chain
     node: ast.Name | ast.Attribute
+    access: Access
 
 
 def _qualified_name(name: str, chain: Chain) -> str:
@@ -122,10 +170,10 @@ def _qualified_name(name: str, chain: Chain) -> str:
     return ".".join([*outer, name])
 
 
-def _is_staticmethod(node: FunctionNode) -> bool:
+def _has_decorator(node: FunctionNode, name: str) -> bool:
     return any(
-        (isinstance(d, ast.Name) and d.id == "staticmethod")
-        or (isinstance(d, ast.Attribute) and d.attr == "staticmethod")
+        (isinstance(d, ast.Name) and d.id == name)
+        or (isinstance(d, ast.Attribute) and d.attr == name)
         for d in node.decorator_list
     )
 
@@ -134,16 +182,62 @@ def _parameters(node: FunctionNode | ast.Lambda, owner: ast.AST) -> Iterator[tup
     """Parameter names, with `self`/`cls` of a method bound to its class."""
     args = node.args
     positional = [*args.posonlyargs, *args.args]
-    method = (
-        isinstance(node, FunctionNode)
+    if (
+        positional
+        and isinstance(node, FunctionNode)
         and isinstance(owner, ast.ClassDef)
-        and not _is_staticmethod(node)
-    )
-    if positional and method and isinstance(owner, ast.ClassDef):
-        yield positional[0].arg, Instance(owner)
+        and not _has_decorator(node, "staticmethod")
+    ):
+        takes_class = node.name in IMPLICIT_CLASSMETHODS or _has_decorator(node, "classmethod")
+        yield positional[0].arg, Instance(owner, is_class=takes_class)
         positional = positional[1:]
     others = [*positional, *args.kwonlyargs, args.vararg, args.kwarg]
     yield from ((arg.arg, None) for arg in others if arg is not None)
+
+
+def _accessor(target: Target) -> Access:
+    """Which use of an attribute runs `target`: a `@x.setter` function runs when
+    it is assigned, a `@x.deleter` one when it is deleted, the rest when it is read."""
+    decorators = target.decorator_list if isinstance(target, FunctionNode) else []
+    kinds = {d.attr for d in decorators if isinstance(d, ast.Attribute)}
+    if "setter" in kinds:
+        return "store"
+    return "delete" if "deleter" in kinds else "load"
+
+
+def _run_by(targets: list[Target], access: Access) -> list[Target]:
+    return [target for target in targets if _accessor(target) == access]
+
+
+def _hook(access: Access) -> str:
+    """The method Python runs on every read, assignment or `del` of an attribute."""
+    if access == "store":
+        return "__setattr__"
+    return "__delattr__" if access == "delete" else "__getattribute__"
+
+
+def _closure(
+    start: ast.ClassDef, edges: dict[ast.ClassDef, list[ast.ClassDef]]
+) -> list[ast.ClassDef]:
+    """`start`, then every class reachable through `edges`, breadth-first."""
+    found = [start]
+    # Bounded (rule 2): each round takes the next class, and none is added twice.
+    for index in range(len(edges)):
+        if index >= len(found):
+            break
+        found += [cls for cls in edges[found[index]] if cls not in found]
+    return found
+
+
+def _subclasses(
+    parents: dict[ast.ClassDef, list[ast.ClassDef]],
+) -> dict[ast.ClassDef, list[ast.ClassDef]]:
+    """The classes that name each class as a base."""
+    children: dict[ast.ClassDef, list[ast.ClassDef]] = {cls: [] for cls in parents}
+    for cls, bases in parents.items():
+        for base in bases:
+            children[base].append(cls)
+    return children
 
 
 def _evaluated_outside(node: FunctionNode | ast.Lambda) -> list[ast.AST]:
@@ -168,9 +262,50 @@ def _bound_names(node: ast.AST) -> list[str]:
     return []
 
 
+def _attribute_write(node: ast.AST) -> tuple[ast.expr, str] | None:
+    """The object and the name of an attribute set without `obj.name = v`:
+    `setattr(obj, name, v)`, `object.__setattr__(obj, name, v)`,
+    `obj.__setattr__(name, v)` (`obj` may be `super()`), `obj.__dict__[name] = v`
+    and `obj.__dict__.update(...)`, with `vars(obj)` for `obj.__dict__`. The
+    name is ANY_NAME when it is known only at run time."""
+    found: tuple[ast.expr, ast.expr | None] | None = None
+    match node:
+        case ast.Call(func=ast.Name(id="setattr"), args=[obj, name, _]):
+            found = obj, name
+        case ast.Call(func=ast.Attribute(attr="__setattr__"), args=[obj, name, _]):
+            found = obj, name
+        case ast.Call(func=ast.Attribute(value=obj, attr="__setattr__"), args=[name, _]):
+            found = obj, name
+        case ast.Subscript(
+            value=(
+                ast.Attribute(value=obj, attr="__dict__")
+                | ast.Call(func=ast.Name(id="vars"), args=[obj])
+            ),
+            slice=name,
+            ctx=ast.Store(),
+        ):
+            found = obj, name
+        case ast.Call(
+            func=ast.Attribute(
+                value=(
+                    ast.Attribute(value=obj, attr="__dict__")
+                    | ast.Call(func=ast.Name(id="vars"), args=[obj])
+                ),
+                attr="update" | "setdefault",
+            )
+        ):
+            found = obj, None
+    if found is None:
+        return None
+    target, key = found
+    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+        return target, key.value
+    return target, ANY_NAME
+
+
 class _Scopes:
     """One pass over a module that records which names each scope binds, and
-    which names and attributes each function reads."""
+    which names and attributes each function uses."""
 
     def __init__(self, tree: ast.Module) -> None:
         self.bindings: defaultdict[ast.AST, defaultdict[str, list[Target]]] = defaultdict(
@@ -180,11 +315,27 @@ class _Scopes:
         self.class_chains: dict[ast.ClassDef, Chain] = {}
         self.names: dict[FunctionNode, str] = {}  # every function, by qualified name
         self.references: list[Reference] = []
-        self.calls = {n.func for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        # Attributes set by name, as `setattr(obj, "name", v)`: object, name, where.
+        self.writes: list[tuple[ast.expr, str, Chain]] = []
+        nodes = list(ast.walk(tree))
+        self.calls = {n.func for n in nodes if isinstance(n, ast.Call)}
+        # `x.a += 1` reads x.a, then assigns it; `x.a: int` with no value does neither.
+        self.updated = {n.target for n in nodes if isinstance(n, ast.AugAssign)}
+        self.annotated = {
+            n.target for n in nodes if isinstance(n, ast.AnnAssign) and n.value is None
+        }
         self._walk(tree)
         for scope, names in self.declared.items():
             for name in names:  # `global x` means this scope does not bind x
                 self.bindings[scope].pop(name, None)
+        # Each class, then its base classes; and each class, then its subclasses.
+        parents = {cls: self._bases(cls) for cls in self.class_chains}
+        children = _subclasses(parents)
+        self.ancestors = {cls: _closure(cls, parents) for cls in parents}
+        self.descendants = {cls: _closure(cls, children) for cls in parents}
+        self.assigned = self._assigned_to_self()
+        # Classes whose instances may have attributes that this module does not show.
+        self.extends_outside = {cls for cls in parents if self._has_outside_base(cls)}
 
     def _walk(self, tree: ast.Module) -> None:
         stack: list[tuple[ast.AST, Chain]] = [(stmt, (tree,)) for stmt in tree.body]
@@ -250,12 +401,61 @@ class _Scopes:
             self.declared[chain[0]].update(node.names)
         elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
             self._bind(chain[0], node.id, None)
-        elif isinstance(node, ast.Name | ast.Attribute) and isinstance(node.ctx, ast.Load):
+        elif isinstance(node, ast.Name | ast.Attribute):
             owner = next((s for s in chain if isinstance(s, FunctionNode)), None)
             if owner is not None:
-                self.references.append(Reference(owner, chain, node))
+                self.references += [Reference(owner, chain, node, a) for a in self._accesses(node)]
+        elif (write := _attribute_write(node)) is not None:
+            self.writes.append((*write, chain))
         for name in _bound_names(node):
             self._bind(chain[0], name, None)
+
+    def _accesses(self, node: ast.Name | ast.Attribute) -> list[Access]:
+        """What this use of a name or attribute does to it."""
+        if isinstance(node.ctx, ast.Del):
+            return ["delete"]
+        if not isinstance(node.ctx, ast.Store):
+            return ["load"]
+        if node in self.annotated:
+            return []
+        return ["load", "store"] if node in self.updated else ["store"]
+
+    def _assigned_to_self(self) -> dict[ast.ClassDef, set[str]]:
+        """The attributes that each class's methods set on `self`, with ANY_NAME
+        for a class that sets some by names known only at run time."""
+        assigned: dict[ast.ClassDef, set[str]] = {cls: set() for cls in self.class_chains}
+        stores = [
+            (reference.node.value, reference.node.attr, reference.chain)
+            for reference in self.references
+            if reference.access == "store" and isinstance(reference.node, ast.Attribute)
+        ]
+        for obj, name, chain in [*stores, *self.writes]:
+            for cls in self._instance_of(obj, chain):
+                # `self.__dict__ = values` can bring any attribute.
+                assigned[cls].add(ANY_NAME if name == "__dict__" else name)
+        return assigned
+
+    def _instance_of(self, obj: ast.expr, chain: Chain) -> list[ast.ClassDef]:
+        """The class whose method `obj` is the `self` of, if it is: `self`, or `super()`."""
+        if isinstance(obj, ast.Call) and isinstance(obj.func, ast.Name) and obj.func.id == "super":
+            owner_class = self._class_of(chain)
+            return [] if owner_class is None else [owner_class]
+        targets = self.resolve(obj.id, chain) if isinstance(obj, ast.Name) else []
+        return [t.cls for t in targets if isinstance(t, Instance) and not t.is_class]
+
+    def _has_outside_base(self, cls: ast.ClassDef) -> bool:
+        """Whether `cls` has a metaclass, or a base other than `object` that is not
+        a class of this module: what its instances have is unknown here."""
+        if any(keyword.arg == "metaclass" for keyword in cls.keywords):
+            return True
+        chain = self.class_chains[cls]
+        for base in cls.bases:
+            targets = self.resolve(base.id, chain) if isinstance(base, ast.Name) else [None]
+            if not targets and isinstance(base, ast.Name) and base.id == "object":
+                continue  # the builtin `object`
+            if not targets or not all(isinstance(t, ast.ClassDef) for t in targets):
+                return True
+        return False
 
     def resolve(self, name: str, chain: Chain) -> list[Target]:
         """What `name` means at a point inside `chain`, by Python's scoping rules."""
@@ -269,18 +469,11 @@ class _Scopes:
 
     def lookup(self, cls: ast.ClassDef, attr: str, *, skip_self: bool = False) -> list[Target]:
         """`cls.attr`: the class body first, then its base classes, breadth-first."""
-        queue = self._bases(cls) if skip_self else [cls]
-        seen = set(queue)
-        for _ in range(len(self.class_chains)):  # each class is visited at most once
-            if not queue:
-                break
-            current = queue.pop(0)
+        classes = self.ancestors[cls]
+        for current in classes[1:] if skip_self else classes:
             found = self.bindings[current].get(attr) if current in self.bindings else None
             if found:
                 return found
-            fresh = [base for base in self._bases(current) if base not in seen]
-            seen.update(fresh)
-            queue += fresh
         return []
 
     def _bases(self, cls: ast.ClassDef) -> list[ast.ClassDef]:
@@ -301,36 +494,67 @@ class _Scopes:
         for target in targets:
             if isinstance(target, FunctionNode):
                 functions.append(target)
-            elif isinstance(target, ast.ClassDef) and called:
-                found = self.lookup(target, "__init__") + self.lookup(target, "__new__")
-                functions += [f for f in found if isinstance(f, FunctionNode)]
+            elif called and isinstance(target, ast.ClassDef):  # ClassName(...)
+                functions += self._special([target], "__init__", "__new__")
+            elif called and isinstance(target, Instance):  # self(...) or cls(...)
+                names = ("__init__", "__new__") if target.is_class else ("__call__",)
+                functions += self._special(self.descendants[target.cls], *names)
         return functions
 
     def _attribute(self, node: ast.Attribute, reference: Reference) -> list[Target]:
         value = node.value
         if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
-            if value.func.id != "super":
+            owner_class = self._class_of(reference.chain)
+            # super() can only read: assigning or deleting through it fails.
+            if value.func.id != "super" or owner_class is None or reference.access != "load":
                 return []
-            owner_class = self._class_of(reference)
-            return (
-                [] if owner_class is None else self.lookup(owner_class, node.attr, skip_self=True)
-            )
+            return _run_by(self.lookup(owner_class, node.attr, skip_self=True), "load")
         if not isinstance(value, ast.Name):
             return []
         found: list[Target] = []
         for base in self.resolve(value.id, reference.chain):
-            if isinstance(base, ast.ClassDef):
-                found += self.lookup(base, node.attr)
-            elif isinstance(base, Instance):
-                found += self.lookup(base.cls, node.attr)
+            if isinstance(base, Instance):  # self.x or cls.x
+                found += self._on_instance(base, node.attr, reference.access)
+            elif isinstance(base, ast.ClassDef) and reference.access == "load":  # ClassName.x
+                found += _run_by(self.lookup(base, node.attr), "load")
         return found
 
+    def _on_instance(self, instance: Instance, attr: str, access: Access) -> list[Target]:
+        """What `self.attr` or `cls.attr` may run, for `self` an instance of this
+        class or of a subclass in the module (a subclass may override `attr`)."""
+        classes = self.descendants[instance.cls]
+        found = [t for cls in classes for t in _run_by(self.lookup(cls, attr), access)]
+        if instance.is_class:  # `cls.x = v` and `del cls.x` change the class: no setter runs
+            return found if access == "load" else []
+        found += self._special(classes, _hook(access))
+        if access == "load":  # a name that nothing defines falls through to __getattr__
+            missing = [cls for cls in classes if not self._defines(cls, attr)]
+            found += self._special(missing, "__getattr__")
+        return found
+
+    def _defines(self, cls: ast.ClassDef, attr: str) -> bool:
+        """Whether instances of `cls` may have `attr`: `object` gives it, a class
+        body binds it, a method sets it on `self`, or the class or a base may get
+        attributes this module does not show (from a base or metaclass defined
+        elsewhere, or set by names known only at run time)."""
+        if attr in ALWAYS_THERE or self.lookup(cls, attr):
+            return True
+        names = {attr, ANY_NAME}
+        return any(
+            ancestor in self.extends_outside or not names.isdisjoint(self.assigned[ancestor])
+            for ancestor in self.ancestors[cls]
+        )
+
+    def _special(self, classes: list[ast.ClassDef], *names: str) -> list[FunctionNode]:
+        """The methods Python calls by itself, such as `__init__`, as each class finds them."""
+        found = [t for cls in classes for name in names for t in self.lookup(cls, name)]
+        return [f for f in found if isinstance(f, FunctionNode)]
+
     @staticmethod
-    def _class_of(reference: Reference) -> ast.ClassDef | None:
-        """The class whose method contains this reference (for `super()`)."""
-        chain = reference.chain
-        index = chain.index(reference.owner)
-        parent = chain[index + 1] if index + 1 < len(chain) else None
+    def _class_of(chain: Chain) -> ast.ClassDef | None:
+        """The class whose method contains this point in the code (for `super()`)."""
+        index = next((i for i, scope in enumerate(chain) if isinstance(scope, FunctionNode)), -1)
+        parent = chain[index + 1] if 0 <= index < len(chain) - 1 else None
         return parent if isinstance(parent, ast.ClassDef) else None
 
 

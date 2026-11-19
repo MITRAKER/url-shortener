@@ -1,6 +1,6 @@
 import time
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 import redis
@@ -23,6 +23,12 @@ def create(client: TestClient, **body: Any) -> str:
 
 def make_cache(redis_client: redis.Redis) -> LinkCache:
     return LinkCache(RedisGateway(redis_client), ttl=3600, negative_ttl=60)
+
+
+def refuse_writes(*_args: object, **_kwargs: object) -> NoReturn:
+    """Stands in for `Redis.set` when Redis answers reads but refuses writes,
+    as it does when its memory is full and its policy is noeviction."""
+    raise redis.exceptions.OutOfMemoryError("command not allowed when used memory > 'maxmemory'")
 
 
 def test_new_link_is_cached_on_create(client: TestClient) -> None:
@@ -105,6 +111,21 @@ def test_creating_a_link_replaces_a_not_found_entry(client: TestClient) -> None:
     assert (r.status_code, r.headers["x-cache"]) == (302, "HIT")
 
 
+def test_failed_write_through_leaves_the_not_found_entry(
+    client: TestClient, redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The price of carrying on without Redis: if the write-through fails, the
+    "not found" entry stays, and the new link answers 404 until the entry
+    expires (at most cache_negative_ttl_seconds, 60 s by default)."""
+    assert client.get("/later").status_code == 404  # now cached as "not found"
+    with monkeypatch.context() as patch:
+        patch.setattr(redis_client, "set", refuse_writes)
+        create(client, alias="later")  # 201, but the write-through fails
+    r = client.get("/later")
+    assert (r.status_code, r.headers["x-cache"]) == (404, "HIT")
+    assert 0 < redis_client.ttl(LinkCache.key("later")) <= 60
+
+
 def test_not_found_never_overwrites_a_real_entry(redis_client: redis.Redis) -> None:
     """The race this guards against:
     1. request A misses the cache and finds nothing in the database
@@ -115,6 +136,40 @@ def test_not_found_never_overwrites_a_real_entry(redis_client: redis.Redis) -> N
     cache.set("abc", CachedLink("https://example.com", None))
     cache.set_not_found("abc")
     assert cache.get("abc") == CachedLink("https://example.com", None)
+
+
+def test_writes_report_whether_redis_stored_them(redis_client: redis.Redis) -> None:
+    cache = make_cache(redis_client)
+    assert cache.set_not_found("abc") is True
+    assert cache.set_not_found("abc") is True  # another request cached "not found" already
+    assert cache.set("abc", CachedLink("https://example.com", None)) is True
+    assert cache.set_not_found("abc") is False  # SET NX: the real entry stays
+
+
+def test_writes_report_a_failure(
+    redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = make_cache(redis_client)
+    monkeypatch.setattr(redis_client, "set", refuse_writes)
+    assert cache.set("abc", CachedLink("https://example.com", None)) is False
+    assert cache.set_not_found("abc") is False
+
+
+def test_answer_that_was_not_cached_is_a_bypass(
+    client: TestClient, redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MISS means "now cached". If the write fails, the next request misses
+    again, so the header must not say MISS."""
+    code = create(client)
+    redis_client.delete(LinkCache.key(code))  # as if the entry had expired
+    monkeypatch.setattr(redis_client, "set", refuse_writes)
+
+    found = client.get(f"/{code}")
+    unknown = client.get("/nothere")
+
+    assert (found.status_code, found.headers["x-cache"]) == (302, "BYPASS")
+    assert (unknown.status_code, unknown.headers["x-cache"]) == (404, "BYPASS")
+    assert redis_client.keys(KEY_PREFIX + "*") == []  # really nothing cached
 
 
 def test_expiry_survives_the_round_trip(redis_client: redis.Redis) -> None:

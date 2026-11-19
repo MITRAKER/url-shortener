@@ -7,8 +7,15 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import settings
 
-# Every wait has an upper bound (NASA/JPL rule 2, applied to I/O). Talking to
-# Postgres involves four different waits, and each one needs its own limit:
+# Every wait should have an upper bound (NASA/JPL rule 2, applied to I/O).
+# Talking to Postgres involves four different waits, and each one needs its own
+# limit (listed below). One case still has none. Limits 3 and 3b are enforced by
+# the server, so they need a server that answers. Limits 4 and 4b only notice a
+# dead peer or network: when Postgres is stuck, the kernel of its machine still
+# acknowledges our packets. And libpq has no client-side read timeout. So when
+# the server is alive but stuck (a paused container, a hung pooler or proxy), a
+# query on an open connection waits until the server answers, and so does the
+# request that sent it.
 CONNECT_TIMEOUT_SECONDS = 5  # 1. opening a new connection
 POOL_TIMEOUT_SECONDS = 10  # 2. waiting for a free connection from our pool
 STATEMENT_TIMEOUT_MS = 5_000  # 3. running one SQL statement (Postgres cancels it)

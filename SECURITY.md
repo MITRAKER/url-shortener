@@ -18,9 +18,11 @@ would like it.
 
 - Every pull request is scanned by CodeQL and by Ruff's security rules (Bandit).
 - Every dependency, indirect ones included, is locked to an exact version and
-  installed only if its hash matches (`requirements*.txt`). The Docker base
-  image is pinned by digest. Dependencies are checked daily with `pip-audit`
-  and kept up to date by Dependabot.
+  installed only if its hash matches (`requirements*.txt`). That includes the
+  tools the pre-commit hooks run: every hook is a local one, so pre-commit
+  downloads nothing by itself. The Docker base image is pinned by digest.
+  Dependencies are checked daily with `pip-audit` and kept up to date by
+  Dependabot.
 - GitHub Actions are pinned to exact commit SHAs, and workflows get the least
   permissions they need.
 - The Docker image runs as a non-root user. Each release ships an SBOM and a

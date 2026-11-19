@@ -38,12 +38,9 @@ jobs:
           cache-dependency-path: requirements*.txt
       # A lock file with hashes: pip installs exactly these files or fails.
       - run: pip install --require-hashes -r requirements-dev.txt
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/pre-commit
-          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
       # The same hooks you run locally: Ruff, mypy, the Power of Ten checker,
-      # actionlint, hadolint and file hygiene checks.
+      # actionlint, hadolint and file hygiene checks. They run the tools that
+      # the step above installed, so pre-commit has nothing to download or cache.
       - run: pre-commit run --all-files --show-diff-on-failure
 
   test:
