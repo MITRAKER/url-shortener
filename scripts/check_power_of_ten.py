@@ -28,7 +28,9 @@ as the class or any subclass in the module defines it:
                       `__dict__`, `__module__` or `__weakref__`, or the class
                       or a base binds x in its body or sets it on `self` in a
                       method: `self.x = v`, `setattr(self, "x", v)`,
-                      `object.__setattr__(self, "x", v)`, `self.__dict__["x"] = v`
+                      `object.__setattr__(self, "x", v)`, or through
+                      `self.__dict__` or `vars(self)`: `["x"] = v`,
+                      `.setdefault("x", v)`, `.update(x=v)`
     self.x = v        a property setter and `__setattr__` (`+=` reads first)
     del self.x        a property deleter and `__delattr__`
     self(...)         `__call__`
@@ -50,10 +52,12 @@ special methods that operators, statements and built-in functions call:
 `bool(self)` and `if self:` (`__bool__`), `with self:` (`__enter__`). It
 resolves `super().m` to the bases of the class that calls it, not to the next
 class in the instance's MRO. And it assumes that an instance may have any
-attribute when its class or a base has a base other than `object` from
-outside the module, or a metaclass, or sets attributes by names known only at
-run time (`setattr(self, key, v)`, `self.__dict__.update(d)`): a `__getattr__`
-there that reads a missing attribute is not reported.
+attribute when its class or a base has a metaclass, or a base other than
+`object` that is not written as the name of a class in the module or as
+`Outer.Inner` (an import, `module.Base`, an alias such as `Shape = Base`, or
+`Generic[T]`), or sets attributes by names known only at run time
+(`setattr(self, key, v)`, `self.__dict__.update(d)`, a new `self.__dict__`):
+a `__getattr__` there that reads a missing attribute is not reported.
 """
 
 import ast
@@ -262,45 +266,70 @@ def _bound_names(node: ast.AST) -> list[str]:
     return []
 
 
-def _attribute_write(node: ast.AST) -> tuple[ast.expr, str] | None:
-    """The object and the name of an attribute set without `obj.name = v`:
+def _name_of(key: ast.expr | None) -> str:
+    """The attribute name that `key` gives, or ANY_NAME if it is known only at run time."""
+    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+        return key.value
+    return ANY_NAME
+
+
+def _update_names(args: list[ast.expr], keywords: list[ast.keyword]) -> list[str]:
+    """The keys that `d.update(*args, **keywords)` may set: the names of its
+    keyword arguments and the constant keys of a dict display. Anything else
+    (`**values`, or a mapping built at run time) may set any key: ANY_NAME."""
+    names = [ANY_NAME if keyword.arg is None else keyword.arg for keyword in keywords]
+    for arg in args:
+        keys = arg.keys if isinstance(arg, ast.Dict) else [None]
+        names += [_name_of(key) for key in keys]
+    return names
+
+
+def _attribute_writes(node: ast.AST) -> list[tuple[ast.expr, str]]:
+    """The object and the name of each attribute set without `obj.name = v`:
     `setattr(obj, name, v)`, `object.__setattr__(obj, name, v)`,
-    `obj.__setattr__(name, v)` (`obj` may be `super()`), `obj.__dict__[name] = v`
-    and `obj.__dict__.update(...)`, with `vars(obj)` for `obj.__dict__`. The
-    name is ANY_NAME when it is known only at run time."""
-    found: tuple[ast.expr, ast.expr | None] | None = None
+    `obj.__setattr__(name, v)` (`obj` may be `super()`), and through
+    `obj.__dict__` or `vars(obj)`: `[name] = v`, `.setdefault(name, v)` and
+    `.update(...)`. A name known only at run time is ANY_NAME."""
     match node:
-        case ast.Call(func=ast.Name(id="setattr"), args=[obj, name, _]):
-            found = obj, name
-        case ast.Call(func=ast.Attribute(attr="__setattr__"), args=[obj, name, _]):
-            found = obj, name
-        case ast.Call(func=ast.Attribute(value=obj, attr="__setattr__"), args=[name, _]):
-            found = obj, name
-        case ast.Subscript(
-            value=(
-                ast.Attribute(value=obj, attr="__dict__")
-                | ast.Call(func=ast.Name(id="vars"), args=[obj])
-            ),
-            slice=name,
-            ctx=ast.Store(),
+        case (
+            ast.Call(func=ast.Name(id="setattr"), args=[obj, key, _], keywords=[])
+            | ast.Call(func=ast.Attribute(attr="__setattr__"), args=[obj, key, _], keywords=[])
+            | ast.Call(
+                func=ast.Attribute(value=obj, attr="__setattr__"), args=[key, _], keywords=[]
+            )
+            | ast.Subscript(
+                value=(
+                    ast.Attribute(value=obj, attr="__dict__")
+                    | ast.Call(func=ast.Name(id="vars"), args=[obj])
+                ),
+                slice=key,
+                ctx=ast.Store(),
+            )
+            | ast.Call(
+                func=ast.Attribute(
+                    value=(
+                        ast.Attribute(value=obj, attr="__dict__")
+                        | ast.Call(func=ast.Name(id="vars"), args=[obj])
+                    ),
+                    attr="setdefault",
+                ),
+                args=[key, *_],
+            )
         ):
-            found = obj, name
+            return [(obj, _name_of(key))]
         case ast.Call(
             func=ast.Attribute(
                 value=(
                     ast.Attribute(value=obj, attr="__dict__")
                     | ast.Call(func=ast.Name(id="vars"), args=[obj])
                 ),
-                attr="update" | "setdefault",
-            )
+                attr="update",
+            ),
+            args=args,
+            keywords=keywords,
         ):
-            found = obj, None
-    if found is None:
-        return None
-    target, key = found
-    if isinstance(key, ast.Constant) and isinstance(key.value, str):
-        return target, key.value
-    return target, ANY_NAME
+            return [(obj, name) for name in _update_names(args, keywords)]
+    return []
 
 
 class _Scopes:
@@ -405,8 +434,8 @@ class _Scopes:
             owner = next((s for s in chain if isinstance(s, FunctionNode)), None)
             if owner is not None:
                 self.references += [Reference(owner, chain, node, a) for a in self._accesses(node)]
-        elif (write := _attribute_write(node)) is not None:
-            self.writes.append((*write, chain))
+        elif node not in self.annotated:  # `self.__dict__["x"]: int` sets nothing
+            self.writes += [(obj, name, chain) for obj, name in _attribute_writes(node)]
         for name in _bound_names(node):
             self._bind(chain[0], name, None)
 
@@ -427,7 +456,9 @@ class _Scopes:
         stores = [
             (reference.node.value, reference.node.attr, reference.chain)
             for reference in self.references
-            if reference.access == "store" and isinstance(reference.node, ast.Attribute)
+            if reference.access == "store"
+            and isinstance(reference.node, ast.Attribute)
+            and isinstance(reference.node.value, ast.Name)  # not `super().x = v`, which fails
         ]
         for obj, name, chain in [*stores, *self.writes]:
             for cls in self._instance_of(obj, chain):
@@ -436,21 +467,26 @@ class _Scopes:
         return assigned
 
     def _instance_of(self, obj: ast.expr, chain: Chain) -> list[ast.ClassDef]:
-        """The class whose method `obj` is the `self` of, if it is: `self`, or `super()`."""
+        """The class whose method `obj` is the `self` of, if it is: `self`,
+        `super()` (the method's own class), or `super(C, self)`."""
+        target = obj
         if isinstance(obj, ast.Call) and isinstance(obj.func, ast.Name) and obj.func.id == "super":
-            owner_class = self._class_of(chain)
-            return [] if owner_class is None else [owner_class]
-        targets = self.resolve(obj.id, chain) if isinstance(obj, ast.Name) else []
+            if not obj.args:
+                owner_class = self._class_of(chain)
+                return [] if owner_class is None else [owner_class]
+            target = obj.args[-1]  # super(C, x) sets the attribute on x
+        targets = self.resolve(target.id, chain) if isinstance(target, ast.Name) else []
         return [t.cls for t in targets if isinstance(t, Instance) and not t.is_class]
 
     def _has_outside_base(self, cls: ast.ClassDef) -> bool:
         """Whether `cls` has a metaclass, or a base other than `object` that is not
-        a class of this module: what its instances have is unknown here."""
+        written as a class of this module (`Base` or `Outer.Inner`): what its
+        instances have is unknown here."""
         if any(keyword.arg == "metaclass" for keyword in cls.keywords):
             return True
         chain = self.class_chains[cls]
         for base in cls.bases:
-            targets = self.resolve(base.id, chain) if isinstance(base, ast.Name) else [None]
+            targets = self._base_targets(base, chain)
             if not targets and isinstance(base, ast.Name) and base.id == "object":
                 continue  # the builtin `object`
             if not targets or not all(isinstance(t, ast.ClassDef) for t in targets):
@@ -478,9 +514,32 @@ class _Scopes:
 
     def _bases(self, cls: ast.ClassDef) -> list[ast.ClassDef]:
         chain = self.class_chains[cls]
-        names = [base.id for base in cls.bases if isinstance(base, ast.Name)]
-        targets = [t for name in names for t in self.resolve(name, chain)]
+        targets = [t for base in cls.bases for t in self._base_targets(base, chain)]
         return [t for t in targets if isinstance(t, ast.ClassDef)]
+
+    def _base_targets(self, base: ast.expr, chain: Chain) -> list[Target]:
+        """What a base class names: `Base`, or `Outer.Inner` through class
+        bodies. [None] for what can't be followed, such as `module.Base`."""
+        attributes: list[str] = []
+        node = base
+        for _ in range(sum(1 for _ in ast.walk(base))):  # one step per `.attribute`
+            if not isinstance(node, ast.Attribute):
+                break
+            attributes.append(node.attr)
+            node = node.value
+        unknown: list[Target] = [None]
+        targets = self.resolve(node.id, chain) if isinstance(node, ast.Name) else unknown
+        for attribute in reversed(attributes):
+            classes = [t for t in targets if isinstance(t, ast.ClassDef)]
+            if not classes or len(classes) < len(targets):
+                return unknown
+            targets = [t for c in classes for t in self._in_body(c, attribute) or unknown]
+        return targets
+
+    def _in_body(self, cls: ast.ClassDef, attr: str) -> list[Target]:
+        """What `cls`'s own body binds `attr` to, without its bases."""
+        found = self.bindings[cls].get(attr) if cls in self.bindings else None
+        return found or []
 
     def callees(self, reference: Reference) -> list[FunctionNode]:
         """The functions that this name or attribute may run."""
