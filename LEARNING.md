@@ -721,7 +721,7 @@ GET /abc1234
 | `app/main.py` | Rate limits on the routes, the `X-Cache` header, the code-shape check |
 | `app/config.py` | `REDIS_URL`, checked when the app starts |
 | `docker-compose.yml` | A `redis` container with a 64 MB memory budget |
-| `tests/test_cache.py`, `test_ratelimit.py`, `test_redis_client.py`, `test_breaker.py`, `test_config.py` | 92 new tests |
+| `tests/test_cache.py`, `test_ratelimit.py`, `test_redis_client.py`, `test_breaker.py`, `test_config.py` | 116 new tests |
 | `tests/fakes.py` | `SilentServer`: a fake Redis that accepts connections and never answers |
 
 ### Part 1: Caching
@@ -954,6 +954,19 @@ report itself healthy, then answer every request that touched Redis with a
 500, because the URL was first parsed on the first request. Now `Settings`
 checks it at startup (`app/config.py`): building a connection pool parses the
 URL without connecting, and a malformed URL stops the app with a clear error.
+A review found a gap: the pool keeps the query arguments for the connections
+it makes later, without checking that a connection takes them. So a typo like
+`?dbb=1`, or a TLS option such as `ssl_cert_reqs` on `redis://` instead of
+`rediss://`, still passed, and then every request that touched Redis failed
+with a `TypeError`. The gateway does not catch it, because it is not a Redis
+error. Now the check also makes one connection object, which opens no socket,
+and refuses the URL if that fails. It also found that the URL can undo this
+lesson: redis-py lets the query arguments of a URL win over the arguments
+that `make_redis` passes, so `?socket_timeout=30` would let a hung Redis hold
+each request for 30 seconds, and `?retry_on_timeout=true` would retry the
+rate limiter's script after a timeout. The check refuses the arguments that
+the app sets itself (`APP_REDIS_OPTIONS`), and a test makes sure that the list
+keeps up with `make_redis`.
 The rule: check configuration when the process starts (**fail fast**), so a
 bad deploy never looks healthy.
 
@@ -965,14 +978,19 @@ of the URL. In `redis://:S3cret#Pass@redis:6379/0`, the `#` in the password is
 not percent-encoded, so the parser stops there and takes `S3cret` for the
 port. The error read "Port could not be cast to integer value as 'S3cret'".
 A `/` or a `?` does the same, and generated passwords often contain a `/`.
-If the text before the `#` is a number, the URL even parses, as that port and
-without the password, and the app would start without Redis. So the check
-also refuses a URL whose `@` is not in the host part.
-Now `_check_redis_url` catches redis-py's `ValueError` and raises its own,
-with a fixed message, `from None`: unlike lesson 2's `from exc`, this
-deliberately keeps the original error, which quotes the URL, out of the
-traceback. The message names the setting and the problem, never the value or
-any part of it.
+If the text before the `#` is a number, or holds an `@` (`P@ss#word`), the URL
+even parses, wrongly: redis-py uses the start of the password, or none of it,
+and may take the rest for the host (here `ss`). The app would start without
+Redis, and its log would show that host, a piece of the password. In such a
+URL, the `@` that ends the password lands after the host part. So the check
+also refuses any `#` (redis-py ignores what follows it, even in the query),
+an `@` in the path (only a socket path may hold one, and only without user
+info before it), and a query argument without `=`. An `@` in a query value is
+fine: `?password=p@ss` is a valid way to give the password.
+Now `_check_redis_url` catches redis-py's errors and raises its own, with a
+fixed message, `from None`: unlike lesson 2's `from exc`, this deliberately
+keeps the original error, which quotes the URL, out of the traceback. The
+message names the setting and the problem, never the value or any part of it.
 
 #### Making the cache visible
 

@@ -5,7 +5,7 @@ Example: DATABASE_URL=postgresql+psycopg://user:pass@db:5432/shortener
 
 import ipaddress
 from typing import Final
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import redis
 from pydantic import Field, SecretStr, field_validator
@@ -15,6 +15,27 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # could work out the codes we hand out: fine on your laptop, never in
 # production. The app logs a warning while it is in use.
 DEFAULT_CODE_SECRET: Final = "public-default-change-me"  # noqa: S105 - public on purpose
+
+# The query arguments of a Redis URL win over the arguments that make_redis
+# passes (redis-py's from_url), so a URL could quietly undo what keeps a slow
+# or broken Redis from slowing down or breaking the app: how long a call may
+# wait, the fixed pool, that a timeout is never retried, and how replies are
+# read and decoded (app/redis_client.py). These are the app's to set.
+APP_REDIS_OPTIONS: Final = frozenset(
+    {
+        "socket_timeout",
+        "socket_connect_timeout",
+        "max_connections",
+        "retry",
+        "retry_on_timeout",
+        "retry_on_error",
+        "protocol",
+        "legacy_responses",
+        "decode_responses",
+        "encoding",
+        "encoding_errors",
+    }
+)
 
 
 class Settings(BaseSettings):
@@ -54,27 +75,34 @@ class Settings(BaseSettings):
     @classmethod
     def _check_redis_url(cls, url: str) -> str:
         # Parse it now, so a typo stops the app at startup instead of breaking
-        # every request later. Building a pool parses the URL but opens no
-        # connection; it raises ValueError, e.g. for a missing redis:// scheme.
+        # every request later. Nothing here opens a connection.
         if not url:
             return url
         problem = ValueError(
-            "not a valid redis://, rediss:// or unix:// URL"
-            " (percent-encode special characters in the password)"
+            "not a valid redis://, rediss:// or unix:// URL (percent-encode special"
+            " characters in the password, and check the query arguments)"
         )
         try:
-            redis.ConnectionPool.from_url(url)
-        except ValueError:
+            # Parses the URL; raises ValueError, e.g. for a missing redis://.
+            pool = redis.ConnectionPool.from_url(url)
+            # The pool keeps the query arguments for the connections it makes
+            # later. Make one now, which opens no socket: it raises TypeError
+            # for an argument it does not take, such as a typo (?dbb=1) or a
+            # TLS option on redis:// instead of rediss://, and RedisError for
+            # some values it refuses (?protocol=4).
+            pool.connection_class(**pool.connection_kwargs)
+        except (ValueError, TypeError, redis.RedisError):
             # redis-py's message can quote part of the URL, and so part of
             # the password: in redis://:abc#def@host, the parser stops at
             # the '#' and reports "abc" as a bad port. So we never pass its
             # message on.
             raise problem from None
-        # If the text before that '#' (or '/' or '?') is a number, the URL
-        # still parses, as that port and without the password. The '@' that
-        # ends the password then sits outside the host part.
-        if "@" in url and "@" not in urlsplit(url).netloc:
+        if _misread(url):
             raise problem
+        overridden = sorted(APP_REDIS_OPTIONS.intersection(parse_qs(urlsplit(url).query)))
+        if overridden:
+            # Only names from our own list: the message shows nothing of the URL.
+            raise ValueError(f"the URL may not set what the app sets: {', '.join(overridden)}")
         return url
 
     @field_validator("trusted_proxies")
@@ -92,6 +120,24 @@ class Settings(BaseSettings):
     @property
     def trusted_proxy_list(self) -> list[str]:
         return _split(self.trusted_proxies)
+
+
+def _misread(url: str) -> bool:
+    """Whether redis-py would parse the URL, but wrongly. That happens when an
+    unencoded '#', '/' or '?' in the password follows a port number, or an '@':
+    redis-py then reads only the start of the password, or none of it, and may
+    take the rest for the host. The '@' that ends the password lands after the
+    host part. So we refuse any '#' (redis-py ignores what follows it, even in
+    the query), an '@' in the path, which holds only a db number or a socket
+    path, and a query argument without '=', which redis-py drops."""
+    parts = urlsplit(url)
+    # A socket path may hold an '@', unless user info comes before it.
+    socket_path = parts.scheme == "unix" and not parts.netloc
+    return (
+        "#" in url
+        or ("@" in parts.path and not socket_path)
+        or any("=" not in field for field in parts.query.split("&") if field)
+    )
 
 
 def _split(value: str) -> list[str]:

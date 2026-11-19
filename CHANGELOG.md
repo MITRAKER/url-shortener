@@ -7,6 +7,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- The check of `REDIS_URL` at startup refused some valid URLs and passed some
+  broken ones. It now refuses a URL that redis-py would read wrongly: an
+  unencoded `#`, `/` or `?` in the password can make it use the wrong
+  password, host or port, so the check refuses any `#`, an `@` in the path
+  (except in a unix socket path without user info), and a query argument
+  without `=`. It accepts an `@` in a query value (`?password=p@ss`) and in a
+  socket path. It also refuses a query argument that a connection does not
+  take or whose value it refuses (`?dbb=1`, a TLS option on `redis://`),
+  which used to fail every request that touched Redis, and one that would
+  override what the app sets itself, such as `?socket_timeout=30` or
+  `?retry_on_timeout=true`: redis-py lets the URL win, which would undo the
+  limits that keep a slow Redis from slowing down the app.
+
 ## [0.5.0] - 2026-11-19
 
 ### Added
