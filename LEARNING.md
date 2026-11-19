@@ -2148,10 +2148,10 @@ So every label value comes from a short, fixed list:
   matched in the request's `scope` (the dictionary handed down through every
   middleware), and the middleware reads `scope["route"].path` once the app
   has answered. It does that for our routes only: FastAPI's own pages
-  (`/docs`, `/redoc`, `/openapi.json`) are labelled with their paths, a
-  fixed list the middleware is given at startup. A request that matched no
-  route is `unmatched`: a 404 for `/no/such/page`, or the router's redirect
-  from `/health/` to `/health`.
+  (`/docs`, `/docs/oauth2-redirect`, `/redoc`, `/openapi.json`) are labelled
+  with their paths, a fixed list the middleware is given at startup. A
+  request that matched no route is `unmatched`: a 404 for `/no/such/page`,
+  or the router's redirect from `/health/` to `/health`.
 - **method**: one of the seven known methods, or `other`. Anyone can send a
   method called `FOOBAR`.
 - **status**: in practice, a dozen codes.

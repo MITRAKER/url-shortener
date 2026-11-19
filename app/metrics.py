@@ -172,9 +172,10 @@ class PrometheusMiddleware:
 
     The route label is the route's template ("/{code}"), which FastAPI's
     router leaves in the request's scope once it has picked one of our
-    routes. It doesn't for FastAPI's own pages (/docs, /redoc,
-    /openapi.json), which are routes of another kind: those are labelled
-    with their paths, given as `docs_paths`.
+    routes. It doesn't for FastAPI's own pages (/docs,
+    /docs/oauth2-redirect, /redoc, /openapi.json), which are routes of
+    another kind: those are labelled with their paths, given as
+    `docs_paths`.
     """
 
     def __init__(self, app: ASGIApp, docs_paths: Iterable[str | None] = ()) -> None:
