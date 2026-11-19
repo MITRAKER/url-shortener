@@ -19,9 +19,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - The worker counts each click in the stream exactly once. It stores how
   far it got (a checkpoint, in the new `click_checkpoints` table, migration
   `0003`) in the same transaction as the counts, and moves it with a
-  compare-and-set, so a crash at any moment, or a second worker, can't
-  count a click twice or lose one. Counted clicks are then removed from the
-  stream. Around the stream, a click can still be counted twice: when Nginx
+  compare-and-set, so a crash of the worker at any moment, or a second
+  worker, can't count a click twice or lose one. Counted clicks are then
+  removed from the stream. Around the stream, a click can still be counted twice: when Nginx
   retries a redirect, or when the click reached Redis but the reply didn't
   (a timeout, or a broken connection, which the client retries once). A
   crash of the whole machine can lose up to about a second of clicks.
@@ -52,8 +52,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - The app asks redis-py for the RESP2 protocol by name, so a new default in
   a later redis-py can't change the shape of the replies it reads.
 - The app's Redis clients decode bytes that aren't UTF-8 as U+FFFD instead
-  of raising an error, so a stream entry holding such bytes is skipped as
-  junk instead of stopping the worker.
+  of raising an error, so the worker skips a stream entry holding such
+  bytes as junk, like any other entry that isn't a click.
 
 ## [0.3.0] - 2026-11-18
 

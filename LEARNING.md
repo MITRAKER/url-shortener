@@ -2102,8 +2102,12 @@ worker must ask "is it going round its loop?", not "is it making progress?".
 The worker touches a **heartbeat** file on every round, failed or not;
 `python -m app.heartbeat` checks that the last touch is less than 30 seconds
 old. Every wait inside a round has a limit (2 seconds for Redis; for
-PostgreSQL, 10 to get a connection and 5 per statement), so in practice only
-a stuck loop misses it.
+PostgreSQL, 10 to get a connection and 5 per statement), with the one gap
+that lesson 2 names: a PostgreSQL that is alive but stuck holds a query on an
+open connection until it answers. So the heartbeat goes stale only when the
+loop is stuck, in our code or in that one wait. (After a restart, a new
+connection to a stuck PostgreSQL gives up after 5 seconds, so the worker's
+rounds fail, and go on, until the database answers again.)
 
 That check is the container's health check, but a failing health check
 restarts nothing. Docker and Docker Compose only mark the container
