@@ -182,7 +182,12 @@ from the code.
 3. **Race condition lab.** Temporarily rewrite `record_click` the naive way
    (`link.clicks += 1`), then fire 200 concurrent requests
    (`seq 200 | xargs -P 50 -I{} curl -s -o /dev/null localhost:8000/<code>`).
-   Compare the final count with the atomic version.
+   Compare the final count with the atomic version. Since step 4, a redirect
+   appends its click to a Redis stream instead, and calls `record_click` only
+   when Redis can't take the click: so stop Redis first
+   (`docker compose stop redis`), or run the app without `REDIS_URL`. And use
+   PostgreSQL, as Docker Compose does: on SQLite the race hardly ever shows
+   (in our runs, SQLite lost none of 1,000 clicks; PostgreSQL lost most).
 4. **Math check.** How many characters would you need to store 1 trillion
    links with less than a 1% chance that any single new code collides?
 
