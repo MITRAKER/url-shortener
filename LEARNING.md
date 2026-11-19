@@ -1518,6 +1518,16 @@ what is missing: `alembic upgrade head` (`make migrate`).
   run side by side, so every migration must work with both: add a column,
   deploy code that uses it, and remove the old one a release later.
 
+Migration `0002` breaks that rule: it removes the sequence in the same
+release that stops using it, instead of a release later. A v0.2.0 instance
+that is still running afterwards can't create links: it leaves out the ID,
+the database refuses the row, and the instance answers 503 (or 409, "Alias
+is already taken", for an alias that is free). We accept that for this one
+upgrade because it can't be rolling anyway: Nginx takes over port 8000 from
+the single v0.2.0 instance, so that instance has to stop. Stop it before the
+migrations run: `docker compose down` (which keeps the database's volume),
+then `docker compose up --build`.
+
 `tests/test_migrations.py` checks that the migrations build exactly what the
 models describe (Alembic's autogenerate finds no difference), that each can be
 undone, that a v0.2.0 database is adopted with its links, that the SQL can be

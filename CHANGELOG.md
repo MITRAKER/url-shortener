@@ -48,7 +48,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - Generated codes are 8 characters instead of 7.
 - The app no longer creates its tables at startup: run the migrations first.
-- Link IDs come from the app, not from a database sequence.
+- Link IDs come from the app, not from a database sequence. The migration
+  that drops the sequence (0002) stops v0.2.0 instances from creating
+  links, so stop every v0.2.0 instance before the migrations run
+  (`docker compose down`, which keeps the database's volume).
 - In Docker Compose, the app instances can only be reached through Nginx, and
   start again whenever they stop by themselves (`restart: unless-stopped`).
 - The app, not uvicorn, decides whom to trust with proxy headers
