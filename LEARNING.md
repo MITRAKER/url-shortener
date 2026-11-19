@@ -496,7 +496,9 @@ doesn't exist yet.
 danger is the same: two parts of the program changing one object through
 different references. Hence no mutable default arguments (`def f(x=[])` is a
 classic Python bug), immutable data where possible, and no function pointers
-except framework hooks like FastAPI's `Depends`.
+except framework hooks like FastAPI's `Depends` and injected dependencies that
+keep side effects testable: a clock that a test can move by hand, or the
+operation given to `RedisGateway.call` (both in lesson 3).
 
 **Rule 10: all warnings on from day one, zero warnings, daily analysis.** This
 is the whole lesson in one rule: Ruff with a broad rule set, `mypy --strict`,
