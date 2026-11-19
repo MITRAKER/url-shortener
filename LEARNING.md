@@ -311,16 +311,17 @@ the Dockerfile, `detect-private-key` stops you committing a secret key.
 Most code we run, we didn't write: it comes from dependencies. A **supply-chain
 attack** hides malicious code in one of them.
 
-- **Lock files with hashes.** `requirements.in` lists the 7 packages the app
-  imports. Those need about 18 more (Starlette, anyio, h11, ...). Pinning only
-  the direct ones, as this repo first did, still lets pip pick the newest version of the
-  other 18 at install time, so CI, the Docker build and your laptop could each
-  get different code. `pip-compile` (from pip-tools) resolves the whole tree
-  once and writes `requirements.txt`: every package at an exact version, plus
-  the SHA-256 hash of every file pip may download for it. `pip install
-  --require-hashes` refuses any file whose hash differs, so a package that was
-  tampered with, or quietly re-uploaded, cannot get in. You edit the `.in`
-  files and run `make lock`; Dependabot does the same for updates.
+- **Lock files with hashes.** `requirements.in` lists the handful of packages
+  the app imports. Those need about twenty more (Starlette, anyio, h11, ...).
+  Pinning only the direct ones, as this repo first did, still lets pip pick the
+  newest version of all the others at install time, so CI, the Docker build
+  and your laptop could each get different code. `pip-compile` (from
+  pip-tools) resolves the whole tree once and writes `requirements.txt`: every
+  package at an exact version, plus the SHA-256 hash of every file pip may
+  download for it. `pip install --require-hashes` refuses any file whose hash
+  differs, so a package that was tampered with, or quietly re-uploaded, cannot
+  get in. You edit the `.in` files and run `make lock`; Dependabot does the
+  same for updates.
 - **The base image pinned by digest:** `FROM python:3.13-slim@sha256:e48f…`.
   `3.13-slim` is a moving name: Docker rebuilds it for every Python patch and
   every Debian security fix. The digest is the hash of one exact image, so the
