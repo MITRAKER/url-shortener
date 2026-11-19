@@ -59,8 +59,8 @@ Interactive API docs: http://localhost:8000/docs
 
 ```bash
 curl -X POST localhost:8000/api/links -H 'content-type: application/json' \
-     -d '{"url": "https://github.com", "alias": "gh"}'
-curl -i localhost:8000/gh
+     -d '{"url": "https://github.com", "alias": "github"}'
+curl -i localhost:8000/github
 ```
 
 Limits: URLs up to 2048 characters; aliases 3 to 32 characters of `A-Z a-z 0-9 _ -`;
