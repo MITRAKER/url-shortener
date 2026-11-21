@@ -33,17 +33,33 @@ BREAKER_FAILURE_THRESHOLD = 3
 BREAKER_RESET_SECONDS = 5.0
 
 
-def make_redis(url: str) -> redis.Redis:
+def make_redis(url: str, socket_timeout: float = SOCKET_TIMEOUT_SECONDS) -> redis.Redis:
+    """A client with a pool of connections. `socket_timeout` bounds every wait
+    for an answer: short for requests, longer for the click worker, which
+    asks Redis to wait for new clicks (app/worker.py)."""
     return redis.Redis.from_url(
         url,
         decode_responses=True,  # give us str instead of bytes
+        # Redis stores bytes, and anyone who can write to it can store bytes
+        # that aren't UTF-8. Decoding them strictly raises UnicodeDecodeError,
+        # which is not a RedisError: one such entry in the click stream
+        # crashed the worker at every start. Replaced by U+FFFD instead, they
+        # fail validation like any other junk (app/worker.py).
+        encoding_errors="replace",
+        # RESP2, the protocol whose reply shapes our code reads (app/worker.py
+        # parses XREAD replies). Named here, so that a newer redis-py with
+        # another default can't change them under us.
+        protocol=2,
         socket_connect_timeout=SOCKET_TIMEOUT_SECONDS,
-        socket_timeout=SOCKET_TIMEOUT_SECONDS,
+        socket_timeout=socket_timeout,
         max_connections=MAX_CONNECTIONS,
         # Retry once, at once, but only if the connection itself broke, e.g. a
         # pooled connection that Redis closed while it sat idle. Never retry a
         # timeout: the command may already have run, and running the rate
-        # limiter's script twice would charge the client twice.
+        # limiter's script twice would charge the client twice. A connection
+        # can break after the command ran, too: that window is tiny, and we
+        # accept its cost, a token charged twice or a click added twice
+        # (LEARNING.md, lessons 3 and 5).
         retry=Retry(NoBackoff(), retries=1, supported_errors=(redis.ConnectionError,)),
     )
 

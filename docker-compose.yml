@@ -1,10 +1,13 @@
 # The whole system, as in production but on one machine:
 #
 #   client ──▶ nginx (port 8000) ──▶ app × 3 ──▶ redis, db
+#                                                  │
+#                         clicks, as a Redis stream ▼
+#                                   worker ──▶ db (counts them in batches)
 #
 # `migrate` applies the database migrations once, before any app instance
-# starts. Every image is pinned by digest, like the base image in the
-# Dockerfile; Dependabot keeps the digests current.
+# or the worker starts. Every image is pinned by digest, like the base image
+# in the Dockerfile; Dependabot keeps the digests current.
 
 services:
   db:
@@ -26,18 +29,32 @@ services:
 
   redis:
     image: redis:7-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
-    # A pure cache: a fixed memory budget (NASA/JPL rule 3), evict the least
-    # frequently used keys when it is full, and no saving to disk.
+    # The cache, the rate limits, and the clicks waiting to be counted. A fixed
+    # memory budget (NASA/JPL rule 3). When it is full, Redis evicts the least
+    # frequently used keys that expire anyway (cache entries, rate limits),
+    # never the click stream, which doesn't expire: evicting it would lose
+    # clicks without a word. So that waiting clicks can't fill it, the app
+    # stops adding to the stream at a million (about 21 MB, app/clicks.py)
+    # and counts further clicks in PostgreSQL. Should Redis fill up anyway,
+    # with nothing left to evict, it refuses every write: new clicks, but also
+    # the rate limiter's (the limits fail open) and the cache's (the cache
+    # stops working).
+    # The append-only file keeps the stream across restarts; it goes to disk
+    # every second, so a crash of the whole machine loses one second at most.
     command:
       - redis-server
       - --maxmemory
       - 64mb
       - --maxmemory-policy
-      - allkeys-lfu
+      - volatile-lfu
       - --save
       - ""
       - --appendonly
-      - "no"
+      - "yes"
+      - --appendfsync
+      - everysec
+    volumes:
+      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -77,6 +94,34 @@ services:
     restart: unless-stopped
     # The image's HEALTHCHECK tells Compose (and Nginx's depends_on) when it's ready.
 
+  worker:
+    build: .
+    image: url-shortener-app
+    # Counts the clicks waiting in the Redis stream (app/worker.py). One is
+    # enough; a second one would be safe, but would only waste work.
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://app:app@db:5432/shortener
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      # Healthy while it goes round its loop (a heartbeat file, see
+      # app/heartbeat.py). The image's own check asks for /health over HTTP,
+      # which the worker doesn't serve. A failing check restarts nothing:
+      # Docker only marks the container unhealthy, and `restart` acts only
+      # when the process exits. So when the loop is stuck, the worker's own
+      # watchdog ends the process (app/worker.py), and Docker starts it again.
+      test: ["CMD", "python", "-m", "app.heartbeat"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
   nginx:
     image: nginxinc/nginx-unprivileged:1.30-alpine@sha256:f5116ed4606f3eb015dd4a8e28cb9b351476dc0ad4bc6e9f93b19cec130cdf03
     volumes:
@@ -107,3 +152,4 @@ networks:
 
 volumes:
   pgdata:
+  redisdata:

@@ -22,9 +22,10 @@ os.environ["CODE_SECRET"] = TEST_CODE_SECRET
 
 # The app reads its settings when it is imported, so these imports must come
 # after the environment variables above are set (hence noqa: E402).
-from app.db import Base, engine  # noqa: E402
+from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.main import app, get_ids  # noqa: E402
 from app.redis_client import RedisGateway, get_redis, make_redis  # noqa: E402
+from app.worker import ClickWorker  # noqa: E402
 
 
 def make_ids(instance_id: int = 0) -> LinkIds:
@@ -39,11 +40,17 @@ def make_ids(instance_id: int = 0) -> LinkIds:
 
 @pytest.fixture
 def redis_client() -> Iterator[redis.Redis]:
-    """A clean Redis for every test."""
+    """A clean Redis for every test, read the way the app reads it."""
     if TEST_REDIS_URL:
         client = make_redis(TEST_REDIS_URL)
     else:
-        client = fakeredis.FakeRedis(server=fakeredis.FakeServer(), decode_responses=True)
+        # In memory, but decoding replies as the app's own clients do (make_redis).
+        decoding = make_redis("redis://unused/0").get_encoder()
+        client = fakeredis.FakeRedis(
+            server=fakeredis.FakeServer(),
+            decode_responses=decoding.decode_responses,
+            encoding_errors=decoding.encoding_errors,
+        )
     client.flushdb()
     yield client
     client.flushdb()
@@ -63,6 +70,13 @@ def _client_with(redis_client: redis.Redis | None) -> Iterator[TestClient]:
             yield c
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def click_worker(redis_client: redis.Redis) -> ClickWorker:
+    """The click worker (app/worker.py), on the test Redis and database. It
+    doesn't wait for clicks: process_batch() counts what is there already."""
+    return ClickWorker(redis_client, SessionLocal, wait_ms=None)
 
 
 @pytest.fixture
