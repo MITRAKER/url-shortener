@@ -1,10 +1,9 @@
 """Base62 encoding: turn numbers into short, URL-safe strings.
 
 Alphabet = 0-9, a-z, A-Z (62 characters). Each character carries
-log2(62) ~= 5.95 bits, so 7 characters can represent 62**7 ~= 3.5e12 values.
+log2(62) ~= 5.95 bits, so the 8 characters of a code can represent
+62**8 ~= 2.2e14 values (see app/ids.py).
 """
-
-import secrets
 
 ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 BASE = len(ALPHABET)
@@ -42,11 +41,3 @@ def decode(text: str) -> int:
             raise ValueError(f"{char!r} is not a base62 character")
         num = num * BASE + position
     return num
-
-
-def random_code(length: int) -> str:
-    """A random code of exactly `length` characters. Cryptographically random
-    (the `secrets` module), so codes cannot be guessed by counting."""
-    if length < 1:
-        raise ValueError(f"length must be at least 1, got {length}")
-    return "".join(secrets.choice(ALPHABET) for _ in range(length))

@@ -1,0 +1,10 @@
+# For load tests only: the rate limits raised far out of the way. k6 is a
+# single client, but it stands for a crowd, and the per-client limits would
+# refuse most of its requests. The limiter still runs, so its cost is part of
+# what we measure. `make loadtest` uses this file; `make up` restores the
+# normal limits.
+services:
+  app:
+    environment:
+      RATE_LIMIT_READ: 999999/minute
+      RATE_LIMIT_CREATE: 999999/minute

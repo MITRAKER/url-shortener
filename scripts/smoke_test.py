@@ -8,6 +8,7 @@ Usage:
 import http.client
 import json
 import sys
+import time
 from collections.abc import Sequence
 from http import HTTPStatus
 from typing import Any
@@ -15,6 +16,12 @@ from urllib.parse import urlsplit
 
 TIMEOUT_SECONDS = 5  # every network call has an upper bound (NASA/JPL rule 2)
 TARGET = "https://example.com/smoke-test"
+# Default create limit is 10/minute, so 20 attempts must hit it (bounded loop).
+MAX_CREATE_ATTEMPTS = 20
+# The click worker counts a click a moment after the redirect (app/worker.py),
+# so the stats are asked again until it shows up: every 0.5 s, 15 s at most.
+CLICK_POLLS = 30
+CLICK_POLL_SECONDS = 0.5
 
 
 class SmokeTestError(Exception):
@@ -46,6 +53,14 @@ def run(base_url: str) -> None:
     status, _, _ = request(base_url, "GET", "/health")
     expect(status == HTTPStatus.OK, f"GET /health returned {status}")
 
+    # A redirect the app builds itself (here: drop a trailing slash) leads
+    # back to the host and port the client used. Behind Nginx, that needs
+    # the Host header passed on with its port (nginx/default.conf).
+    status, headers, _ = request(base_url, "GET", "/health/")
+    expect(status == HTTPStatus.TEMPORARY_REDIRECT, f"GET /health/ returned {status}")
+    location = headers.get("location")
+    expect(location == f"{base_url.rstrip('/')}/health", f"/health/ redirected to {location}")
+
     status, _, body = request(base_url, "POST", "/api/links", {"url": TARGET})
     expect(status == HTTPStatus.CREATED, f"POST /api/links returned {status}: {body!r}")
     code = json.loads(body)["code"]
@@ -53,10 +68,35 @@ def run(base_url: str) -> None:
     status, headers, _ = request(base_url, "GET", f"/{code}")
     expect(status == HTTPStatus.FOUND, f"GET /{code} returned {status}, expected 302")
     expect(headers.get("location") == TARGET, f"redirected to {headers.get('location')}")
+    # Proves Redis is connected: new links are cached on create.
+    expect(headers.get("x-cache") == "HIT", f"X-Cache was {headers.get('x-cache')}")
 
-    status, _, body = request(base_url, "GET", f"/api/links/{code}")
-    expect(status == HTTPStatus.OK, f"GET /api/links/{code} returned {status}")
-    expect(json.loads(body)["clicks"] == 1, f"click was not counted: {body!r}")
+    # Proves the click worker runs: it counted the click from the stream.
+    clicks = counted_clicks(base_url, code, 1)
+    expect(clicks == 1, f"expected 1 click, counted {clicks}")
+
+    expect(rate_limit_kicks_in(base_url), "never got 429 Too Many Requests")
+
+
+def counted_clicks(base_url: str, code: str, expected: int) -> int:
+    """The link's click count, once it reaches `expected` or time is up."""
+    clicks = 0
+    for _ in range(CLICK_POLLS):  # bounded (NASA/JPL rule 2)
+        status, _, body = request(base_url, "GET", f"/api/links/{code}")
+        expect(status == HTTPStatus.OK, f"GET /api/links/{code} returned {status}")
+        clicks = int(json.loads(body)["clicks"])
+        if clicks >= expected:
+            break
+        time.sleep(CLICK_POLL_SECONDS)
+    return clicks
+
+
+def rate_limit_kicks_in(base_url: str) -> bool:
+    for _ in range(MAX_CREATE_ATTEMPTS):
+        status, headers, _ = request(base_url, "POST", "/api/links", {"url": TARGET})
+        if status == HTTPStatus.TOO_MANY_REQUESTS:
+            return headers.get("retry-after", "").isdigit()
+    return False
 
 
 def main(argv: Sequence[str]) -> int:

@@ -1,0 +1,37 @@
+# Prometheus: what to ask for metrics, how often, and which rules to check.
+# docker-compose.yml mounts this folder at /etc/prometheus. LEARNING.md
+# (lesson 6) explains it; `make monitoring-check` checks it, and the alerts'
+# tests (alerts_test.yml), with promtool.
+
+global:
+  # Every 15 s, Prometheus asks every target for its /metrics page.
+  scrape_interval: 15s
+  # A target that takes longer than this is counted as down for that round.
+  scrape_timeout: 10s
+  # Every 15 s, it works out the recording rules and checks the alerts.
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  # Each app instance, asked directly, not through Nginx: through Nginx,
+  # every scrape would reach a different instance. Docker's DNS server
+  # answers the name "app" with the address of every instance (as it does
+  # for Nginx), so instances that come and go are found on their own.
+  - job_name: app
+    dns_sd_configs:
+      - names: [app]
+        type: A
+        port: 8000
+        refresh_interval: 15s
+
+  # The click worker serves its own metrics (app/worker.py).
+  - job_name: click-worker
+    static_configs:
+      - targets: ["worker:8001"]
+
+  # Prometheus watches itself too: how long scrapes and rules take.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

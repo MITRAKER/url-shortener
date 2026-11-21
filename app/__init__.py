@@ -2,4 +2,4 @@
 
 # The single source of truth for the version. The API docs, pyproject.toml
 # and the release workflow all read it from here.
-__version__ = "0.1.0"
+__version__ = "0.5.0"

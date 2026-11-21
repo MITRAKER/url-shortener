@@ -1,0 +1,263 @@
+# Unit tests for the alerts in alerts.yml, run by promtool with made-up
+# series: `make monitoring-check`, and CI. Each test feeds Prometheus a
+# history ("0+980x120" is 0, 980, 1960... : a counter growing by 980 a
+# minute, for 120 minutes), then asks which alerts fire at a given time.
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 15s
+
+tests:
+  # 2% of redirects fail: 20 times what the budget allows. The fast alert
+  # fires within minutes; the slow one only after its 15 minutes.
+  - name: a burst of errors pages someone
+    interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="app", instance="a:8000", method="GET", route="/{code}", status="302"}'
+        values: "0+980x120"
+      - series: 'http_requests_total{job="app", instance="a:8000", method="GET", route="/{code}", status="500"}'
+        values: "0+20x120"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: RedirectErrorBudgetBurningFast
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: Redirects are failing fast enough to spend 2% of the month's error budget in an hour.
+              runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#redirecterrorbudgetburningfast
+      - eval_time: 10m
+        alertname: RedirectErrorBudgetBurningSlowly
+        exp_alerts: []
+
+  # 0.8% fail: 8 times the budget. Not worth waking anyone, but a ticket.
+  - name: a steady trickle of errors opens a ticket
+    interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="app", instance="a:8000", method="GET", route="/{code}", status="302"}'
+        values: "0+992x120"
+      - series: 'http_requests_total{job="app", instance="a:8000", method="GET", route="/{code}", status="503"}'
+        values: "0+8x120"
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: RedirectErrorBudgetBurningFast
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: RedirectErrorBudgetBurningSlowly
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: Redirects are failing fast enough to spend 5% of the month's error budget in six hours.
+              runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#redirecterrorbudgetburningslowly
+
+  # 0.05% fail: within budget. Errors on other routes don't count.
+  - name: errors within the budget stay quiet
+    interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="app", instance="a:8000", method="GET", route="/{code}", status="302"}'
+        values: "0+1999x120"
+      - series: 'http_requests_total{job="app", instance="a:8000", method="GET", route="/{code}", status="500"}'
+        values: "0+1x120"
+      - series: 'http_requests_total{job="app", instance="a:8000", method="POST", route="/api/links", status="500"}'
+        values: "0+500x120"
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: RedirectErrorBudgetBurningFast
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: RedirectErrorBudgetBurningSlowly
+        exp_alerts: []
+
+  # 98% of redirects within 100 ms, for longer than 10 minutes.
+  - name: slow redirects
+    interval: 1m
+    input_series:
+      - series: 'http_request_duration_seconds_bucket{job="app", instance="a:8000", method="GET", route="/{code}", le="0.1"}'
+        values: "0+980x60"
+      - series: 'http_request_duration_seconds_count{job="app", instance="a:8000", method="GET", route="/{code}"}'
+        values: "0+1000x60"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RedirectsSlow
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: RedirectsSlow
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: Fewer than 99% of redirects were answered within 100 ms over the last 10 minutes.
+              runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#redirectsslow
+
+  # One of three instances stops answering at minute 3.
+  - name: a missing instance opens a ticket
+    interval: 1m
+    input_series:
+      - series: 'up{job="app", instance="10.89.0.131:8000"}'
+        values: "1x15"
+      - series: 'up{job="app", instance="10.89.0.132:8000"}'
+        values: "1x15"
+      - series: 'up{job="app", instance="10.89.0.133:8000"}'
+        values: "1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AppInstancesMissing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: AppInstancesMissing
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: Fewer than 3 app instances are answering Prometheus.
+              runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#appinstancesmissing
+      - eval_time: 10m
+        alertname: AppDown
+        exp_alerts: []
+
+  # No instance at all: service discovery finds none, so there is no `up`
+  # series to be 0. The alert must fire on the absence of answers.
+  - name: no instance at all pages someone
+    interval: 1m
+    input_series:
+      - series: 'up{job="click-worker", instance="worker:8001"}'
+        values: "1x5"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: AppDown
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: No app instance is answering Prometheus.
+              runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#appdown
+
+  - name: the click worker is down
+    interval: 1m
+    input_series:
+      - series: 'up{job="click-worker", instance="worker:8001"}'
+        values: "1 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ClickWorkerDown
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: ClickWorkerDown
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: click-worker
+              instance: worker:8001
+            exp_annotations:
+              summary: The click worker is not answering Prometheus. Clicks wait in Redis, uncounted.
+              runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#clickworkerdown
+
+  # The oldest waiting click gets older by 30 s a minute: nothing is counted.
+  - name: clicks wait too long
+    interval: 1m
+    input_series:
+      - series: 'click_backlog_oldest_age_seconds{job="click-worker", instance="worker:8001"}'
+        values: "0+30x12"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ClicksWaitingTooLong
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: ClicksWaitingTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: A click has waited over a minute to be counted. The click worker is not keeping up.
+              runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#clickswaitingtoolong
+
+  # The worker stops at minute 1 while clicks keep coming. Its own series
+  # stop with it (there are none here), but the app instances measure the
+  # backlog too, so both alerts fire.
+  - name: the click worker is down while clicks pile up
+    interval: 1m
+    input_series:
+      - series: 'up{job="click-worker", instance="worker:8001"}'
+        values: "1 0x10"
+      - series: 'click_backlog_oldest_age_seconds{job="app", instance="a:8000"}'
+        values: "0 0+60x10"
+      - series: 'click_backlog_oldest_age_seconds{job="app", instance="b:8000"}'
+        values: "0 0+60x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ClickWorkerDown
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: click-worker
+              instance: worker:8001
+            exp_annotations:
+              summary: The click worker is not answering Prometheus. Clicks wait in Redis, uncounted.
+              runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#clickworkerdown
+      - eval_time: 10m
+        alertname: ClicksWaitingTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: A click has waited over a minute to be counted. The click worker is not keeping up.
+              runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#clickswaitingtoolong
+
+  - name: clicks bypass the stream
+    interval: 1m
+    input_series:
+      - series: 'clicks_recorded_total{job="app", instance="a:8000", path="database"}'
+        values: "0+10x30"
+      - series: 'clicks_recorded_total{job="app", instance="a:8000", path="stream"}'
+        values: "0+1000x30"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ClicksBypassingTheStream
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: Redis is not taking clicks, so redirects count them in PostgreSQL, slowly.
+              runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#clicksbypassingthestream
+
+  - name: the Redis circuit is open
+    interval: 1m
+    input_series:
+      - series: 'circuit_breaker_open{job="app", instance="a:8000", name="Redis"}'
+        values: "0 1 1 1 1"
+      - series: 'circuit_breaker_open{job="app", instance="b:8000", name="Redis"}'
+        values: "0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: RedisCircuitOpen
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: An app instance has stopped calling Redis after repeated failures.
+              runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#rediscircuitopen
+
+  # 27 of 30 connections in use on one instance; the other is fine.
+  - name: a saturated connection pool
+    interval: 1m
+    input_series:
+      - series: 'db_pool_connections_in_use{job="app", instance="a:8000"}'
+        values: "27x10"
+      - series: 'db_pool_connections_limit{job="app", instance="a:8000"}'
+        values: "30x10"
+      - series: 'db_pool_connections_in_use{job="app", instance="b:8000"}'
+        values: "3x10"
+      - series: 'db_pool_connections_limit{job="app", instance="b:8000"}'
+        values: "30x10"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: DatabasePoolSaturated
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              instance: a:8000
+            exp_annotations:
+              summary: Instance a:8000 has used over 80% of its database connections for 5 minutes.
+              runbook_url: https://github.com/MITRAKER/url-shortener/blob/main/docs/RUNBOOK.md#databasepoolsaturated

@@ -1,9 +1,10 @@
 # Shortcuts for everyday tasks. Run `make help` to list them.
 .DEFAULT_GOAL := help
-.PHONY: help install lock format lint typecheck power test audit check up down
+.PHONY: help install lock format lint typecheck power test audit check migrate worker up down \
+	loadtest monitoring-check
 
 help: ## List the available commands
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  make %-10s %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  make %-16s %s\n", $$1, $$2}'
 
 install: ## Install the locked dependencies and the git pre-commit hook
 	pip install --require-hashes -r requirements-dev.txt
@@ -38,8 +39,30 @@ check: ## What CI checks, except Docker and the PostgreSQL test run
 	pytest --cov
 	$(MAKE) --no-print-directory audit
 
-up: ## Start the app with PostgreSQL in Docker
+migrate: ## Bring the database (DATABASE_URL) up to the latest migration
+	alembic upgrade head
+
+worker: ## Count the clicks waiting in Redis (needs DATABASE_URL and REDIS_URL)
+	python -m app.worker
+
+up: ## Start everything in Docker: Nginx, 3 app instances, the worker, databases, monitoring
 	docker compose up --build
 
 down: ## Stop the Docker containers
 	docker compose down
+
+# The load test's settings, which you can override: make loadtest RATE=500 DURATION=2m
+RATE ?= 200
+DURATION ?= 1m
+LINKS ?= 100
+export RATE DURATION LINKS
+
+loadtest: ## Load-test the Docker stack with k6, rate limits raised (see loadtest/redirects.js)
+	docker compose -f docker-compose.yml -f loadtest/compose.yml up --build --detach --wait
+	docker compose -f docker-compose.yml -f loadtest/compose.yml run --rm --no-deps k6
+
+monitoring-check: ## Check the Prometheus configuration and run the alerts' tests (needs Docker)
+	docker compose run --rm --no-deps --entrypoint promtool prometheus \
+		check config /etc/prometheus/prometheus.yml
+	docker compose run --rm --no-deps --entrypoint promtool --workdir /etc/prometheus prometheus \
+		test rules alerts_test.yml

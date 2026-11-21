@@ -25,7 +25,7 @@ preprocessor, `malloc`), so we keep their purpose and translate the mechanics.
 | 6 | Declare data at the smallest possible scope. | No `global` or `nonlocal`. Module-level objects are only constants and singletons created once at startup (settings, engine). Prefer immutable data: tuples, `frozenset`, frozen dataclasses. | `check_power_of_ten.py` (R6), Ruff `PLW0603`, `B006`, `RUF012` |
 | 7 | Check every return value; validate parameters in every function. | Errors are exceptions in Python, so: never swallow them (no bare or blind `except`, no `except: pass`, no `contextlib.suppress(Exception)`), and `mypy --strict` forces every possible `None` to be handled before use. | Ruff `E722`, `BLE001`, `S110`, `check_power_of_ten.py` (R7), mypy strict |
 | 8 | Limit the preprocessor to includes and simple macros. | No metaprogramming that hides behavior from tools: no `eval`, `exec`, `compile`, `__import__`, `importlib.import_module`. | `check_power_of_ten.py` (R8), Ruff `S102`, `S307` |
-| 9 | At most one level of pointer dereferencing; no function pointers. | Python has references rather than pointers. We avoid mutable state shared through several references (no mutable default arguments, frozen dataclasses) and long attribute chains. Passing functions is limited to framework hooks such as FastAPI's `Depends`. | Ruff `B006`, `B008`; review |
+| 9 | At most one level of pointer dereferencing; no function pointers. | Python has references rather than pointers. We avoid mutable state shared through several references (no mutable default arguments, frozen dataclasses) and long attribute chains. Passing functions is limited to framework hooks (FastAPI's `Depends`), standard-library factories such as `defaultdict(list)`, and injected dependencies, such as clocks and the operation given to `RedisGateway.call`, which keep side effects testable. | Ruff `B006`, `B008`; review |
 | 10 | All warnings on, at the most pedantic level, from day one; zero warnings; daily static analysis. | Ruff with a broad rule set, `mypy --strict`, warnings turned into test failures, CodeQL, and a daily CI run. Zero warnings is the only accepted state. | CI (daily schedule), CodeQL (weekly), pre-commit |
 
 ### Waivers
@@ -38,7 +38,14 @@ while True:  # p10-waiver: R2 server loop, runs until the process stops
 ```
 
 A `# noqa: CODE` for Ruff or a `# type: ignore[code]` for mypy needs a reason
-in a comment too. There are none in the codebase today.
+in a comment too. Today there are seven, all for Ruff:
+
+| Where | Rule | Why |
+|-------|------|-----|
+| `app/cache.py` | `S311` (non-cryptographic random) | The cache TTL jitter doesn't need to be unpredictable, only spread out |
+| `app/config.py` | `S105` (hard-coded password) | `DEFAULT_CODE_SECRET` is public on purpose, so the app runs out of the box; it logs a warning while the default is in use |
+| `tests/conftest.py` | `S105` (hard-coded password) | The tests' own code secret, which protects nothing |
+| `tests/conftest.py`, 4 imports | `E402` (import not at the top) | The app reads its settings on import, so the test settings must be set first |
 
 ## Other rules
 
@@ -46,7 +53,8 @@ in a comment too. There are none in the codebase today.
   Nobody argues about formatting in review.
 - **Types:** every function has type hints; `mypy --strict` passes with zero errors.
 - **Errors:** raise specific exception types named `...Error`; chain them with
-  `raise ... from exc`; log, don't print.
+  `raise ... from exc`, unless the original error could carry a secret into the
+  logs: then `raise ... from None`, as in `_check_redis_url`; log, don't print.
 - **Security:** Ruff's `S` (Bandit) rules; no secrets in code; every
   dependency locked with hashes (edit `requirements*.in`, then `make lock`) and
   audited daily with `pip-audit`; the base image pinned by digest; CodeQL on
@@ -54,5 +62,11 @@ in a comment too. There are none in the codebase today.
 - **Tests:** every feature and every bug fix comes with a test. Branch coverage
   must stay at or above 95%. Tests must not print warnings.
 - **Time:** only timezone-aware datetimes, in UTC (Ruff `DTZ`).
+- **Metrics:** label values come only from short, fixed lists (route
+  templates, known methods, status codes), never from IDs, codes, URLs or
+  addresses: each new value is a new time series, held in memory. A new metric
+  comes with a test. Every alert has a section in `docs/RUNBOOK.md` and a test
+  in `monitoring/prometheus/alerts_test.yml` (`tests/test_monitoring.py`
+  checks both, and that every query names a metric that exists).
 - **Commits:** [Conventional Commits](https://www.conventionalcommits.org/),
   e.g. `feat: add rate limiting`, `fix: handle expired links`.
