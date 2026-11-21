@@ -55,6 +55,11 @@ def _as_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
 
 
+def _sanitize_for_log(value: str) -> str:
+    """Keep log entries single-line to prevent log-forging via CR/LF."""
+    return value.replace("\r", "").replace("\n", "")
+
+
 def _insert(session: Session, link: Link) -> bool:
     """Try to insert `link`. False means its code is already taken."""
     session.add(link)
@@ -109,7 +114,11 @@ def create_link(
         # The ID or the generated code is already taken. A generated code can
         # clash with an alias someone chose; anything else means trouble (see
         # IdClashError). Either way, a new ID solves it.
-        log.warning("new link %d (code %r) clashed with an existing row, retrying", link_id, code)
+        log.warning(
+            "new link %d (code %r) clashed with an existing row, retrying",
+            link_id,
+            _sanitize_for_log(code),
+        )
     raise IdClashError
 
 
