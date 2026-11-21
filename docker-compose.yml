@@ -16,15 +16,38 @@ services:
       timeout: 3s
       retries: 15
 
+  redis:
+    image: redis:7-alpine
+    # A pure cache: a fixed memory budget (NASA/JPL rule 3), evict the least
+    # frequently used keys when it is full, and no saving to disk.
+    command:
+      - redis-server
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - allkeys-lfu
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   app:
     build: .
     environment:
       DATABASE_URL: postgresql+psycopg://app:app@db:5432/shortener
+      REDIS_URL: redis://redis:6379/0
       BASE_URL: http://localhost:8000
     ports:
       - "8000:8000"
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     # If the app still can't reach the database at startup, start it again.
     restart: on-failure
