@@ -26,6 +26,7 @@ from app import __version__
 from app import main as main_module
 from app.breaker import CircuitBreaker
 from app.clicks import STREAM
+from app.limits import MAX_BODY_BYTES
 from app.metrics import (
     CONTENT_TYPE_LATEST,
     REGISTRY,
@@ -233,6 +234,25 @@ def test_a_redirect_that_drops_a_trailing_slash_is_unmatched(client: TestClient)
     assert client.get("/health/").status_code == 307
     assert client.get("/docs/").status_code == 307
     assert requests("GET", "unmatched", 307) == before + 2
+
+
+@pytest.mark.parametrize(
+    ("chunked", "route"),
+    [(False, "unmatched"), (True, "/api/links")],
+    ids=["content-length", "chunked"],
+)
+def test_a_body_too_large_is_counted_where_it_is_refused(
+    client: TestClient, chunked: bool, route: str
+) -> None:
+    """A Content-Length over 16 KB is refused before routing. A chunked body
+    announces no size, so it is refused once it passes 16 KB, inside its route."""
+    parts = [b'{"url": "https://example.com/', b"a" * MAX_BODY_BYTES, b'"}']
+    body = iter(parts) if chunked else b"".join(parts)
+    before = requests("POST", route, 413)
+    response = client.post("/api/links", content=body, headers={"content-type": "application/json"})
+    assert response.status_code == 413
+    assert ("content-length" in response.request.headers) is not chunked
+    assert requests("POST", route, 413) == before + 1
 
 
 def test_unknown_methods_share_one_label(client: TestClient) -> None:

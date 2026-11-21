@@ -1351,16 +1351,27 @@ location @once_more {
 
 The proxy settings moved up to the `server` block, so both locations share
 them, all but one: the second chance makes a single try. So a `GET` or `HEAD`
-reaches the instances at most 3 times, 2 tries and then 1. After the fix, CI's
-sequence ran 11 times without a single 502. And to be sure the changing list
-was the trigger, we ran the old configuration with DNS asked only every 5
-minutes (`valid=300s`): 4 runs, no 502 either. Two lessons in one: the same
-failure can be harmless or not depending on *when* requests arrive, so test
-more than one timing; and a second chance is only for requests that are safe
-to repeat. (Is a `GET` safe? In HTTP's terms, yes. Ours counts a click, the
-one side effect we accept repeating. "No instance answered" doesn't mean no
-instance received the request: one may count the click and die before it
-answers. With 3 tries, a click can be counted up to 3 times.)
+usually reaches the instances at most 3 times, 2 tries and then 1. After the
+fix, CI's sequence ran 11 times without a single 502. And to be sure the
+changing list was the trigger, we ran the old configuration with DNS asked
+only every 5 minutes (`valid=300s`): 4 runs, no 502 either. Two lessons in
+one: the same failure can be harmless or not depending on *when* requests
+arrive, so test more than one timing; and a second chance is only for
+requests that are safe to repeat. (Is a `GET` safe? In HTTP's terms, yes.
+Ours counts a click, the one side effect we accept repeating. "No instance
+answered" doesn't mean no instance received the request: one may count the
+click and die before it answers. So a click can be counted once more for
+every instance that does that.)
+
+Why "usually"? Nginx doesn't count a try whose kept-alive connection breaks
+(see the race below): the instance may simply have closed it as idle, which
+says nothing about its health. But an instance that takes the request on
+such a connection and dies before answering breaks it the same way, so its
+try isn't counted either. What always holds is the round robin's own rule: in
+one pass, it picks each instance at most once. The location and `@once_more`
+are two passes, each a new request to the upstream with its own 10 seconds,
+so the hard limit is 6 tries with our 3 instances, and a click can be
+counted at most that often.
 
 A later review found that our first version of `@once_more` had no
 `proxy_next_upstream_tries` of its own. It inherited the `server` block's 2,
@@ -1416,18 +1427,19 @@ header, so it may be believed only when it comes from our own proxy.
 `tests/test_proxy.py` checks all of it: one bucket per client behind Nginx,
 the header ignored from anyone else, and a forged address in front ignored.
 
-Nginx should pass on one more header: `Host`, the name and port the client
+Nginx must pass on one more header: `Host`, the name and port the client
 asked for. Left to itself, Nginx would send the name its configuration gives
-the instances, `app_instances`. (Our redirects would survive that:
-`proxy_redirect`, on by default, rewrites a `Location` that starts with
-`http://app_instances/` to the address the client used. But the app would
-have the wrong idea of its own address.) `proxy_set_header Host $http_host;` passes on
-what the client sent, port included. The app uses it to build the few
-redirects that point back at itself: `/docs/` sends you to `/docs`, on the
-host and port you used. Our first version used the common `$host`, which
-drops the port: `http://localhost:8000/docs/` sent you to
-`http://localhost/docs`, on port 80, where the app isn't. The smoke test now
-checks one such redirect.
+the instances, `app_instances`, and the app would build its redirects with
+that name. (`proxy_redirect`, on by default, would turn a `Location` that
+starts with `http://app_instances/` into a bare path, and Nginx would then
+make it absolute again with the client's host name but its own port, 8080,
+not the 8000 the client used. Those redirects would break too.)
+`proxy_set_header Host $http_host;` passes on what the client sent, port
+included. The app uses it to build the few redirects that point back at
+itself: `/docs/` sends you to `/docs`, on the host and port you used. Our
+first version used the common `$host`, which drops the port:
+`http://localhost:8000/docs/` sent you to `http://localhost/docs`, on port
+80, where the app isn't. The smoke test now checks one such redirect.
 
 ### Part 2: Unique IDs without asking anyone
 
@@ -2005,7 +2017,8 @@ an entry raised `UnicodeDecodeError` before our checks ever saw it. That is
 not a Redis error, so the worker crashed, started again, read the same
 entry, and crashed again: a poison message after all. Now `make_redis()`
 decodes with `encoding_errors="replace"`: the bad bytes become U+FFFD (�),
-and the entry fails validation like any other junk.
+so a code holding them fails validation like any other junk. Anywhere else
+in the entry they do no harm: the worker reads only the code.
 
 #### The stream holds only what is left to count
 
@@ -2117,9 +2130,9 @@ with it.)
 
 So "exactly once" is a promise about the worker: it counts each click in
 the stream once, whatever fails. Around it, a click can still be counted
-twice: after an ambiguous failure, or when Nginx retries a redirect on
-another instance (lesson 4). And a crash of the whole machine can lose up to
-about a second of clicks (see "Redis restarts" above).
+more than once: when Nginx retries a redirect (lesson 4 gives the bound), or
+twice after an ambiguous failure. And a crash of the whole machine can lose
+up to about a second of clicks (see "Redis restarts" above).
 
 #### The worker: crash-only, and alive is not the same as working
 
@@ -2217,7 +2230,7 @@ heartbeat module takes 0.15 s.
   checkpoint and both insert one. A SQLAlchemy `before_flush` event inserts
   the row from "another worker" just before ours: one row, no error.
 - **Shapes and junk.** Replies of other shapes (RESP3's dict, a broken entry)
-  raise; entries that aren't clicks, bytes that aren't UTF-8 among them, are
+  raise; entries that aren't clicks, codes that aren't UTF-8 among them, are
   skipped without blocking the clicks behind them.
 - **A watchdog that can't end pytest.** The watchdog takes its clock and its
   exit function as arguments. The tests pass a fake clock, and an exit
@@ -2344,7 +2357,7 @@ for every click or two (Part 5).
 | `nginx/default.conf` | `/metrics` is refused from outside |
 | `scripts/check_metrics.py` | For CI: every target up, every rule working, every dashboard query valid |
 | `docs/BENCHMARKS.md` | Every step, measured with the same load test |
-| `tests/test_metrics.py`, `tests/test_monitoring.py` | 37 tests: each metric moves when it should; every query names metrics that exist |
+| `tests/test_metrics.py`, `tests/test_monitoring.py` | 39 tests: each metric moves when it should; every query names metrics that exist |
 
 ### Part 1: Metrics
 
@@ -2434,7 +2447,9 @@ So every label value comes from a short, fixed list:
   with their paths, a fixed list the middleware is given at startup. A
   request that matched no route is `unmatched`: a 404 for `/no/such/page`,
   the router's redirect from `/health/` to `/health`, or a request refused
-  before it reaches the router, such as a 413 for a body over 16 KB.
+  before it reaches the router, such as a 413 for a `Content-Length` over
+  16 KB. (A chunked body announces no size, so it is refused only once it
+  passes 16 KB, inside its route: that 413 keeps the route's label.)
 - **method**: one of the seven known methods, or `other`. Anyone can send a
   method called `FOOBAR`.
 - **status**: in practice, a dozen codes.
@@ -2947,15 +2962,17 @@ runs. And don't believe a difference you haven't seen twice.
 
 - **Each metric moves when it should** (`tests/test_metrics.py`): a 404 on a
   short code is counted under `/{code}`, the API docs under their paths, an
-  unknown path and a redirect that drops a trailing slash under `unmatched`,
-  a crash as a 500, a strange method as `other`; a cache hit, a click through
-  the stream or the database, a 429, three Redis errors and then a circuit
-  open, which reads closed again once its cool-down is over, without a call;
-  the pool collector, and the backlog with a click added 5 seconds in the
-  past (a stream ID chosen by the test), whose collector is registered
-  without a call to Redis. An instance's own page shows the backlog, and
-  comes quickly without it when Redis refuses or never answers; a scrape
-  held up on purpose holds up no request, and takes none of their threads.
+  unknown path and a redirect that drops a trailing slash under `unmatched`, a
+  413 under `unmatched` when the body announced its size and under its route
+  when it came in chunks, a crash as a 500, a strange method as `other`; a
+  cache hit, a click through the stream or the database, a 429, three Redis
+  errors and then a circuit open, which reads closed again once its cool-down
+  is over, without a call; the pool collector, and the backlog with a click
+  added 5 seconds in the past (a stream ID chosen by the test), whose
+  collector is registered without a call to Redis. An instance's own page
+  shows the backlog, and comes quickly without it when Redis refuses or never
+  answers; a scrape held up on purpose holds up no request, and takes none of
+  their threads.
 - **The worker's metrics**: batches, clicks counted, entries skipped (once,
   even when a failed batch is read again), errors by system, and its own
   `/metrics` page, served on a free port. A fake stop event records every
