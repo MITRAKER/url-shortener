@@ -112,8 +112,11 @@ running but stuck.
 
 1. Is [ClickWorkerDown](#clickworkerdown) firing too? Then start there.
 2. `docker compose ps worker`: a worker that keeps restarting has a loop that
-   gets stuck. Its watchdog ends it after 30 s without a heartbeat (the log
-   says "the loop is stuck, exiting"), and Docker starts it again.
+   gets stuck, in our code or in a query to a PostgreSQL that is alive but
+   stuck (a paused container, a hung pooler). Its watchdog ends it after 30 s
+   without a heartbeat (the log says "the loop is stuck, exiting"), and
+   Docker starts it again. A slow database that still answers doesn't do
+   this: the worker touches its heartbeat after every few statements.
 3. The worker's logs: "counting clicks failed" means PostgreSQL or Redis
    keeps failing; the worker retries every second, by design.
 4. "Click worker: batches and errors": errors by system tell which one.

@@ -1807,11 +1807,11 @@ GET /abc1234 ─▶ Nginx ─▶ app ── XADD clicks:v1 * code abc1234 ──
 | `app/clicks.py` | `ClickStream.append()`: one `XADD`, unless a million clicks already wait (a small Lua script), through the Redis gateway |
 | `app/service.py` | `count_click()`: the stream, or PostgreSQL straight away when Redis can't take the click |
 | `app/worker.py` | The click worker: read a batch, add it up, count it with its checkpoint in one transaction; a watchdog that ends it when its loop is stuck |
-| `app/heartbeat.py` | The worker's health check: was its last round recent? |
+| `app/heartbeat.py` | The worker's health check: was its last heartbeat recent? |
 | `app/models.py`, migration `0003` | `click_checkpoints`: how far the worker got |
 | `docker-compose.yml` | The `worker` service; Redis keeps the stream on disk and never evicts it |
 | `scripts/check_clicks.py` | For CI: clicks wait while the worker is stopped, and survive a Redis restart |
-| `tests/test_clicks.py`, `tests/test_worker.py` | 39 tests: the redirect path, batching, every failure in between, two workers at once |
+| `tests/test_clicks.py`, `tests/test_worker.py` | 43 tests: the redirect path, batching, every failure in between, two workers at once |
 
 ### Part 1: Why take work off the request path?
 
@@ -2135,15 +2135,14 @@ about a second of clicks (see "Redis restarts" above).
 
 Restarting is the cure for the last case only, so whatever restarts the
 worker must ask "is it going round its loop?", not "is it making progress?".
-The worker touches a **heartbeat** file on every round, failed or not;
-`python -m app.heartbeat` checks that the last touch is less than 30 seconds
-old. Every wait inside a round has a limit (2 seconds for Redis; for
-PostgreSQL, 10 to get a connection and 5 per statement), with the one gap
-that lesson 2 names: a PostgreSQL that is alive but stuck holds a query on an
-open connection until it answers. So the heartbeat goes stale only when the
-loop is stuck, in our code or in that one wait. (After a restart, a new
-connection to a stuck PostgreSQL gives up after 5 seconds, so the worker's
-rounds fail, and go on, until the database answers again.)
+The worker touches a **heartbeat** file as every round begins, failed or
+not, and after each step of a round; `python -m app.heartbeat` checks that
+the last touch is less than 30 seconds old. Every wait inside a round has a
+limit (2 seconds for Redis; for PostgreSQL, 10 to get a connection and 5 per
+statement), with the one gap that lesson 2 names: a PostgreSQL that is alive
+but stuck holds a query on an open connection until it answers. (After a
+restart, a new connection to a stuck PostgreSQL gives up after 5 seconds, so
+the worker's rounds fail, and go on, until the database answers again.)
 
 That check is the container's health check, but a failing health check
 restarts nothing. Docker and Docker Compose only mark the container
@@ -2158,6 +2157,22 @@ restart policy does the rest, and crash-only design makes that safe.
 loop to stop, which a stuck loop never notices. A new worker gets 30 seconds
 for its first round: Docker restarts a container with its files, the old
 heartbeat included.
+
+A limit on each wait is not enough, though: a round holds many waits. It runs
+one `UPDATE` per link in its batch, up to 1,000, and our first version
+touched the heartbeat only as a round began. A review made every `UPDATE`
+take 4 seconds, within its limit of 5, and a batch of 8 links took 32
+seconds. The watchdog would end such a worker while it was getting on. Its
+batch was not committed, so the next worker would read the same batch, and
+end the same way, again and again. Now the worker sends the `UPDATE`s in
+chunks of 3, each done within 15 seconds (half of the 30), and touches the
+heartbeat after each chunk, as it does after reading the checkpoint, reading
+the stream and moving the checkpoint. The batch is still one transaction. On
+a database that answers, however slowly, no two touches are 30 seconds
+apart, so the heartbeat goes stale only when the loop is stuck: in our code,
+or in that one wait without a limit. The price is round trips: a batch of
+1,000 distinct links makes 334 instead of one, about 65 ms instead of 18 on
+a local PostgreSQL. Most batches hold far fewer links.
 
 **Progress** is a different signal: the backlog (`XLEN`) and the age of its
 oldest entry (its ID is a timestamp). That's a metric to graph and alert on,
@@ -2209,6 +2224,10 @@ heartbeat module takes 0.15 s.
   function that only notes the status: a heartbeat 30 seconds old ends the
   worker with status 1; rounds less than 30 seconds apart, and a new
   worker's first 30 seconds, don't.
+- **A slow database, in two seconds.** On PostgreSQL, a trigger makes every
+  `UPDATE` on `links` sleep 0.2 s (`pg_sleep`). The test shrinks the 30
+  seconds to 1, and a chunk to one `UPDATE`: the batch takes 1.6 s in all,
+  and the watchdog must leave the worker alone.
 - **The real stack, in CI.** The smoke test waits for its click to be counted;
   `scripts/check_clicks.py` checks clicks across a Redis restart.
 

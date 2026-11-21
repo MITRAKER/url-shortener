@@ -21,6 +21,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   override what the app sets itself, such as `?socket_timeout=30` or
   `?retry_on_timeout=true`: redis-py lets the URL win, which would undo the
   limits that keep a slow Redis from slowing down the app.
+- The click worker's watchdog could end a worker that was making progress.
+  The worker touched its heartbeat once per round, but a round runs one
+  `UPDATE` per link in a batch of up to 1,000, so a database that answers
+  each one within its 5 s limit could still keep a round past 30 seconds.
+  The next worker then read the same batch and was ended again. Now the
+  `UPDATE`s go in chunks of 3, all in the batch's one transaction, and the
+  worker touches the heartbeat after each step of a round: reading the
+  checkpoint, reading the stream, moving the checkpoint, and each chunk.
 
 ## [0.5.0] - 2026-11-19
 
