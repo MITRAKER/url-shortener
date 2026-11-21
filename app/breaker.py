@@ -16,6 +16,8 @@ import threading
 import time
 from collections.abc import Callable
 
+from app import metrics
+
 log = logging.getLogger(__name__)
 
 
@@ -39,11 +41,22 @@ class CircuitBreaker:
         self._lock = threading.Lock()
         self._failures = 0  # failures in a row, capped at failure_threshold
         self._blocked_until = 0.0  # while open, calls are skipped until this time
+        # Worked out when Prometheus asks, not set when the state changes:
+        # once the cool-down is over, the next call goes through, whenever it
+        # comes. Set on changes, the gauge would say "open" on an instance
+        # that gets no requests, long after Redis came back.
+        metrics.CIRCUIT_OPEN.labels(name).set_function(self._skipping)
+        metrics.CIRCUIT_OPENED.labels(name)  # 0 until it first opens
 
     @property
     def is_open(self) -> bool:
         with self._lock:
             return self._failures >= self.failure_threshold
+
+    def _skipping(self) -> float:
+        """1.0 while calls skip the dependency, else 0.0 (for the gauge)."""
+        with self._lock:
+            return float(self._clock() < self._blocked_until)
 
     def allow(self) -> bool:
         """May the caller use the dependency right now?"""
@@ -72,6 +85,7 @@ class CircuitBreaker:
             if self._failures >= self.failure_threshold:
                 self._blocked_until = self._clock() + self.reset_after
         if just_opened:
+            metrics.CIRCUIT_OPENED.labels(self.name).inc()
             log.warning(
                 "%s failed %d times in a row, circuit open: skipping it for %.0f s",
                 self.name,

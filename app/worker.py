@@ -14,6 +14,9 @@ the end of my batch". If another worker moved it first, the update changes no
 row, and this worker throws its batch away. So a second worker can never
 count a click twice; it only wastes work. One worker is plenty: a batch of a
 thousand clicks takes one transaction.
+
+The worker serves its metrics on port 8001 for Prometheus (app/metrics.py):
+how many batches and clicks it counted, its errors, and the clicks waiting.
 """
 
 import logging
@@ -27,12 +30,15 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
+from wsgiref.simple_server import WSGIServer
 
 import redis
+from prometheus_client import CollectorRegistry, start_http_server
 from sqlalchemy import bindparam, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app import metrics
 from app.clicks import STREAM
 from app.config import settings
 from app.db import SessionLocal
@@ -48,7 +54,15 @@ WAIT_MS: Final = 1000  # how long one read waits for new clicks to arrive
 SOCKET_MARGIN_SECONDS: Final = 1.0  # the client waits that much longer for Redis's answer
 WATCHDOG_SECONDS: Final = 5.0  # how often the watchdog looks at the heartbeat
 RETRY_SECONDS: Final = 1.0  # after an error, wait this long before trying again
+# After a batch smaller than the batch size, wait this long before reading
+# again: the clicks that arrive meanwhile make the next batch bigger. Without
+# it, a read returns as soon as there is one click, and at 300 clicks a second
+# the worker committed 260 transactions a second, one or two clicks each (the
+# metrics showed it, LEARNING.md lesson 6). A full batch means a backlog: no
+# waiting then. Kafka calls this wait "linger".
+LINGER_SECONDS: Final = 0.2
 START: Final = "0-0"  # comes before every stream ID: "nothing counted yet"
+METRICS_PORT: Final = 8001  # where Prometheus reads the worker's metrics
 
 # One statement, run once per link in the batch (an "executemany"). Clicks
 # are added (clicks = clicks + n), never set: an UPDATE from the app, counting
@@ -106,6 +120,11 @@ class Batch:
     clicks: dict[str, int]  # how many clicks each code got
     size: int  # how many entries were read
 
+    @property
+    def skipped(self) -> int:
+        """How many entries were not clicks on a valid code."""
+        return self.size - sum(self.clicks.values())
+
 
 class ClickWorker:
     """Reads clicks from the stream and counts them, one batch at a time."""
@@ -120,7 +139,7 @@ class ClickWorker:
         self._redis = client
         self._sessions = sessions
         self._wait_ms = wait_ms  # None: don't wait for new clicks (tests)
-        self._batch_size = batch_size
+        self.batch_size = batch_size
 
     def checkpoint(self) -> str:
         """The ID of the last entry already counted. Made on first use."""
@@ -141,14 +160,11 @@ class ClickWorker:
         """The next entries after the checkpoint, up to the batch size, or
         None if no click arrived within `wait_ms`."""
         after = self.checkpoint()
-        reply = self._redis.xread({STREAM: after}, count=self._batch_size, block=self._wait_ms)
+        reply = self._redis.xread({STREAM: after}, count=self.batch_size, block=self._wait_ms)
         entries = parse_entries(reply)
         if not entries:
             return None
         clicks = Counter(code for _, code in entries if code is not None)
-        skipped = len(entries) - clicks.total()
-        if skipped:
-            log.warning("skipped %d stream entries that are not clicks on a valid code", skipped)
         return Batch(after, entries[-1][0], dict(clicks), len(entries))
 
     def count(self, batch: Batch) -> bool:
@@ -162,6 +178,7 @@ class ClickWorker:
             )
             if moved.rowcount != 1:
                 session.rollback()
+                metrics.BATCHES.labels("already_counted").inc()
                 log.warning("another worker counted the clicks after %s first", batch.after)
                 return False
             if batch.clicks:
@@ -174,6 +191,15 @@ class ClickWorker:
                     [{"for_code": code, "added": n} for code, n in sorted(batch.clicks.items())],
                 )
             session.commit()
+        # Counted only now that the checkpoint is past these entries, junk
+        # included: a batch that failed is read again, and counted again.
+        metrics.BATCHES.labels("counted").inc()
+        metrics.CLICKS_COUNTED.inc(sum(batch.clicks.values()))
+        if batch.skipped:
+            metrics.ENTRIES_SKIPPED.inc(batch.skipped)
+            log.warning(
+                "skipped %d stream entries that are not clicks on a valid code", batch.skipped
+            )
         self._forget(batch)
         return True
 
@@ -188,9 +214,11 @@ class ClickWorker:
     def process_batch(self) -> int:
         """Read and count one batch. Returns how many entries it counted."""
         batch = self.read()
-        if batch is None or not self.count(batch):
+        if batch is None:
             return 0
-        return batch.size
+        with metrics.BATCH_DURATION.time():
+            counted = self.count(batch)
+        return batch.size if counted else 0
 
 
 def run(worker: ClickWorker, stop: threading.Event, heartbeat: Path) -> None:
@@ -201,11 +229,26 @@ def run(worker: ClickWorker, stop: threading.Event, heartbeat: Path) -> None:
     while not stop.is_set():  # p10-waiver: R2 runs until the process is told to stop
         heartbeat.touch()
         try:
-            worker.process_batch()
+            counted = worker.process_batch()
         except (redis.RedisError, SQLAlchemyError) as exc:
             # Nothing is lost: whatever wasn't counted is still in the stream.
+            system = "redis" if isinstance(exc, redis.RedisError) else "database"
+            metrics.WORKER_ERRORS.labels(system).inc()
             log.warning("counting clicks failed, trying again in %.0f s: %s", RETRY_SECONDS, exc)
             stop.wait(RETRY_SECONDS)
+            continue
+        if counted < worker.batch_size:
+            stop.wait(LINGER_SECONDS)  # no backlog: let the next clicks gather
+
+
+def serve_metrics(client: redis.Redis, port: int) -> WSGIServer:
+    """Serve the worker's metrics, and the clicks waiting in the stream, on
+    `port`, from a thread of their own, until the server is shut down."""
+    registry = CollectorRegistry()
+    registry.register(metrics.WORKER_REGISTRY)  # a registry is a collector too
+    registry.register(metrics.BacklogCollector(client, STREAM))
+    server, _ = start_http_server(port, registry=registry)
+    return server
 
 
 def stop_on_signals(stop: threading.Event) -> None:
@@ -279,8 +322,13 @@ def main(argv: Sequence[str]) -> int:
     stop = threading.Event()
     start_watchdog(HEARTBEAT, stop)
     stop_on_signals(stop)
+    server = serve_metrics(client, METRICS_PORT)
     log.info("counting clicks from the Redis stream %s", STREAM)
-    run(ClickWorker(client, SessionLocal), stop, HEARTBEAT)
+    try:
+        run(ClickWorker(client, SessionLocal), stop, HEARTBEAT)
+    finally:
+        server.shutdown()
+        server.server_close()
     log.info("stopped")
     return 0
 

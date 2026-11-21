@@ -9,6 +9,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import metrics
 from app.cache import CachedLink, LinkCache, Lookup
 from app.clicks import ClickStream
 from app.ids import LinkIds
@@ -18,7 +19,7 @@ from app.schemas import ALIAS_PATTERN
 log = logging.getLogger(__name__)
 
 # Codes that would clash with our own routes.
-RESERVED = frozenset({"api", "docs", "redoc", "health", "openapi.json", "favicon.ico"})
+RESERVED = frozenset({"api", "docs", "redoc", "health", "metrics", "openapi.json", "favicon.ico"})
 # Upper bound for the insert-and-retry loop (NASA/JPL rule 2).
 MAX_ATTEMPTS = 5
 # Every code we hand out matches this: aliases are validated against it, and
@@ -152,8 +153,11 @@ def is_expired(link: Link | CachedLink) -> bool:
 def count_click(session: Session, clicks: ClickStream | None, code: str) -> None:
     """Count a click on `code`: on the stream, for the click worker to add up
     later, or, when Redis can't take it, in the database right away."""
-    if clicks is None or not clicks.append(code):
+    if clicks is not None and clicks.append(code):
+        metrics.CLICKS.labels("stream").inc()
+    else:
         record_click(session, code)
+        metrics.CLICKS.labels("database").inc()
 
 
 def record_click(session: Session, code: str) -> None:

@@ -4,21 +4,22 @@ import asyncio
 import contextlib
 import logging
 import signal
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from functools import partial
-from typing import Annotated
+from typing import Annotated, Final
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from anyio import CapacityLimiter, to_thread
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-from app import __version__, instances, service
+from app import __version__, instances, metrics, service
 from app.cache import LinkCache
-from app.clicks import ClickStream
+from app.clicks import STREAM, ClickStream
 from app.config import DEFAULT_CODE_SECRET, settings
-from app.db import engine, get_session
+from app.db import POOL_MAX_OVERFLOW, POOL_SIZE, engine, get_session
 from app.ids import CodeCipher, LinkIds, RetiredError, Snowflake
 from app.limits import LimitBodySize
 from app.models import Link
@@ -37,6 +38,23 @@ def give_up(snowflake: Snowflake) -> None:
     signal.raise_signal(signal.SIGTERM)
 
 
+@contextmanager
+def backlog_reported(gateway: RedisGateway | None) -> Iterator[None]:
+    """Show the clicks waiting in the stream on this instance's /metrics page
+    while the `with` block runs. The worker shows them too, but its page goes
+    when it stops, and that is when the clicks pile up: from the instances'
+    pages, ClicksWaitingTooLong still sees them (monitoring/prometheus)."""
+    if gateway is None:
+        yield  # no Redis, no stream
+        return
+    collector = metrics.BacklogCollector(gateway.client, STREAM)
+    metrics.REGISTRY.register(collector)
+    try:
+        yield
+    finally:
+        metrics.REGISTRY.unregister(collector)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The tables are not created here: migrations do that (`alembic upgrade
@@ -47,7 +65,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.warning("CODE_SECRET is not set: anyone can work out the codes. Set it in production.")
     # Hold a unique instance number for as long as this instance runs, and
     # keep checking that we still do.
-    with instances.lease_instance_id(engine) as lease:
+    with instances.lease_instance_id(engine) as lease, backlog_reported(get_redis()):
+        metrics.APP.info({"version": __version__, "instance_number": str(lease.number)})
         snowflake = Snowflake(lease.number)
         app.state.ids = LinkIds(snowflake, CodeCipher(secret))
         watchdog = asyncio.create_task(instances.watch(lease, partial(give_up, snowflake)))
@@ -67,6 +86,17 @@ app.add_middleware(LimitBodySize)
 # it only on requests from a proxy listed in TRUSTED_PROXIES. After this,
 # request.client is the real client (the rate limiter counts per client).
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=settings.trusted_proxy_list)
+# Count and time every request (app/metrics.py). Added last, so it runs
+# first: it also sees the requests that the middleware above refuses. It is
+# given the paths of FastAPI's own pages (the API docs), to label them.
+app.add_middleware(
+    metrics.PrometheusMiddleware,
+    docs_paths=[app.openapi_url, app.docs_url, app.swagger_ui_oauth2_redirect_url, app.redoc_url],
+)
+# How busy the connection pool is. PostgreSQL only: that is the server whose
+# connections run out (SQLite's pool, a file on this machine, sizes itself).
+if engine.dialect.name == "postgresql":
+    metrics.REGISTRY.register(metrics.DatabasePoolCollector(engine, POOL_SIZE + POOL_MAX_OVERFLOW))
 
 
 def get_cache(gateway: Annotated[RedisGateway | None, Depends(get_redis)]) -> LinkCache | None:
@@ -117,6 +147,23 @@ def health(ids: IdsDep) -> dict[str, str | int]:
     return {"status": "ok", "instance": ids.snowflake.instance_id}
 
 
+# One scrape at a time, on a thread that isn't one of the requests' (below).
+SCRAPE_LIMITER: Final = CapacityLimiter(1)
+
+
+# For Prometheus (monitoring/prometheus/prometheus.yml), which asks every
+# instance directly; Nginx refuses it from outside. Not rate limited. The page
+# is put together on a thread of its own, for two reasons. Measuring the click
+# backlog asks Redis, which may take up to its timeout: on the event loop,
+# that wait would hold up every request. And the thread runs under a limiter
+# of its own, not under the requests' limit of 40 threads: an overloaded
+# instance, every thread busy, must still report.
+@app.get(metrics.METRICS_PATH, include_in_schema=False)
+async def prometheus_metrics() -> Response:
+    page = await to_thread.run_sync(metrics.generate_latest, limiter=SCRAPE_LIMITER)
+    return Response(page, media_type=metrics.CONTENT_TYPE_LATEST)
+
+
 @app.post("/api/links", status_code=status.HTTP_201_CREATED, dependencies=[limit_create])
 def create(body: LinkCreate, session: SessionDep, cache: CacheDep, ids: IdsDep) -> LinkOut:
     try:
@@ -154,6 +201,7 @@ def redirect(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Link not found")
 
     link, cache_status = service.resolve(session, cache, code)
+    metrics.CACHE_LOOKUPS.labels(cache_status.value.lower()).inc()
     headers = {"X-Cache": cache_status.value}
     if link is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Link not found", headers=headers)

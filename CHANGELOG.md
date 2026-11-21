@@ -7,6 +7,64 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-19
+
+### Added
+
+- Metrics for Prometheus. Each app instance serves `GET /metrics`: requests
+  by method, route and status code, their duration (a histogram with a
+  bucket at the 100 ms objective), requests in progress, cache lookups by
+  result, clicks by path (the stream or the database), requests refused with
+  429, Redis calls that fell back, the circuit breaker's state and openings,
+  the database connection pool, the clicks waiting in the stream with the age
+  of the oldest (the worker serves them too, but they must still show while
+  it is down), and the app's version and instance number. Label values come
+  from fixed lists only. The page is put together on a thread of its own: a
+  slow Redis can't hold up requests, and busy request threads can't hold up
+  the page. Nginx refuses `/metrics` from outside.
+- The click worker serves its own metrics on port 8001: batches, clicks
+  counted, entries skipped, errors by system, time per batch, and the clicks
+  waiting in the stream with the age of the oldest.
+- Prometheus (the `prometheus` service, port 9090 on 127.0.0.1). It finds
+  the app instances through Docker's DNS, keeps 7 days of data (1 GB at
+  most), and checks recording rules and 10 alerts: burn-rate alerts over two
+  windows for the redirect error objective (99.9% over 30 days), slow
+  redirects (objective: 99% within 100 ms), an instance missing or all of
+  them down, the click worker down or behind, clicks bypassing the stream,
+  the Redis circuit open, and a saturated connection pool. Each alert links
+  to its section of the new runbook (`docs/RUNBOOK.md`) and has a promtool
+  test (`make monitoring-check`, and CI).
+- Grafana (the `grafana` service, port 3000 on 127.0.0.1), with the
+  Prometheus data source and a dashboard of 23 panels, provisioned from
+  files. Anyone may look without logging in.
+- A k6 load test (`loadtest/redirects.js`, `make loadtest`, and a Load test
+  workflow on GitHub, run by hand): requests at a fixed rate (an open
+  model), links clicked by Zipf's law, 5% unknown codes, and the objectives
+  as thresholds. CI runs it for 10 seconds.
+- CI checks that Prometheus collects every instance and the worker, that
+  every rule works and every dashboard query runs, and that Grafana serves
+  the dashboard (`scripts/check_metrics.py`). Tests check that every query of
+  the alerts and the dashboard names a metric that exists, and that every
+  alert has a runbook section and a test.
+- Benchmarks of every step with the same load test (`docs/BENCHMARKS.md`):
+  on the same three cores, step 1 answers about 250 redirects a second.
+  Step 5 keeps up at 300 a second, and at 600 in one run of two; at 900 it
+  answers about 880 a second but falls behind, with a p99 of 248-321 ms.
+- Lesson 6 in LEARNING.md: metrics, PromQL, SLOs and burn-rate alerts, load
+  testing, what the numbers showed, and what each step bought.
+
+### Changed
+
+- `metrics` is now a reserved code, like `api` and `health`: a new link
+  can't have it as its alias (409). This breaks a link that already has that
+  alias: it no longer redirects, because an instance answers `/metrics` with
+  Prometheus's page, and Nginx answers it with 404. The link itself is kept;
+  `GET /api/links/metrics` tells whether you have one.
+- After a batch that wasn't full, the click worker waits 0.2 s before reading
+  again, so that clicks gather into bigger batches. At 300 clicks a second,
+  it went from 259 transactions a second to 4.8, and from 55% of a CPU to
+  2.2%. A click is counted up to 0.2 s later than before.
+
 ## [0.4.0] - 2026-11-18
 
 ### Added
@@ -204,7 +262,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - GitHub Actions CI running the tests on SQLite and PostgreSQL.
 - Lesson 1 in LEARNING.md.
 
-[Unreleased]: https://github.com/MITRAKER/url-shortener/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/MITRAKER/url-shortener/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/MITRAKER/url-shortener/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MITRAKER/url-shortener/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/MITRAKER/url-shortener/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MITRAKER/url-shortener/compare/v0.1.0...v0.2.0

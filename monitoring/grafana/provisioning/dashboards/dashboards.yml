@@ -1,0 +1,14 @@
+# Grafana loads every dashboard in /etc/grafana/dashboards
+# (monitoring/grafana/dashboards) at startup, and keeps them in sync.
+# To change one: edit it in Grafana, then "Export" > "Export as JSON", and
+# replace the file. Edits made only in Grafana are not saved.
+apiVersion: 1
+
+providers:
+  - name: url-shortener
+    folder: URL shortener
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards

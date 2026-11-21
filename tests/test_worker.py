@@ -4,6 +4,7 @@ into PostgreSQL, each one exactly once, whatever fails in between."""
 import os
 import signal
 import threading
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -18,8 +19,10 @@ from app.clicks import STREAM
 from app.config import settings
 from app.db import Base, SessionLocal, engine
 from app.heartbeat import ALIVE_SECONDS, HEARTBEAT, is_alive
+from app.metrics import WORKER_REGISTRY
 from app.models import ClickCheckpoint, Link
 from app.worker import (
+    LINGER_SECONDS,
     START,
     Batch,
     ClickWorker,
@@ -28,6 +31,7 @@ from app.worker import (
     main,
     parse_entries,
     run,
+    serve_metrics,
     stop_on_signals,
 )
 from tests.fakes import FakeClock
@@ -68,6 +72,12 @@ def clicks() -> dict[str, int]:
 def checkpoint() -> str | None:
     with SessionLocal() as session:
         return session.scalar(select(ClickCheckpoint.last_id))
+
+
+def metric(name: str, /, **labels: str) -> float:
+    """One of the worker's metrics (app/metrics.py). They add up over the
+    whole test run, so tests compare a value before and after."""
+    return WORKER_REGISTRY.get_sample_value(name, labels) or 0.0
 
 
 # ------------------------------------------------------------- counting ----
@@ -116,6 +126,26 @@ def test_entries_that_are_not_clicks_are_skipped(
     assert clicks() == {FIRST: 1, SECOND: 0, THIRD: 0}
     assert checkpoint() == last
     assert "skipped 2 stream entries" in caplog.text
+
+
+def test_the_worker_counts_what_it_did(
+    redis_client: redis.Redis, click_worker: ClickWorker
+) -> None:
+    def counts() -> list[float]:
+        return [
+            metric("click_worker_batches_total", result="counted"),
+            metric("click_worker_clicks_counted_total"),
+            metric("click_worker_entries_skipped_total"),
+            metric("click_worker_batch_duration_seconds_count"),  # batches timed
+        ]
+
+    before = counts()
+    click(redis_client, FIRST, SECOND, FIRST)
+    redis_client.xadd(STREAM, {"code": "not valid!"})
+    assert click_worker.process_batch() == 4
+    assert counts() == [before[0] + 1, before[1] + 3, before[2] + 1, before[3] + 1]
+    assert click_worker.process_batch() == 0  # nothing to read: no batch
+    assert counts() == [before[0] + 1, before[1] + 3, before[2] + 1, before[3] + 1]
 
 
 def test_a_batch_of_nothing_but_junk_still_moves_the_checkpoint(
@@ -167,6 +197,28 @@ def test_a_failed_transaction_counts_nothing_and_loses_nothing(
     assert clicks()[FIRST] == 2
 
 
+def test_a_batch_read_again_skips_its_junk_only_once(
+    redis_client: redis.Redis,
+    click_worker: ClickWorker,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Entries are skipped for good when the checkpoint moves past them, in
+    the commit. A batch that failed is read again, junk and all."""
+    redis_client.xadd(STREAM, {"code": "not valid!"})
+    click(redis_client, FIRST)
+    before = metric("click_worker_entries_skipped_total")
+    broken = text("UPDATE no_such_table SET clicks = :added WHERE code = :for_code")
+    monkeypatch.setattr(worker_module, "ADD_CLICKS", broken)
+    with pytest.raises(SQLAlchemyError):
+        click_worker.process_batch()
+    assert metric("click_worker_entries_skipped_total") == before  # nothing skipped yet
+    monkeypatch.undo()
+    assert click_worker.process_batch() == 2
+    assert metric("click_worker_entries_skipped_total") == before + 1
+    assert caplog.text.count("not clicks on a valid code") == 1
+
+
 def test_a_crash_after_the_commit_counts_nothing_twice(
     redis_client: redis.Redis,
     click_worker: ClickWorker,
@@ -201,9 +253,11 @@ def test_a_batch_another_worker_counted_first_is_thrown_away(
     batch = second.read()
     assert batch is not None
     assert first.process_batch() == 2  # the first worker is faster
+    lost = metric("click_worker_batches_total", result="already_counted")
     assert not second.count(batch)  # the checkpoint moved: compare-and-set fails
     assert clicks()[FIRST] == 2
     assert "another worker counted the clicks" in caplog.text
+    assert metric("click_worker_batches_total", result="already_counted") == lost + 1
 
 
 def test_two_workers_at_once_count_every_click_exactly_once(redis_client: redis.Redis) -> None:
@@ -297,10 +351,44 @@ def test_run_carries_on_after_errors_until_stopped(
 
     monkeypatch.setattr(click_worker, "process_batch", process_batch)
     monkeypatch.setattr(worker_module, "RETRY_SECONDS", 0.0)
+    before = [metric("click_worker_errors_total", system=s) for s in ("redis", "database")]
     run(click_worker, stop, tmp_path / "alive")
     assert outcomes == []
     assert caplog.text.count("counting clicks failed") == 2
     assert is_alive(tmp_path / "alive")
+    after = [metric("click_worker_errors_total", system=s) for s in ("redis", "database")]
+    assert after == [before[0] + 1, before[1] + 1]
+
+
+class RecordingStop(threading.Event):
+    """A stop event that notes how long the worker waits, without waiting."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waits: list[float | None] = []
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.waits.append(timeout)
+        return self.is_set()
+
+
+def test_the_worker_lingers_after_a_batch_that_was_not_full(
+    click_worker: ClickWorker, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A full batch means more clicks are waiting: read again at once.
+    Otherwise wait a moment, so that the next batch gathers more clicks."""
+    stop = RecordingStop()
+    results = [click_worker.batch_size, click_worker.batch_size, 3]
+
+    def process_batch() -> int:
+        result = results.pop(0)
+        if not results:
+            stop.set()
+        return result
+
+    monkeypatch.setattr(click_worker, "process_batch", process_batch)
+    run(click_worker, stop, tmp_path / "alive")
+    assert stop.waits == [LINGER_SECONDS]  # after the batch of 3 only
 
 
 def test_any_other_error_is_a_bug_and_ends_the_worker(
@@ -457,6 +545,23 @@ def test_without_redis_there_is_nothing_to_count(
     assert "REDIS_URL is not set" in caplog.text
 
 
+def test_the_worker_serves_its_metrics(redis_client: redis.Redis) -> None:
+    click(redis_client, FIRST, SECOND)
+    server = serve_metrics(redis_client, port=0)  # 0: any free port
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/metrics"
+        with urllib.request.urlopen(url, timeout=5) as response:
+            page = response.read().decode()
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert "click_worker_batches_total" in page
+    assert "click_backlog_entries 2.0" in page
+    assert "process_cpu_seconds_total" in page
+    # The HTTP metrics of the app instances have no place here.
+    assert "http_requests_total" not in page
+
+
 def test_main_runs_the_worker(monkeypatch: pytest.MonkeyPatch) -> None:
     started: list[tuple[ClickWorker, Path]] = []
     watched: list[Path] = []
@@ -471,6 +576,7 @@ def test_main_runs_the_worker(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(worker_module, "start_watchdog", fake_start_watchdog)
     monkeypatch.setattr(worker_module, "stop_on_signals", lambda _stop: None)
     monkeypatch.setattr(worker_module, "run", fake_run)
+    monkeypatch.setattr(worker_module, "METRICS_PORT", 0)
     assert main([]) == 0
     [(worker, heartbeat)] = started
     assert isinstance(worker, ClickWorker)
