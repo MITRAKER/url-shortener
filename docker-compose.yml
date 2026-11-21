@@ -8,7 +8,10 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d shortener"]
+      # -h 127.0.0.1 probes over TCP like the app does. On first start, the
+      # image runs a temporary server that only listens on a Unix socket while
+      # it creates the database; a socket probe would call that "healthy".
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U app -d shortener"]
       interval: 2s
       timeout: 3s
       retries: 15
@@ -23,6 +26,9 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # If the app still can't reach the database at startup, start it again.
+    restart: on-failure
+    # The image's HEALTHCHECK lets `docker compose up --wait` know when we're ready.
 
 volumes:
   pgdata:

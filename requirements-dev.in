@@ -1,0 +1,30 @@
+# Tools for development and CI. After changing this file, run `make lock` to
+# rebuild requirements-dev.txt, the full lock file with hashes.
+-r requirements.in
+# Use exactly the versions the app ships with (requirements.txt), so the
+# tests run against the very packages that go into the Docker image.
+-c requirements.txt
+
+# Testing
+pytest==9.2.0
+pytest-cov==7.1.0
+httpx2==2.16.2  # used by FastAPI's TestClient
+
+# Code quality (same versions locally, in pre-commit and in CI)
+ruff==0.17.5
+mypy==2.4.1
+pre-commit==4.7.0
+# The file hygiene hooks in .pre-commit-config.yaml (trailing whitespace,
+# YAML syntax, private keys and more).
+pre-commit-hooks==6.0.0
+actionlint-py==1.7.12.25
+# actionlint checks the shell scripts in workflows only if it finds
+# shellcheck, so we pin it too: otherwise CI would check more than your laptop.
+shellcheck-py==0.11.0.1
+hadolint-py==2.15.1.3
+
+# Security
+pip-audit==2.10.1
+
+# Lock files: `make lock` runs pip-compile to rebuild both requirements files.
+pip-tools==7.6.2
