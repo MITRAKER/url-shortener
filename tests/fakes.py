@@ -1,9 +1,29 @@
-"""Test doubles that behave like broken servers."""
+"""Test doubles: broken servers, a clock that only moves when told, and a proxy."""
 
 import socket
 from typing import Final
 
 BACKLOG: Final = 64
+# Where Nginx's requests come from (its fixed address in docker-compose.yml).
+# The tests trust it, like the app does in Compose (TRUSTED_PROXIES).
+NGINX: Final = "10.89.0.10"
+
+
+class FakeClock:
+    """A clock the test moves by hand, so no test has to sleep. Pass its
+    `sleep` method where the code would sleep: that just moves the clock."""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+    def sleep(self, seconds: float) -> None:
+        self.advance(seconds)
 
 
 class SilentServer:

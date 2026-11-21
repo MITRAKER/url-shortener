@@ -12,7 +12,8 @@ git clone https://github.com/MITRAKER/url-shortener.git
 cd url-shortener
 python -m venv .venv && source .venv/bin/activate
 make install        # dependencies + the git pre-commit hook
-make up             # optional: run the app with PostgreSQL in Docker
+make migrate        # create the tables in the local SQLite database
+make up             # optional: the whole stack in Docker (Nginx, 3 app instances, PostgreSQL, Redis)
 ```
 
 `make help` lists every command.
@@ -35,6 +36,25 @@ make up             # optional: run the app with PostgreSQL in Docker
 
 The pre-commit hook runs the fast checks on every commit, so most problems
 are caught before they ever reach CI.
+
+## Database changes
+
+The tables change only through migrations ([Alembic](https://alembic.sqlalchemy.org/)),
+never by hand and never at app startup:
+
+1. Change the model in `app/models.py`.
+2. Run `alembic revision --autogenerate -m "short description"`. Alembic
+   compares the models with the database and writes a new file in
+   `app/migrations/versions/`. Read it: autogenerate misses some changes
+   (renames look like a drop plus an add, for example), and data migrations
+   are yours to write.
+3. Run `make migrate`, and `alembic downgrade -1` then `make migrate` again,
+   to check both directions.
+4. Keep every migration safe for instances that are still running the
+   previous version: add a column first, use it in a later release, and drop
+   what is no longer used later still ("expand, then contract").
+
+`tests/test_migrations.py` fails when the models and the migrations disagree.
 
 ## Dependencies
 
@@ -59,7 +79,7 @@ hashes.
 | Lint, format, types, Power of Ten | All pre-commit hooks on every file |
 | Tests (SQLite + fake Redis), Tests (PostgreSQL + Redis) | The test suite on both setups; fails below 95% branch coverage |
 | Dependency vulnerability audit | `pip-audit` against the Python vulnerability database |
-| Docker build and smoke test | Builds the image, starts the stack, runs `scripts/smoke_test.py` |
+| Docker build and smoke test | Builds the image, starts the stack (migrations, Nginx, 3 instances), runs `scripts/smoke_test.py`, checks that Nginx uses all 3 instances, then stops one and checks that no request fails |
 | CodeQL | Security analysis of the Python code and of the workflows |
 
 ## Releasing

@@ -1,6 +1,14 @@
+# The whole system, as in production but on one machine:
+#
+#   client ──▶ nginx (port 8000) ──▶ app × 3 ──▶ redis, db
+#
+# `migrate` applies the database migrations once, before any app instance
+# starts. Every image is pinned by digest, like the base image in the
+# Dockerfile; Dependabot keeps the digests current.
+
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:81e77a4833487b8132fe4b00bedd39dc3f74b8641e387f19312a48f7de218c2e
     environment:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: app
@@ -17,7 +25,7 @@ services:
       retries: 15
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
     # A pure cache: a fixed memory budget (NASA/JPL rule 3), evict the least
     # frequently used keys when it is full, and no saving to disk.
     command:
@@ -36,22 +44,66 @@ services:
       timeout: 3s
       retries: 15
 
+  migrate:
+    build: .
+    image: url-shortener-app
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://app:app@db:5432/shortener
+    depends_on:
+      db:
+        condition: service_healthy
+
   app:
     build: .
+    image: url-shortener-app
+    deploy:
+      replicas: 3
     environment:
       DATABASE_URL: postgresql+psycopg://app:app@db:5432/shortener
       REDIS_URL: redis://redis:6379/0
       BASE_URL: http://localhost:8000
-    ports:
-      - "8000:8000"
+      # Believe X-Forwarded-For only from Nginx (its fixed address is below).
+      TRUSTED_PROXIES: 10.89.0.10
+    # No "ports:" on purpose: the instances can only be reached through Nginx.
     depends_on:
-      db:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
-    # If the app still can't reach the database at startup, start it again.
-    restart: on-failure
-    # The image's HEALTHCHECK lets `docker compose up --wait` know when we're ready.
+    # Start an instance again whenever it stops by itself: when it crashed,
+    # could not reach the database at startup, or gave up its instance
+    # number (app/instances.py). `docker compose stop` still stops it.
+    restart: unless-stopped
+    # The image's HEALTHCHECK tells Compose (and Nginx's depends_on) when it's ready.
+
+  nginx:
+    image: nginxinc/nginx-unprivileged:1.30-alpine@sha256:f5116ed4606f3eb015dd4a8e28cb9b351476dc0ad4bc6e9f93b19cec130cdf03
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8000:8080"
+    networks:
+      default:
+        ipv4_address: 10.89.0.10
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      # Healthy once Nginx answers and can reach at least one instance.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+networks:
+  default:
+    ipam:
+      config:
+        # A fixed network, so that Nginx can have a fixed address for
+        # TRUSTED_PROXIES. Other containers get addresses from the upper half.
+        - subnet: 10.89.0.0/24
+          ip_range: 10.89.0.128/25
 
 volumes:
   pgdata:

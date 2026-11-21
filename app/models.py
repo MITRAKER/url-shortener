@@ -7,8 +7,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
 
-# BIGINT in Postgres; plain INTEGER in SQLite, where only INTEGER PRIMARY KEY
-# columns auto-increment.
+# BIGINT in Postgres; INTEGER in SQLite, where INTEGER already holds 64 bits
+# and an INTEGER PRIMARY KEY is the table's own row ID, the fastest key.
 BigInt = BigInteger().with_variant(Integer, "sqlite")
 
 
@@ -19,7 +19,10 @@ def utcnow() -> datetime:
 class Link(Base):
     __tablename__ = "links"
 
-    id: Mapped[int] = mapped_column(BigInt, primary_key=True)
+    # A Snowflake ID (app/ids.py), made by the app before the INSERT, not
+    # counted up by the database: no instance has to ask anyone for the next
+    # number, and IDs still sort by creation time.
+    id: Mapped[int] = mapped_column(BigInt, primary_key=True, autoincrement=False)
     # The unique index on `code` is what makes redirects fast (O(log n) lookup)
     # and what guarantees no two links share a code.
     code: Mapped[str] = mapped_column(String(32), unique=True, index=True)

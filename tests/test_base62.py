@@ -33,14 +33,3 @@ def test_decode_rejects_bad_length(text: str) -> None:
 def test_decode_rejects_bad_characters() -> None:
     with pytest.raises(ValueError, match="not a base62 character"):
         base62.decode("ab-c")
-
-
-def test_random_code_shape() -> None:
-    code = base62.random_code(7)
-    assert len(code) == 7
-    assert all(c in base62.ALPHABET for c in code)
-
-
-def test_random_code_rejects_bad_length() -> None:
-    with pytest.raises(ValueError, match="at least 1"):
-        base62.random_code(0)

@@ -1,37 +1,71 @@
 """HTTP layer: turns requests into service calls, and errors into status codes."""
 
+import asyncio
+import contextlib
+import logging
+import signal
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from functools import partial
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-from app import __version__, service
+from app import __version__, instances, service
 from app.cache import LinkCache
-from app.config import settings
-from app.db import Base, engine, get_session
+from app.config import DEFAULT_CODE_SECRET, settings
+from app.db import engine, get_session
+from app.ids import CodeCipher, LinkIds, RetiredError, Snowflake
 from app.limits import LimitBodySize
 from app.models import Link
 from app.ratelimit import RateLimit
 from app.redis_client import RedisGateway, get_redis
 from app.schemas import LinkCreate, LinkOut
 
+log = logging.getLogger(__name__)
+
+
+def give_up(snowflake: Snowflake) -> None:
+    """Our instance number may be someone else's now (app/instances.py). Make
+    no more IDs, and shut down as `docker stop` would: Docker starts the
+    instance again (restart: unless-stopped), and it leases a number afresh."""
+    snowflake.retire()
+    signal.raise_signal(signal.SIGTERM)
+
 
 @asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    # Creates the tables if they are missing. Fine for one instance, but it
-    # checks first and creates second, so several instances starting at the same
-    # moment on an empty database would race. Production apps run migrations
-    # (e.g. Alembic) once, before any instance starts.
-    Base.metadata.create_all(engine)
-    yield
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # The tables are not created here: migrations do that (`alembic upgrade
+    # head`), once, before any instance starts. Three instances creating
+    # tables at the same moment would race.
+    secret = settings.code_secret.get_secret_value()
+    if secret == DEFAULT_CODE_SECRET:
+        log.warning("CODE_SECRET is not set: anyone can work out the codes. Set it in production.")
+    # Hold a unique instance number for as long as this instance runs, and
+    # keep checking that we still do.
+    with instances.lease_instance_id(engine) as lease:
+        snowflake = Snowflake(lease.number)
+        app.state.ids = LinkIds(snowflake, CodeCipher(secret))
+        watchdog = asyncio.create_task(instances.watch(lease, partial(give_up, snowflake)))
+        try:
+            yield
+        finally:
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog
 
 
 app = FastAPI(title="URL Shortener", version=__version__, lifespan=lifespan)
 # Refuse oversized request bodies before reading them (NASA/JPL rule 3).
 app.add_middleware(LimitBodySize)
+# Behind Nginx, every request comes from Nginx's address. The real client's
+# address is in X-Forwarded-For, but anyone can write that header, so we read
+# it only on requests from a proxy listed in TRUSTED_PROXIES. After this,
+# request.client is the real client (the rate limiter counts per client).
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=settings.trusted_proxy_list)
 
 
 def get_cache(gateway: Annotated[RedisGateway | None, Depends(get_redis)]) -> LinkCache | None:
@@ -40,9 +74,15 @@ def get_cache(gateway: Annotated[RedisGateway | None, Depends(get_redis)]) -> Li
     return LinkCache(gateway, settings.cache_ttl_seconds, settings.cache_negative_ttl_seconds)
 
 
+def get_ids(request: Request) -> LinkIds:
+    ids: LinkIds = request.app.state.ids  # made in lifespan(), at startup
+    return ids
+
+
 # "Annotated" dependencies: declared once, reused by every route that needs them.
 SessionDep = Annotated[Session, Depends(get_session)]
 CacheDep = Annotated[LinkCache | None, Depends(get_cache)]
+IdsDep = Annotated[LinkIds, Depends(get_ids)]
 
 # Creating links is the expensive, abusable operation, so it gets a strict
 # limit. Reads (redirects and stats) share a generous one.
@@ -65,19 +105,21 @@ def to_out(link: Link) -> LinkOut:
 # every page should answer it. (Hidden from the API docs to avoid duplicates.)
 @app.head("/health", include_in_schema=False)
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health(ids: IdsDep) -> dict[str, str | int]:
+    # "instance" tells you which instance answered. Ask a few times through
+    # Nginx and watch the load balancer take turns.
+    return {"status": "ok", "instance": ids.snowflake.instance_id}
 
 
 @app.post("/api/links", status_code=status.HTTP_201_CREATED, dependencies=[limit_create])
-def create(body: LinkCreate, session: SessionDep, cache: CacheDep) -> LinkOut:
+def create(body: LinkCreate, session: SessionDep, cache: CacheDep, ids: IdsDep) -> LinkOut:
     try:
         link = service.create_link(
-            session, str(body.url), body.alias, body.expires_in_days, cache=cache
+            session, ids, str(body.url), body.alias, body.expires_in_days, cache=cache
         )
     except service.AliasTakenError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, "Alias is already taken") from exc
-    except service.CodeSpaceExhaustedError as exc:
+    except (service.IdClashError, RetiredError) as exc:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, "Could not allocate a code"
         ) from exc

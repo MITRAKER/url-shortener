@@ -48,6 +48,14 @@ def run(base_url: str) -> None:
     status, _, _ = request(base_url, "GET", "/health")
     expect(status == HTTPStatus.OK, f"GET /health returned {status}")
 
+    # A redirect the app builds itself (here: drop a trailing slash) leads
+    # back to the host and port the client used. Behind Nginx, that needs
+    # the Host header passed on with its port (nginx/default.conf).
+    status, headers, _ = request(base_url, "GET", "/health/")
+    expect(status == HTTPStatus.TEMPORARY_REDIRECT, f"GET /health/ returned {status}")
+    location = headers.get("location")
+    expect(location == f"{base_url.rstrip('/')}/health", f"/health/ redirected to {location}")
+
     status, _, body = request(base_url, "POST", "/api/links", {"url": TARGET})
     expect(status == HTTPStatus.CREATED, f"POST /api/links returned {status}: {body!r}")
     code = json.loads(body)["code"]
