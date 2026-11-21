@@ -1,6 +1,6 @@
 # Pinned by digest: the tag python:3.13-slim moves whenever Docker publishes a
 # rebuild, but a digest always names the very same image. Dependabot updates it.
-FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 
 # Python doesn't try to write .pyc files at run time (the app user can't write
 # the code directory anyway), and log lines appear immediately.

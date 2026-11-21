@@ -1,6 +1,6 @@
 # The packages the app imports directly. After changing this file, run
 # `make lock` to rebuild requirements.txt, the full lock file with hashes.
-fastapi==0.163.1
+fastapi==0.165.0
 uvicorn[standard]==0.54.0
 SQLAlchemy==2.1.9
 psycopg[binary]==3.3.9
