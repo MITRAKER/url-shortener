@@ -342,9 +342,14 @@ attack** hides malicious code in one of them.
   download for it. `pip install --require-hashes` refuses any file whose hash
   differs, so a package that was tampered with, or quietly re-uploaded, cannot
   get in. You edit the `.in` files and run `make lock`; Dependabot does the
-  same for updates.
-- **The base image pinned by digest:** `FROM python:3.13-slim@sha256:e48f…`.
-  `3.13-slim` is a moving name: Docker rebuilds it for every Python patch and
+  same for updates. The image also passes `--only-binary=:all:`: a package
+  with no wheel for the image's Python would be built from source, and pip
+  fetches the build tools for that without checking any hash. When the image
+  moved to Python 3.15, PyYAML 6.0.3 had no wheel for it and was quietly built
+  that way; now such a build fails, and the lock file moves to a version with
+  a wheel (PyYAML 6.0.4).
+- **The base image pinned by digest:** `FROM python:3.15-slim@sha256:65a6…`.
+  `3.15-slim` is a moving name: Docker rebuilds it for every Python patch and
   every Debian security fix. The digest is the hash of one exact image, so the
   same Dockerfile always starts from the same bytes. Dependabot proposes the
   new digest when the tag moves.

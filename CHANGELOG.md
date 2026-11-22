@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- The image runs Python 3.15 (it was 3.13), with FastAPI 0.165.0.
+- The image installs wheels only (`pip install --only-binary=:all:`). On
+  Python 3.15, PyYAML 6.0.3, which has no wheel for it, was built from
+  source, with build tools that pip fetched without checking any hash.
+  PyYAML is now 6.0.4, which has wheels for 3.15 on x86-64 and ARM.
+
 ### Fixed
 
 - The check of `REDIS_URL` at startup refused some valid URLs and passed some

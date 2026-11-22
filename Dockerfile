@@ -1,4 +1,4 @@
-# Pinned by digest: the tag python:3.13-slim moves whenever Docker publishes a
+# Pinned by digest: the tag python:3.15-slim moves whenever Docker publishes a
 # rebuild, but a digest always names the very same image. Dependabot updates it.
 FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 
@@ -23,8 +23,11 @@ WORKDIR /app
 # code changes then rebuild in seconds instead of reinstalling everything.
 # requirements.txt is a lock file: every package, even indirect ones, at an
 # exact version with its hash, so pip refuses anything that was tampered with.
+# --only-binary: wheels only. A package without a wheel for this Python would
+# be built from source, with build tools that pip fetches without any hash.
+# Now the build fails instead, and the lock file needs a version with a wheel.
 COPY requirements.txt .
-RUN pip install --no-cache-dir --require-hashes -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements.txt
 
 # The app, its database migrations (app/migrations) and their configuration.
 COPY alembic.ini .
