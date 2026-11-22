@@ -598,15 +598,20 @@ setter and `__setattr__`, `del self.x` its deleter and `__delattr__`, and
 `self(...)` runs `__call__`. So a setter that does `self.x = v` calls itself,
 though no line says `x(...)`. The checker follows these calls on `self`.
 "Nothing defines `x`" is a judgment: the checker looks for `x` in the class
-bodies, for `Class.x = v` anywhere in the module, and for code that sets it on
-`self` (`self.x = v`, `setattr(self, "x", v)`, `self.__dict__["x"] = v`,
-`vars(self).update(x=v)`). It compares names the way Python stores them:
-inside class `C`, `self.__x` is really `self._C__x` ("name mangling"), while
-the string in `setattr(self, "__x", v)` stays as written. When a class gets
-attributes from code it cannot read, it assumes `x` may be there and says
-nothing. That covers a metaclass, a base class it cannot trace to a `class`
-statement in the module (one from another module, such as `dict` or
-`Exception`, but also an alias such as `Shape = Base`: only `Base`, and
+bodies, for code anywhere in the module that sets it on a class
+(`Class.x = v`, `Outer.Inner.x = v`, `cls.x = v`, `setattr(Class, "x", v)`),
+and for code that sets it on `self` (`self.x = v`, `setattr(self, "x", v)`,
+`self.__dict__["x"] = v`, `vars(self).update(x=v)`). What code sets on a class
+is kept apart from what the class body binds: that line may run before or
+after any other, so it must not hide a method the class inherits, nor change
+what a name means inside the class body, which runs before the class even
+exists. It compares names the way Python stores them: inside class `C`, `__x`
+is really `_C__x` ("name mangling"), as an attribute (`self.__x`) and as a
+plain name, while the string in `setattr(self, "__x", v)` stays as written.
+When a class gets attributes from code it cannot read, it assumes `x` may be
+there and says nothing. That covers a metaclass, a base class it cannot trace
+to a `class` statement in the module (one from another module, such as `dict`
+or `Exception`, but also an alias such as `Shape = Base`: only `Base`, and
 `Outer.Inner` with `Inner` written in `Outer`'s own body, are traced), and
 names known only at run time (`setattr(self, key, v)`,
 `self.__dict__.update(values)`, or a whole new `self.__dict__`).
@@ -615,25 +620,32 @@ It is still an approximation, like every static analyzer for a dynamic
 language: it only knows the classes of one module, and it cannot see calls
 through other objects (`node.walk()`, `self.__class__(...)`), across modules,
 through `getattr`, `setattr` or metaclasses, through descriptors other than
-decorated methods, or through the special methods that operators and
-built-ins run (`len(self)`, `self == other`, `self[k]`, `with self`,
-`str(self)`). Nor does it follow Python's fallback to `__getattr__` when a
-property's getter raises AttributeError. It takes `super().m` to mean `m` in
-the bases of the class that calls it, though with multiple inheritance Python
-picks the next class in the instance's method resolution order (MRO). It can
-also be wrong the other way: `self` and `cls` stand for every subclass in the
-module, so a factory such as `Base.make()`, which runs `cls(...)`, is reported
-when a subclass's `__init__` calls it, though `cls` is `Base` there. Code like
-that needs a waiver, `# p10-waiver: R1 <reason>` (see below).
+decorated methods, or through the special methods that operators and built-ins
+run (`len(self)`, `self == other`, `self[k]`, `with self`, `str(self)`). Nor
+does it follow Python's fallback to `__getattr__` when a property's getter
+raises AttributeError. It takes `super().m` to mean `m` in the bases of the
+class that calls it, though with multiple inheritance Python picks the next
+class in the instance's method resolution order (MRO). And it ignores the
+order of statements: `Class.x = v` counts wherever it stands, even for a class
+of the same name defined after it. It can also be wrong the other way: `self`
+and `cls` stand for every subclass in the module, so a factory such as
+`Base.make()`, which runs `cls(...)`, is reported when a subclass's `__init__`
+calls it, though `cls` is `Base` there. Code like that needs a waiver,
+`# p10-waiver: R1 <reason>` (see below).
 
 Knowing what your tool can't see is part of using it well. The first version
 was simpler, and an independent review found seven kinds of recursion it
-missed; a later review found six more, through properties, special methods
-and subclasses. A third review found the opposite mistake: false alarms on
-classes whose attributes come from outside the module. A fourth and a fifth
-found gaps in both directions in how it decides what a class defines, such as
-taking `vars(self).update(x=v)` to set any name at all, or missing that
-Python stores `self.__x` as `self._C__x`. Each one is now a test case.
+missed; a later review found six more, through properties, special methods and
+subclasses. A third review found the opposite mistake: false alarms on classes
+whose attributes come from outside the module. A fourth and a fifth found gaps
+in both directions in how it decides what a class defines, such as taking
+`vars(self).update(x=v)` to set any name at all, or missing that Python stores
+`self.__x` as `self._C__x`. The fix for `Class.x = v` brought a bug of its
+own, which the sixth review found: it wrote the store into the class's own
+names, so a store on a subclass hid the method it inherits, and a name in a
+class body could mean a store that runs later. Each one is now a test case.
+For that last fix we also mutated each new branch of the checker, 13 mutants
+in all, and for every one a test failed.
 
 Rules sometimes need breaking. A waiver must name the rule and give a reason,
 right on the line, so a reviewer can judge it:

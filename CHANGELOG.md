@@ -29,6 +29,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `UPDATE`s go in chunks of 3, all in the batch's one transaction, and the
   worker touches the heartbeat after each step of a round: reading the
   checkpoint, reading the stream, moving the checkpoint, and each chunk.
+- The recursion check (R1) wrote `Class.x = v` into the class's own names.
+  So a store on a subclass, even under an `if` that never runs, hid the
+  method it inherits, and the recursion through it went unreported; and a
+  name in a class body could mean a store that runs only later. Such stores
+  are now kept apart, and they count on nested classes, through `cls.x = v`
+  and through `setattr(Class, "x", v)` too. A private plain name inside a
+  class is now looked up mangled (`__walk` is `_Walker__walk`), as Python
+  does. A base `Outer.Inner` is unknown when code may set `Outer.Inner` or
+  when `Outer` may inherit it. And `update(*a, *b)` and
+  `setdefault(key, **options)` no longer count as calls that must fail.
 - Documentation that said less than the whole truth. The tests drop every
   table in `TEST_DATABASE_URL`, not only the app's, so give them a database
   of their own (README). Nginx doesn't count a try whose kept-alive
