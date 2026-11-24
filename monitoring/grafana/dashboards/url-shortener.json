@@ -982,7 +982,7 @@
     {
       "type": "timeseries",
       "title": "Clicks recorded and counted",
-      "description": "stream: a redirect added the click to Redis. database: Redis couldn't take it (down, out of memory, or a million clicks already waiting), so it was counted at once in PostgreSQL. counted: what the click worker added to PostgreSQL.",
+      "description": "stream: a redirect added the click to Redis. database: Redis couldn't take it (down, too slow, skipped while the circuit is open, out of memory, or a million clicks already waiting), so it was counted at once in PostgreSQL. counted: what the click worker added to PostgreSQL.",
       "id": 17,
       "datasource": {
         "type": "prometheus",

@@ -342,9 +342,14 @@ attack** hides malicious code in one of them.
   download for it. `pip install --require-hashes` refuses any file whose hash
   differs, so a package that was tampered with, or quietly re-uploaded, cannot
   get in. You edit the `.in` files and run `make lock`; Dependabot does the
-  same for updates.
-- **The base image pinned by digest:** `FROM python:3.13-slim@sha256:e48f…`.
-  `3.13-slim` is a moving name: Docker rebuilds it for every Python patch and
+  same for updates. The image also passes `--only-binary=:all:`: a package
+  with no wheel for the image's Python would be built from source, and pip
+  fetches the build tools for that without checking any hash. When the image
+  moved to Python 3.15, PyYAML 6.0.3 had no wheel for it and was quietly built
+  that way; now such a build fails, and the lock file moves to a version with
+  a wheel (PyYAML 6.0.4).
+- **The base image pinned by digest:** `FROM python:3.15-slim@sha256:65a6…`.
+  `3.15-slim` is a moving name: Docker rebuilds it for every Python patch and
   every Debian security fix. The digest is the hash of one exact image, so the
   same Dockerfile always starts from the same bytes. Dependabot proposes the
   new digest when the tag moves.
@@ -598,15 +603,20 @@ setter and `__setattr__`, `del self.x` its deleter and `__delattr__`, and
 `self(...)` runs `__call__`. So a setter that does `self.x = v` calls itself,
 though no line says `x(...)`. The checker follows these calls on `self`.
 "Nothing defines `x`" is a judgment: the checker looks for `x` in the class
-bodies, for `Class.x = v` anywhere in the module, and for code that sets it on
-`self` (`self.x = v`, `setattr(self, "x", v)`, `self.__dict__["x"] = v`,
-`vars(self).update(x=v)`). It compares names the way Python stores them:
-inside class `C`, `self.__x` is really `self._C__x` ("name mangling"), while
-the string in `setattr(self, "__x", v)` stays as written. When a class gets
-attributes from code it cannot read, it assumes `x` may be there and says
-nothing. That covers a metaclass, a base class it cannot trace to a `class`
-statement in the module (one from another module, such as `dict` or
-`Exception`, but also an alias such as `Shape = Base`: only `Base`, and
+bodies, for code anywhere in the module that sets it on a class
+(`Class.x = v`, `Outer.Inner.x = v`, `cls.x = v`, `setattr(Class, "x", v)`),
+and for code that sets it on `self` (`self.x = v`, `setattr(self, "x", v)`,
+`self.__dict__["x"] = v`, `vars(self).update(x=v)`). What code sets on a class
+is kept apart from what the class body binds: that line may run before or
+after any other, so it must not hide a method the class inherits, nor change
+what a name means inside the class body, which runs before the class even
+exists. It compares names the way Python stores them: inside class `C`, `__x`
+is really `_C__x` ("name mangling"), as an attribute (`self.__x`) and as a
+plain name, while the string in `setattr(self, "__x", v)` stays as written.
+When a class gets attributes from code it cannot read, it assumes `x` may be
+there and says nothing. That covers a metaclass, a base class it cannot trace
+to a `class` statement in the module (one from another module, such as `dict`
+or `Exception`, but also an alias such as `Shape = Base`: only `Base`, and
 `Outer.Inner` with `Inner` written in `Outer`'s own body, are traced), and
 names known only at run time (`setattr(self, key, v)`,
 `self.__dict__.update(values)`, or a whole new `self.__dict__`).
@@ -615,25 +625,32 @@ It is still an approximation, like every static analyzer for a dynamic
 language: it only knows the classes of one module, and it cannot see calls
 through other objects (`node.walk()`, `self.__class__(...)`), across modules,
 through `getattr`, `setattr` or metaclasses, through descriptors other than
-decorated methods, or through the special methods that operators and
-built-ins run (`len(self)`, `self == other`, `self[k]`, `with self`,
-`str(self)`). Nor does it follow Python's fallback to `__getattr__` when a
-property's getter raises AttributeError. It takes `super().m` to mean `m` in
-the bases of the class that calls it, though with multiple inheritance Python
-picks the next class in the instance's method resolution order (MRO). It can
-also be wrong the other way: `self` and `cls` stand for every subclass in the
-module, so a factory such as `Base.make()`, which runs `cls(...)`, is reported
-when a subclass's `__init__` calls it, though `cls` is `Base` there. Code like
-that needs a waiver, `# p10-waiver: R1 <reason>` (see below).
+decorated methods, or through the special methods that operators and built-ins
+run (`len(self)`, `self == other`, `self[k]`, `with self`, `str(self)`). Nor
+does it follow Python's fallback to `__getattr__` when a property's getter
+raises AttributeError. It takes `super().m` to mean `m` in the bases of the
+class that calls it, though with multiple inheritance Python picks the next
+class in the instance's method resolution order (MRO). And it ignores the
+order of statements: `Class.x = v` counts wherever it stands, even for a class
+of the same name defined after it. It can also be wrong the other way: `self`
+and `cls` stand for every subclass in the module, so a factory such as
+`Base.make()`, which runs `cls(...)`, is reported when a subclass's `__init__`
+calls it, though `cls` is `Base` there. Code like that needs a waiver,
+`# p10-waiver: R1 <reason>` (see below).
 
 Knowing what your tool can't see is part of using it well. The first version
 was simpler, and an independent review found seven kinds of recursion it
-missed; a later review found six more, through properties, special methods
-and subclasses. A third review found the opposite mistake: false alarms on
-classes whose attributes come from outside the module. A fourth and a fifth
-found gaps in both directions in how it decides what a class defines, such as
-taking `vars(self).update(x=v)` to set any name at all, or missing that
-Python stores `self.__x` as `self._C__x`. Each one is now a test case.
+missed; a later review found six more, through properties, special methods and
+subclasses. A third review found the opposite mistake: false alarms on classes
+whose attributes come from outside the module. A fourth and a fifth found gaps
+in both directions in how it decides what a class defines, such as taking
+`vars(self).update(x=v)` to set any name at all, or missing that Python stores
+`self.__x` as `self._C__x`. The fix for `Class.x = v` brought a bug of its
+own, which the sixth review found: it wrote the store into the class's own
+names, so a store on a subclass hid the method it inherits, and a name in a
+class body could mean a store that runs later. Each one is now a test case.
+For that last fix we also mutated each new branch of the checker, 13 mutants
+in all, and for every one a test failed.
 
 Rules sometimes need breaking. A waiver must name the rule and give a reason,
 right on the line, so a reviewer can judge it:
@@ -721,7 +738,7 @@ GET /abc1234
 | `app/main.py` | Rate limits on the routes, the `X-Cache` header, the code-shape check |
 | `app/config.py` | `REDIS_URL`, checked when the app starts |
 | `docker-compose.yml` | A `redis` container with a 64 MB memory budget |
-| `tests/test_cache.py`, `test_ratelimit.py`, `test_redis_client.py`, `test_breaker.py`, `test_config.py` | 92 new tests |
+| `tests/test_cache.py`, `test_ratelimit.py`, `test_redis_client.py`, `test_breaker.py`, `test_config.py` | 116 new tests |
 | `tests/fakes.py` | `SilentServer`: a fake Redis that accepts connections and never answers |
 
 ### Part 1: Caching
@@ -954,6 +971,19 @@ report itself healthy, then answer every request that touched Redis with a
 500, because the URL was first parsed on the first request. Now `Settings`
 checks it at startup (`app/config.py`): building a connection pool parses the
 URL without connecting, and a malformed URL stops the app with a clear error.
+A review found a gap: the pool keeps the query arguments for the connections
+it makes later, without checking that a connection takes them. So a typo like
+`?dbb=1`, or a TLS option such as `ssl_cert_reqs` on `redis://` instead of
+`rediss://`, still passed, and then every request that touched Redis failed
+with a `TypeError`. The gateway does not catch it, because it is not a Redis
+error. Now the check also makes one connection object, which opens no socket,
+and refuses the URL if that fails. It also found that the URL can undo this
+lesson: redis-py lets the query arguments of a URL win over the arguments
+that `make_redis` passes, so `?socket_timeout=30` would let a hung Redis hold
+each request for 30 seconds, and `?retry_on_timeout=true` would retry the
+rate limiter's script after a timeout. The check refuses the arguments that
+the app sets itself (`APP_REDIS_OPTIONS`), and a test makes sure that the list
+keeps up with `make_redis`.
 The rule: check configuration when the process starts (**fail fast**), so a
 bad deploy never looks healthy.
 
@@ -965,14 +995,19 @@ of the URL. In `redis://:S3cret#Pass@redis:6379/0`, the `#` in the password is
 not percent-encoded, so the parser stops there and takes `S3cret` for the
 port. The error read "Port could not be cast to integer value as 'S3cret'".
 A `/` or a `?` does the same, and generated passwords often contain a `/`.
-If the text before the `#` is a number, the URL even parses, as that port and
-without the password, and the app would start without Redis. So the check
-also refuses a URL whose `@` is not in the host part.
-Now `_check_redis_url` catches redis-py's `ValueError` and raises its own,
-with a fixed message, `from None`: unlike lesson 2's `from exc`, this
-deliberately keeps the original error, which quotes the URL, out of the
-traceback. The message names the setting and the problem, never the value or
-any part of it.
+If the text before the `#` is a number, or holds an `@` (`P@ss#word`), the URL
+even parses, wrongly: redis-py uses the start of the password, or none of it,
+and may take the rest for the host (here `ss`). The app would start without
+Redis, and its log would show that host, a piece of the password. In such a
+URL, the `@` that ends the password lands after the host part. So the check
+also refuses any `#` (redis-py ignores what follows it, even in the query),
+an `@` in the path (only a socket path may hold one, and only without user
+info before it), and a query argument without `=`. An `@` in a query value is
+fine: `?password=p@ss` is a valid way to give the password.
+Now `_check_redis_url` catches redis-py's errors and raises its own, with a
+fixed message, `from None`: unlike lesson 2's `from exc`, this deliberately
+keeps the original error, which quotes the URL, out of the traceback. The
+message names the setting and the problem, never the value or any part of it.
 
 #### Making the cache visible
 
@@ -1333,16 +1368,27 @@ location @once_more {
 
 The proxy settings moved up to the `server` block, so both locations share
 them, all but one: the second chance makes a single try. So a `GET` or `HEAD`
-reaches the instances at most 3 times, 2 tries and then 1. After the fix, CI's
-sequence ran 11 times without a single 502. And to be sure the changing list
-was the trigger, we ran the old configuration with DNS asked only every 5
-minutes (`valid=300s`): 4 runs, no 502 either. Two lessons in one: the same
-failure can be harmless or not depending on *when* requests arrive, so test
-more than one timing; and a second chance is only for requests that are safe
-to repeat. (Is a `GET` safe? In HTTP's terms, yes. Ours counts a click, the
-one side effect we accept repeating. "No instance answered" doesn't mean no
-instance received the request: one may count the click and die before it
-answers. With 3 tries, a click can be counted up to 3 times.)
+usually reaches the instances at most 3 times, 2 tries and then 1. After the
+fix, CI's sequence ran 11 times without a single 502. And to be sure the
+changing list was the trigger, we ran the old configuration with DNS asked
+only every 5 minutes (`valid=300s`): 4 runs, no 502 either. Two lessons in
+one: the same failure can be harmless or not depending on *when* requests
+arrive, so test more than one timing; and a second chance is only for
+requests that are safe to repeat. (Is a `GET` safe? In HTTP's terms, yes.
+Ours counts a click, the one side effect we accept repeating. "No instance
+answered" doesn't mean no instance received the request: one may count the
+click and die before it answers. So a click can be counted once more for
+every instance that does that.)
+
+Why "usually"? Nginx doesn't count a try whose kept-alive connection breaks
+(see the race below): the instance may simply have closed it as idle, which
+says nothing about its health. But an instance that takes the request on
+such a connection and dies before answering breaks it the same way, so its
+try isn't counted either. What always holds is the round robin's own rule: in
+one pass, it picks each instance at most once. The location and `@once_more`
+are two passes, each a new request to the upstream with its own 10 seconds,
+so the hard limit is 6 tries with our 3 instances, and a click can be
+counted at most that often.
 
 A later review found that our first version of `@once_more` had no
 `proxy_next_upstream_tries` of its own. It inherited the `server` block's 2,
@@ -1398,18 +1444,19 @@ header, so it may be believed only when it comes from our own proxy.
 `tests/test_proxy.py` checks all of it: one bucket per client behind Nginx,
 the header ignored from anyone else, and a forged address in front ignored.
 
-Nginx should pass on one more header: `Host`, the name and port the client
+Nginx must pass on one more header: `Host`, the name and port the client
 asked for. Left to itself, Nginx would send the name its configuration gives
-the instances, `app_instances`. (Our redirects would survive that:
-`proxy_redirect`, on by default, rewrites a `Location` that starts with
-`http://app_instances/` to the address the client used. But the app would
-have the wrong idea of its own address.) `proxy_set_header Host $http_host;` passes on
-what the client sent, port included. The app uses it to build the few
-redirects that point back at itself: `/docs/` sends you to `/docs`, on the
-host and port you used. Our first version used the common `$host`, which
-drops the port: `http://localhost:8000/docs/` sent you to
-`http://localhost/docs`, on port 80, where the app isn't. The smoke test now
-checks one such redirect.
+the instances, `app_instances`, and the app would build its redirects with
+that name. (`proxy_redirect`, on by default, would turn a `Location` that
+starts with `http://app_instances/` into a bare path, and Nginx would then
+make it absolute again with the client's host name but its own port, 8080,
+not the 8000 the client used. Those redirects would break too.)
+`proxy_set_header Host $http_host;` passes on what the client sent, port
+included. The app uses it to build the few redirects that point back at
+itself: `/docs/` sends you to `/docs`, on the host and port you used. Our
+first version used the common `$host`, which drops the port:
+`http://localhost:8000/docs/` sent you to `http://localhost/docs`, on port
+80, where the app isn't. The smoke test now checks one such redirect.
 
 ### Part 2: Unique IDs without asking anyone
 
@@ -1789,11 +1836,11 @@ GET /abc1234 ─▶ Nginx ─▶ app ── XADD clicks:v1 * code abc1234 ──
 | `app/clicks.py` | `ClickStream.append()`: one `XADD`, unless a million clicks already wait (a small Lua script), through the Redis gateway |
 | `app/service.py` | `count_click()`: the stream, or PostgreSQL straight away when Redis can't take the click |
 | `app/worker.py` | The click worker: read a batch, add it up, count it with its checkpoint in one transaction; a watchdog that ends it when its loop is stuck |
-| `app/heartbeat.py` | The worker's health check: was its last round recent? |
+| `app/heartbeat.py` | The worker's health check: was its last heartbeat recent? |
 | `app/models.py`, migration `0003` | `click_checkpoints`: how far the worker got |
 | `docker-compose.yml` | The `worker` service; Redis keeps the stream on disk and never evicts it |
 | `scripts/check_clicks.py` | For CI: clicks wait while the worker is stopped, and survive a Redis restart |
-| `tests/test_clicks.py`, `tests/test_worker.py` | 39 tests: the redirect path, batching, every failure in between, two workers at once |
+| `tests/test_clicks.py`, `tests/test_worker.py` | 50 tests: the redirect path, batching, every failure in between, two workers at once |
 
 ### Part 1: Why take work off the request path?
 
@@ -1969,9 +2016,11 @@ turns, but the habit costs nothing.)
 
 A batch of 1000 clicks on one viral link becomes **one** `UPDATE ... + 1000`
 and **one** commit, instead of 1000 of each. That's **write coalescing**:
-batching turns a thousand row locks and WAL flushes into one. All the
-`UPDATE`s of a batch go to PostgreSQL in one go (an *executemany*, which
-psycopg 3 sends as a pipeline, without waiting for each answer).
+batching turns a thousand row locks and WAL flushes into one. A batch with
+many links still runs one `UPDATE` per link. They go to PostgreSQL in chunks
+of 3, all in the batch's one transaction: each chunk is an *executemany*,
+which psycopg 3 sends as a pipeline, without waiting for each answer. (Why
+chunks, and not all of them in one go: Part 4, on the worker's heartbeat.)
 
 #### Junk in the stream: poison messages
 
@@ -1987,7 +2036,8 @@ an entry raised `UnicodeDecodeError` before our checks ever saw it. That is
 not a Redis error, so the worker crashed, started again, read the same
 entry, and crashed again: a poison message after all. Now `make_redis()`
 decodes with `encoding_errors="replace"`: the bad bytes become U+FFFD (�),
-and the entry fails validation like any other junk.
+so a code holding them fails validation like any other junk. Anywhere else
+in the entry they do no harm: the worker reads only the code.
 
 #### The stream holds only what is left to count
 
@@ -2099,9 +2149,9 @@ with it.)
 
 So "exactly once" is a promise about the worker: it counts each click in
 the stream once, whatever fails. Around it, a click can still be counted
-twice: after an ambiguous failure, or when Nginx retries a redirect on
-another instance (lesson 4). And a crash of the whole machine can lose up to
-about a second of clicks (see "Redis restarts" above).
+more than once: when Nginx retries a redirect (lesson 4 gives the bound), or
+twice after an ambiguous failure. And a crash of the whole machine can lose
+up to about a second of clicks (see "Redis restarts" above).
 
 #### The worker: crash-only, and alive is not the same as working
 
@@ -2117,15 +2167,14 @@ about a second of clicks (see "Redis restarts" above).
 
 Restarting is the cure for the last case only, so whatever restarts the
 worker must ask "is it going round its loop?", not "is it making progress?".
-The worker touches a **heartbeat** file on every round, failed or not;
-`python -m app.heartbeat` checks that the last touch is less than 30 seconds
-old. Every wait inside a round has a limit (2 seconds for Redis; for
-PostgreSQL, 10 to get a connection and 5 per statement), with the one gap
-that lesson 2 names: a PostgreSQL that is alive but stuck holds a query on an
-open connection until it answers. So the heartbeat goes stale only when the
-loop is stuck, in our code or in that one wait. (After a restart, a new
-connection to a stuck PostgreSQL gives up after 5 seconds, so the worker's
-rounds fail, and go on, until the database answers again.)
+The worker touches a **heartbeat** file as every round begins, failed or
+not, and after each step of a round; `python -m app.heartbeat` checks that
+the last touch is less than 30 seconds old. Every wait inside a round has a
+limit (2 seconds for Redis; for PostgreSQL, 10 to get a connection and 5 per
+statement), with the one gap that lesson 2 names: a PostgreSQL that is alive
+but stuck holds a query on an open connection until it answers. (After a
+restart, a new connection to a stuck PostgreSQL gives up after 5 seconds, so
+the worker's rounds fail, and go on, until the database answers again.)
 
 That check is the container's health check, but a failing health check
 restarts nothing. Docker and Docker Compose only mark the container
@@ -2140,6 +2189,22 @@ restart policy does the rest, and crash-only design makes that safe.
 loop to stop, which a stuck loop never notices. A new worker gets 30 seconds
 for its first round: Docker restarts a container with its files, the old
 heartbeat included.
+
+A limit on each wait is not enough, though: a round holds many waits. It runs
+one `UPDATE` per link in its batch, up to 1,000, and our first version
+touched the heartbeat only as a round began. A review made every `UPDATE`
+take 4 seconds, within its limit of 5, and a batch of 8 links took 32
+seconds. The watchdog would end such a worker while it was getting on. Its
+batch was not committed, so the next worker would read the same batch, and
+end the same way, again and again. Now the worker sends the `UPDATE`s in
+chunks of 3, each done within 15 seconds (half of the 30), and touches the
+heartbeat after each chunk, as it does after reading the checkpoint, reading
+the stream and moving the checkpoint. The batch is still one transaction. On
+a database that answers, however slowly, no two touches are 30 seconds
+apart, so the heartbeat goes stale only when the loop is stuck: in our code,
+or in that one wait without a limit. The price is round trips: a batch of
+1,000 distinct links makes 334 instead of one, about 65 ms instead of 18 on
+a local PostgreSQL. Most batches hold far fewer links.
 
 **Progress** is a different signal: the backlog (`XLEN`) and the age of its
 oldest entry (its ID is a timestamp). That's a metric to graph and alert on,
@@ -2184,13 +2249,17 @@ heartbeat module takes 0.15 s.
   checkpoint and both insert one. A SQLAlchemy `before_flush` event inserts
   the row from "another worker" just before ours: one row, no error.
 - **Shapes and junk.** Replies of other shapes (RESP3's dict, a broken entry)
-  raise; entries that aren't clicks, bytes that aren't UTF-8 among them, are
+  raise; entries that aren't clicks, codes that aren't UTF-8 among them, are
   skipped without blocking the clicks behind them.
 - **A watchdog that can't end pytest.** The watchdog takes its clock and its
   exit function as arguments. The tests pass a fake clock, and an exit
   function that only notes the status: a heartbeat 30 seconds old ends the
   worker with status 1; rounds less than 30 seconds apart, and a new
   worker's first 30 seconds, don't.
+- **A slow database, in two seconds.** On PostgreSQL, a trigger makes every
+  `UPDATE` on `links` sleep 0.2 s (`pg_sleep`). The test shrinks the 30
+  seconds to 1, and a chunk to one `UPDATE`: the batch takes 1.6 s in all,
+  and the watchdog must leave the worker alone.
 - **The real stack, in CI.** The smoke test waits for its click to be counted;
   `scripts/check_clicks.py` checks clicks across a Redis restart.
 
@@ -2307,7 +2376,7 @@ for every click or two (Part 5).
 | `nginx/default.conf` | `/metrics` is refused from outside |
 | `scripts/check_metrics.py` | For CI: every target up, every rule working, every dashboard query valid |
 | `docs/BENCHMARKS.md` | Every step, measured with the same load test |
-| `tests/test_metrics.py`, `tests/test_monitoring.py` | 37 tests: each metric moves when it should; every query names metrics that exist |
+| `tests/test_metrics.py`, `tests/test_monitoring.py` | 39 tests: each metric moves when it should; every query names metrics that exist |
 
 ### Part 1: Metrics
 
@@ -2397,7 +2466,9 @@ So every label value comes from a short, fixed list:
   with their paths, a fixed list the middleware is given at startup. A
   request that matched no route is `unmatched`: a 404 for `/no/such/page`,
   the router's redirect from `/health/` to `/health`, or a request refused
-  before it reaches the router, such as a 413 for a body over 16 KB.
+  before it reaches the router, such as a 413 for a `Content-Length` over
+  16 KB. (A chunked body announces no size, so it is refused only once it
+  passes 16 KB, inside its route: that 413 keeps the route's label.)
 - **method**: one of the seven known methods, or `other`. Anyone can send a
   method called `FOOBAR`.
 - **status**: in practice, a dozen codes.
@@ -2910,15 +2981,17 @@ runs. And don't believe a difference you haven't seen twice.
 
 - **Each metric moves when it should** (`tests/test_metrics.py`): a 404 on a
   short code is counted under `/{code}`, the API docs under their paths, an
-  unknown path and a redirect that drops a trailing slash under `unmatched`,
-  a crash as a 500, a strange method as `other`; a cache hit, a click through
-  the stream or the database, a 429, three Redis errors and then a circuit
-  open, which reads closed again once its cool-down is over, without a call;
-  the pool collector, and the backlog with a click added 5 seconds in the
-  past (a stream ID chosen by the test), whose collector is registered
-  without a call to Redis. An instance's own page shows the backlog, and
-  comes quickly without it when Redis refuses or never answers; a scrape
-  held up on purpose holds up no request, and takes none of their threads.
+  unknown path and a redirect that drops a trailing slash under `unmatched`, a
+  413 under `unmatched` when the body announced its size and under its route
+  when it came in chunks, a crash as a 500, a strange method as `other`; a
+  cache hit, a click through the stream or the database, a 429, three Redis
+  errors and then a circuit open, which reads closed again once its cool-down
+  is over, without a call; the pool collector, and the backlog with a click
+  added 5 seconds in the past (a stream ID chosen by the test), whose
+  collector is registered without a call to Redis. An instance's own page
+  shows the backlog, and comes quickly without it when Redis refuses or never
+  answers; a scrape held up on purpose holds up no request, and takes none of
+  their threads.
 - **The worker's metrics**: batches, clicks counted, entries skipped (once,
   even when a failed batch is read again), errors by system, and its own
   `/metrics` page, served on a free port. A fake stop event records every

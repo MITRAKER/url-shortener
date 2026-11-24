@@ -47,7 +47,9 @@ __all__ = ["CONTENT_TYPE_LATEST", "REGISTRY", "generate_latest"]
 METRICS_PATH: Final = "/metrics"
 # Requests that matched no route share one label: a 404 for /no/such/page,
 # the redirect from /health/ to /health, which the router sends itself, and
-# a request refused before routing (a 413 for a body over 16 KB, app/limits.py).
+# a request refused before routing: a 413 for a Content-Length over 16 KB
+# (app/limits.py). A chunked body announces no size, so it is refused only
+# once it passes 16 KB, inside its route: that 413 keeps the route's label.
 UNMATCHED: Final = "unmatched"
 KNOWN_METHODS: Final = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
 

@@ -390,6 +390,79 @@ def test_clean_code_passes() -> None:
             def step(self):
                 return self.run()
         """,
+        # a store on a subclass, even one that may never run, hides nothing it
+        # inherits: `self.read()` may still be `Reader.read`, and `Leaf(...)`
+        # still runs `Base.__init__`
+        """
+        import sys
+
+        class Reader:
+            def read(self):
+                return self.read_chunk()
+
+        class SocketReader(Reader):
+            def read_chunk(self):
+                return self.read()
+
+        def _windows_read(self):
+            return b""
+
+        if sys.platform == "win32":
+            SocketReader.read = _windows_read
+        """,
+        """
+        class Base:
+            def __init__(self, depth):
+                self.child = Leaf(depth + 1)
+
+        class Leaf(Base):
+            pass
+
+        Leaf.__init__ = Base.__init__
+        """,
+        # `Class.x = v` runs once the class exists, after its body: in the body,
+        # `step` is the module's function, and `Base` the module's class
+        """
+        def build(n):
+            class Node:
+                value = step(n)
+
+            Node.step = None
+            return Node
+
+        def step(n):
+            return build(n - 1)
+        """,
+        """
+        class Base:
+            sides = 0
+
+        class Shapes:
+            class Square(Base):
+                def __getattr__(self, name):
+                    return self.side
+
+        Shapes.Base = Base
+        """,
+        # inside a class, Python reads a private name `__walk` as `_Walker__walk`
+        # wherever it looks it up: here, in the module
+        """
+        def _Walker__walk(n):
+            return Walker.go(n)
+
+        class Walker:
+            @staticmethod
+            def go(n):
+                return __walk(n - 1)
+        """,
+        """
+        class Walker:
+            def walk(self, n):
+                def __visit(m):
+                    return __visit(m - 1)
+
+                return __visit(n)
+        """,
         # async functions
         """
         async def countdown(n):
@@ -734,6 +807,89 @@ def test_recursion_is_rejected(source: str) -> None:
             @classmethod
             def register(cls, name):
                 cls.last = name
+        """,
+        # an attribute set on a class from outside its body: in another class's
+        # body, on a nested class, by a classmethod, or with setattr
+        """
+        class Proxy:
+            def __getattr__(self, name):
+                return self.target
+
+        class Registry:
+            Proxy.target = "registered"
+
+        Registry.Proxy = Proxy
+        """,
+        """
+        class Shapes:
+            class Square:
+                def __getattr__(self, name):
+                    return self.side
+
+        Shapes.Square.side = 4
+
+        class Configured:
+            @classmethod
+            def configure(cls, target):
+                cls.target = target
+
+            def __getattr__(self, name):
+                return self.target
+
+        class Patched:
+            def __getattr__(self, name):
+                return self.target
+
+        setattr(Patched, "target", None)
+        """,
+        # `update(*a, *b)` may pass one mapping in all, and `**options` may be
+        # empty: neither call has to fail
+        """
+        DEFAULTS = ({"target": None},)
+
+        class Merged:
+            def __init__(self, *overrides):
+                self.__dict__.update(*DEFAULTS, *overrides)
+
+            def __getattr__(self, name):
+                return self.target
+
+        class Defaulted:
+            def __init__(self, **options):
+                self.__dict__.setdefault("target", **options)
+
+            def __getattr__(self, name):
+                return self.target
+        """,
+        # inside `Walker`, `__visit` is `_Walker__visit`, which nothing binds:
+        # a NameError, not the module's `__visit`
+        """
+        def __visit(n):
+            return Walker.walk(None, n)
+
+        class Walker:
+            def walk(self, n):
+                return __visit(n - 1)
+        """,
+        # a base `Outer.Inner` where one `Outer` may inherit `Inner` is unknown
+        """
+        from typing import TYPE_CHECKING
+
+        class _Runtime:
+            class Base:
+                target = "real"
+
+        if TYPE_CHECKING:
+            class Shapes:
+                class Base:
+                    pass
+        else:
+            class Shapes(_Runtime):
+                pass
+
+        class Proxy(Shapes.Base):
+            def __getattr__(self, name):
+                return self.target
         """,
         # replacing a method on its class does not call it
         """

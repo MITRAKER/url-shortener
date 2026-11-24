@@ -28,6 +28,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from itertools import batched
 from pathlib import Path
 from typing import Final
 from wsgiref.simple_server import WSGIServer
@@ -41,7 +42,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app import metrics
 from app.clicks import STREAM
 from app.config import settings
-from app.db import SessionLocal
+from app.db import STATEMENT_TIMEOUT_MS, SessionLocal
 from app.heartbeat import ALIVE_SECONDS, HEARTBEAT, is_alive
 from app.models import ClickCheckpoint, Link
 from app.redis_client import make_redis
@@ -72,6 +73,13 @@ ADD_CLICKS: Final = (
     .where(Link.code == bindparam("for_code"))
     .values(clicks=Link.clicks + bindparam("added"))
 )
+# How many of those UPDATEs go to PostgreSQL together. The worker reports a
+# step after each chunk, so that a batch of many links on a slow database
+# doesn't look like a stuck loop. On a database that answers, each UPDATE
+# ends within STATEMENT_TIMEOUT_MS (lock waits included), so a chunk ends
+# within half of ALIVE_SECONDS (3 UPDATEs, 15 s). That leaves room for the
+# rollback and the pause before a retry that follow a chunk that failed.
+CHUNK_SIZE: Final = int(ALIVE_SECONDS * 1000 / 2 // STATEMENT_TIMEOUT_MS)
 
 
 def parse_entries(reply: object) -> list[tuple[str, str | None]]:
@@ -156,20 +164,25 @@ class ClickWorker:
                 session.rollback()
         return START
 
-    def read(self) -> Batch | None:
+    def read(self, on_step: Callable[[], object] = lambda: None) -> Batch | None:
         """The next entries after the checkpoint, up to the batch size, or
-        None if no click arrived within `wait_ms`."""
+        None if no click arrived within `wait_ms`. Calls `on_step` once it
+        has the checkpoint, and again once it has the entries."""
         after = self.checkpoint()
+        on_step()
         reply = self._redis.xread({STREAM: after}, count=self.batch_size, block=self._wait_ms)
         entries = parse_entries(reply)
         if not entries:
             return None
+        on_step()
         clicks = Counter(code for _, code in entries if code is not None)
         return Batch(after, entries[-1][0], dict(clicks), len(entries))
 
-    def count(self, batch: Batch) -> bool:
+    def count(self, batch: Batch, on_step: Callable[[], object] = lambda: None) -> bool:
         """Add the batch's clicks and move the checkpoint past it, in one
-        transaction. False if another worker counted these clicks first."""
+        transaction. False if another worker counted these clicks first.
+        Calls `on_step` once the checkpoint has moved, and after each chunk
+        of UPDATEs (CHUNK_SIZE)."""
         with self._sessions() as session:
             moved = session.connection().execute(
                 update(ClickCheckpoint)
@@ -181,15 +194,15 @@ class ClickWorker:
                 metrics.BATCHES.labels("already_counted").inc()
                 log.warning("another worker counted the clicks after %s first", batch.after)
                 return False
-            if batch.clicks:
-                # Rows always locked in the same order (sorted by code): the
-                # habit that keeps transactions locking several rows from
-                # deadlocking each other. (Here the checkpoint's row lock,
-                # taken first, already makes two workers take turns.)
-                session.connection().execute(
-                    ADD_CLICKS,
-                    [{"for_code": code, "added": n} for code, n in sorted(batch.clicks.items())],
-                )
+            on_step()
+            # Rows always locked in the same order (sorted by code): the
+            # habit that keeps transactions locking several rows from
+            # deadlocking each other. (Here the checkpoint's row lock,
+            # taken first, already makes two workers take turns.)
+            rows = [{"for_code": code, "added": n} for code, n in sorted(batch.clicks.items())]
+            for chunk in batched(rows, CHUNK_SIZE, strict=False):  # the last may be shorter
+                session.connection().execute(ADD_CLICKS, chunk)
+                on_step()
             session.commit()
         # Counted only now that the checkpoint is past these entries, junk
         # included: a batch that failed is read again, and counted again.
@@ -211,25 +224,33 @@ class ClickWorker:
         except redis.RedisError as exc:
             log.warning("could not remove counted clicks from the stream: %s", exc)
 
-    def process_batch(self) -> int:
-        """Read and count one batch. Returns how many entries it counted."""
-        batch = self.read()
+    def process_batch(self, on_step: Callable[[], object] = lambda: None) -> int:
+        """Read and count one batch. Returns how many entries it counted.
+
+        Calls `on_step` after each step of the way: reading the checkpoint,
+        reading the stream, moving the checkpoint, and each chunk of UPDATEs.
+        A step waits a few times at most, and each wait has a limit, so on a
+        database that answers, however slowly, no step takes ALIVE_SECONDS.
+        (The worker holds one connection at a time: it never waits for the
+        pool.)"""
+        batch = self.read(on_step)
         if batch is None:
             return 0
         with metrics.BATCH_DURATION.time():
-            counted = self.count(batch)
+            counted = self.count(batch, on_step)
         return batch.size if counted else 0
 
 
 def run(worker: ClickWorker, stop: threading.Event, heartbeat: Path) -> None:
-    """Count batches until `stop` is set, touching `heartbeat` on every round
-    (the health check and the watchdog read it, see app/heartbeat.py). Errors
-    from Redis or PostgreSQL are logged, then retried. Any other error is a
-    bug: it ends the process, and Docker starts a new one."""
+    """Count batches until `stop` is set, touching `heartbeat` as every round
+    begins and after each step of it (the health check and the watchdog read
+    it, see app/heartbeat.py). Errors from Redis or PostgreSQL are logged,
+    then retried. Any other error is a bug: it ends the process, and Docker
+    starts a new one."""
     while not stop.is_set():  # p10-waiver: R2 runs until the process is told to stop
         heartbeat.touch()
         try:
-            counted = worker.process_batch()
+            counted = worker.process_batch(heartbeat.touch)
         except (redis.RedisError, SQLAlchemyError) as exc:
             # Nothing is lost: whatever wasn't counted is still in the stream.
             system = "redis" if isinstance(exc, redis.RedisError) else "database"
@@ -264,8 +285,8 @@ class Watchdog:
     the process exits.
 
     It reads the heartbeat, as the health check does, so a worker that goes
-    round its loop while PostgreSQL or Redis is down is not stuck: restarting
-    it wouldn't help."""
+    round its loop while PostgreSQL or Redis is down, or works through a long
+    batch on a slow database, is not stuck: restarting it wouldn't help."""
 
     def __init__(
         self,

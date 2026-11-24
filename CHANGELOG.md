@@ -7,6 +7,56 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- The image runs Python 3.15 (it was 3.13), with FastAPI 0.165.0.
+- The image installs wheels only (`pip install --only-binary=:all:`). On
+  Python 3.15, PyYAML 6.0.3, which has no wheel for it, was built from
+  source, with build tools that pip fetched without checking any hash.
+  PyYAML is now 6.0.4, which has wheels for 3.15 on x86-64 and ARM.
+
+### Fixed
+
+- The check of `REDIS_URL` at startup refused some valid URLs and passed some
+  broken ones. It now refuses a URL that redis-py would read wrongly: an
+  unencoded `#`, `/` or `?` in the password can make it use the wrong
+  password, host or port, so the check refuses any `#`, an `@` in the path
+  (except in a unix socket path without user info), and a query argument
+  without `=`. It accepts an `@` in a query value (`?password=p@ss`) and in a
+  socket path. It also refuses a query argument that a connection does not
+  take or whose value it refuses (`?dbb=1`, a TLS option on `redis://`),
+  which used to fail every request that touched Redis, and one that would
+  override what the app sets itself, such as `?socket_timeout=30` or
+  `?retry_on_timeout=true`: redis-py lets the URL win, which would undo the
+  limits that keep a slow Redis from slowing down the app.
+- The click worker's watchdog could end a worker that was making progress.
+  The worker touched its heartbeat once per round, but a round runs one
+  `UPDATE` per link in a batch of up to 1,000, so a database that answers
+  each one within its 5 s limit could still keep a round past 30 seconds.
+  The next worker then read the same batch and was ended again. Now the
+  `UPDATE`s go in chunks of 3, all in the batch's one transaction, and the
+  worker touches the heartbeat after each step of a round: reading the
+  checkpoint, reading the stream, moving the checkpoint, and each chunk.
+- The recursion check (R1) wrote `Class.x = v` into the class's own names.
+  So a store on a subclass, even under an `if` that never runs, hid the
+  method it inherits, and the recursion through it went unreported; and a
+  name in a class body could mean a store that runs only later. Such stores
+  are now kept apart, and they count on nested classes, through `cls.x = v`
+  and through `setattr(Class, "x", v)` too. A private plain name inside a
+  class is now looked up mangled (`__walk` is `_Walker__walk`), as Python
+  does. A base `Outer.Inner` is unknown when code may set `Outer.Inner` or
+  when `Outer` may inherit it. And `update(*a, *b)` and
+  `setdefault(key, **options)` no longer count as calls that must fail.
+- Documentation that said less than the whole truth. The tests drop every
+  table in `TEST_DATABASE_URL`, not only the app's, so give them a database
+  of their own (README). Nginx doesn't count a try whose kept-alive
+  connection breaks, so a redirect can reach the instances up to once per
+  instance in each of its two passes, not only 3 times (lesson 4,
+  `nginx/default.conf`). Without `proxy_set_header Host`, the app's own
+  redirects would break (lesson 4). A 413 for a chunked body keeps its
+  route's label (lesson 6, `app/metrics.py`), and the dashboard's clicks
+  panel names every reason a click goes straight to PostgreSQL.
+
 ## [0.5.0] - 2026-11-19
 
 ### Added
@@ -79,10 +129,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `0003`) in the same transaction as the counts, and moves it with a
   compare-and-set, so a crash of the worker at any moment, or a second
   worker, can't count a click twice or lose one. Counted clicks are then
-  removed from the stream. Around the stream, a click can still be counted twice: when Nginx
-  retries a redirect, or when the click reached Redis but the reply didn't
-  (a timeout, or a broken connection, which the client retries once). A
-  crash of the whole machine can lose up to about a second of clicks.
+  removed from the stream. Around the stream, a click can still be counted
+  more than once: when Nginx retries a redirect (lesson 4 in LEARNING.md
+  gives the bound), or twice when the click reached Redis but the reply
+  didn't (a timeout, or a broken connection, which the client retries
+  once). A crash of the whole machine can lose up to about a second of
+  clicks.
 - When Redis can't take a click (not configured, down, or full), it is
   counted in PostgreSQL at once, as before. So is a click that finds a
   million clicks already waiting: the stream stops there (about 21 MB), so
@@ -110,8 +162,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - The app asks redis-py for the RESP2 protocol by name, so a new default in
   a later redis-py can't change the shape of the replies it reads.
 - The app's Redis clients decode bytes that aren't UTF-8 as U+FFFD instead
-  of raising an error, so the worker skips a stream entry holding such
-  bytes as junk, like any other entry that isn't a click.
+  of raising an error, so such bytes no longer stop the worker: an entry
+  whose code isn't valid UTF-8 fails validation and is skipped as junk,
+  like any other entry that isn't a click on a valid code.
 
 ## [0.3.0] - 2026-11-18
 
@@ -123,9 +176,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   (2 tries at most), and leaves it out for 10 seconds after 3 failures. A
   `GET` or `HEAD` that ends in a 502 made by Nginx itself (no instance
   answered: one closed the connection mid-answer, or the list of instances
-  changed while it waited) is tried once more, so it reaches the instances
-  at most 3 times, and a click can be counted up to 3 times when instances
-  die mid-answer. A request that times out gets a 504 and no further try.
+  changed while it waited) is tried once more, so it usually reaches the
+  instances at most 3 times. Nginx doesn't count a try whose kept-alive
+  connection breaks, so the hard limit is each instance once in each of
+  the two passes: 6 times with 3 instances. A click is counted once more
+  for each instance that dies mid-answer. A request whose last try times
+  out gets a 504 and no second chance.
   Nginx keeps connections to the instances open, and refuses request bodies
   over 16 KB.
 - Snowflake IDs, made by each instance without asking anyone: 31 bits of

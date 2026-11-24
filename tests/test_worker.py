@@ -4,7 +4,9 @@ into PostgreSQL, each one exactly once, whatever fails in between."""
 import os
 import signal
 import threading
+import time
 import urllib.request
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -17,11 +19,12 @@ from app import heartbeat as heartbeat_module
 from app import worker as worker_module
 from app.clicks import STREAM
 from app.config import settings
-from app.db import Base, SessionLocal, engine
+from app.db import STATEMENT_TIMEOUT_MS, Base, SessionLocal, engine
 from app.heartbeat import ALIVE_SECONDS, HEARTBEAT, is_alive
 from app.metrics import WORKER_REGISTRY
 from app.models import ClickCheckpoint, Link
 from app.worker import (
+    CHUNK_SIZE,
     LINGER_SECONDS,
     START,
     Batch,
@@ -37,6 +40,9 @@ from app.worker import (
 from tests.fakes import FakeClock
 
 FIRST, SECOND, THIRD = "first", "second", "third"
+needs_postgres = pytest.mark.skipif(
+    engine.dialect.name != "postgresql", reason="needs PostgreSQL (set TEST_DATABASE_URL)"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +52,14 @@ def links() -> None:
     Base.metadata.create_all(engine)
     with SessionLocal() as session:
         for number, code in enumerate([FIRST, SECOND, THIRD], start=1):
+            session.add(Link(id=number, code=code, target_url="https://example.com/"))
+        session.commit()
+
+
+def more_links(*codes: str) -> None:
+    """Links beside the three that every test has, none clicked yet."""
+    with SessionLocal() as session:
+        for number, code in enumerate(codes, start=4):
             session.add(Link(id=number, code=code, target_url="https://example.com/"))
         session.commit()
 
@@ -111,6 +125,42 @@ def test_a_batch_holds_at_most_batch_size_entries(redis_client: redis.Redis) -> 
     click(redis_client, FIRST, FIRST, FIRST, FIRST, FIRST)
     assert [worker.process_batch() for _ in range(4)] == [2, 2, 1, 0]
     assert clicks()[FIRST] == 5
+
+
+def test_the_updates_go_in_chunks_with_a_step_after_each(
+    redis_client: redis.Redis, click_worker: ClickWorker
+) -> None:
+    """A batch runs one UPDATE per link, up to a thousand, and a slow database
+    may take up to 5 s for each. So they go in chunks, still sorted by code,
+    and the worker reports a step after each chunk: run() touches the
+    heartbeat then, so a long batch doesn't look like a stuck loop."""
+    # On a database that answers, a chunk ends within half of ALIVE_SECONDS.
+    assert 0 < CHUNK_SIZE * STATEMENT_TIMEOUT_MS / 1000 <= ALIVE_SECONDS / 2
+    codes = [f"link{number}" for number in range(2 * CHUNK_SIZE + 1)]  # 3 chunks
+    more_links(*codes)
+    click(redis_client, *reversed(codes))
+    chunks: list[list[str]] = []  # the codes of each chunk sent to the database
+    steps: list[int] = []  # how many chunks had been sent at each step
+
+    def record(
+        _conn: object,
+        statement: object,
+        multiparams: Sequence[Mapping[str, object]],
+        params: Mapping[str, object],
+        _options: object,
+    ) -> None:
+        if statement is worker_module.ADD_CLICKS:
+            chunks.append([str(row["for_code"]) for row in multiparams or [params]])
+
+    event.listen(engine, "before_execute", record)
+    try:
+        assert click_worker.process_batch(lambda: steps.append(len(chunks))) == len(codes)
+    finally:
+        event.remove(engine, "before_execute", record)
+    assert chunks == [sorted(codes)[n : n + CHUNK_SIZE] for n in range(0, len(codes), CHUNK_SIZE)]
+    # The checkpoint read, the stream read, the checkpoint moved, each chunk.
+    assert steps == [0, 0, 0, 1, 2, 3]
+    assert all(clicks()[code] == 1 for code in codes)
 
 
 def test_entries_that_are_not_clicks_are_skipped(
@@ -217,6 +267,40 @@ def test_a_batch_read_again_skips_its_junk_only_once(
     assert click_worker.process_batch() == 2
     assert metric("click_worker_entries_skipped_total") == before + 1
     assert caplog.text.count("not clicks on a valid code") == 1
+
+
+# The steps of a batch of three links, with a chunk per link: the checkpoint
+# read, the stream read, the checkpoint moved, then the three chunks.
+@pytest.mark.parametrize(
+    "last_step",
+    [3, 4, 5, 6],
+    ids=["checkpoint moved", "first chunk", "second chunk", "last chunk"],
+)
+def test_the_chunks_of_a_batch_are_one_transaction(
+    redis_client: redis.Redis,
+    click_worker: ClickWorker,
+    monkeypatch: pytest.MonkeyPatch,
+    last_step: int,
+) -> None:
+    """A worker that dies after any step of count() has counted nothing:
+    the checkpoint and all the chunks are committed together, or not at all.
+    (A commit slipped in just before a step fails the case that dies after
+    that step; one just after it fails the next case.)"""
+    monkeypatch.setattr(worker_module, "CHUNK_SIZE", 1)  # a chunk per link
+    click(redis_client, FIRST, SECOND, THIRD)
+    steps: list[None] = []
+
+    def die_after_the_last_step() -> None:
+        steps.append(None)
+        if len(steps) == last_step:
+            raise RuntimeError("the worker died")
+
+    with pytest.raises(RuntimeError, match="died"):
+        click_worker.process_batch(die_after_the_last_step)
+    assert checkpoint() == START
+    assert clicks() == {FIRST: 0, SECOND: 0, THIRD: 0}
+    assert click_worker.process_batch() == 3  # a new worker: the same clicks, once
+    assert clicks() == {FIRST: 1, SECOND: 1, THIRD: 1}
 
 
 def test_a_crash_after_the_commit_counts_nothing_twice(
@@ -341,7 +425,7 @@ def test_run_carries_on_after_errors_until_stopped(
         3,
     ]
 
-    def process_batch() -> int:
+    def process_batch(_on_step: Callable[[], object]) -> int:
         outcome = outcomes.pop(0)
         if not outcomes:
             stop.set()  # as SIGTERM would
@@ -380,7 +464,7 @@ def test_the_worker_lingers_after_a_batch_that_was_not_full(
     stop = RecordingStop()
     results = [click_worker.batch_size, click_worker.batch_size, 3]
 
-    def process_batch() -> int:
+    def process_batch(_on_step: Callable[[], object]) -> int:
         result = results.pop(0)
         if not results:
             stop.set()
@@ -394,12 +478,35 @@ def test_the_worker_lingers_after_a_batch_that_was_not_full(
 def test_any_other_error_is_a_bug_and_ends_the_worker(
     click_worker: ClickWorker, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    def bug() -> int:
+    def bug(_on_step: Callable[[], object]) -> int:
         raise ValueError("a bug")
 
     monkeypatch.setattr(click_worker, "process_batch", bug)
     with pytest.raises(ValueError, match="a bug"):
         run(click_worker, threading.Event(), tmp_path / "alive")
+
+
+def test_run_touches_the_heartbeat_after_each_step_too(
+    click_worker: ClickWorker, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On a slow database, one round can take longer than ALIVE_SECONDS. So
+    run() hands the worker a way to touch the heartbeat after each step of
+    the round, not only as the round begins."""
+    heartbeat = tmp_path / "alive"
+    stop = threading.Event()
+    alive_before_the_step: list[bool] = []
+
+    def process_batch(on_step: Callable[[], object]) -> int:
+        beat(heartbeat, 0.0)  # as if the round had begun long ago
+        alive_before_the_step.append(is_alive(heartbeat))
+        on_step()
+        stop.set()
+        return 1
+
+    monkeypatch.setattr(click_worker, "process_batch", process_batch)
+    run(click_worker, stop, heartbeat)
+    assert alive_before_the_step == [False]
+    assert is_alive(heartbeat)
 
 
 def test_a_stopped_worker_does_no_more_rounds(click_worker: ClickWorker, tmp_path: Path) -> None:
@@ -506,6 +613,68 @@ def test_a_worker_that_goes_round_its_loop_is_not_stuck(tmp_path: Path) -> None:
         beat(heartbeat, clock())
         clock.advance(ALIVE_SECONDS - 1)
         assert not watchdog.is_stuck()
+
+
+@pytest.fixture
+def slow_updates() -> Iterator[None]:
+    """Every UPDATE on links takes 0.2 s (a trigger sleeps): a database that
+    is slow, but answers. PostgreSQL only. (`links`, autouse, runs first.)"""
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE OR REPLACE FUNCTION slow_update() RETURNS trigger LANGUAGE plpgsql"
+                " AS $$ BEGIN PERFORM pg_sleep(0.2); RETURN NEW; END $$"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TRIGGER slow BEFORE UPDATE ON links"
+                " FOR EACH ROW EXECUTE FUNCTION slow_update()"
+            )
+        )
+    yield
+    with engine.begin() as connection:
+        connection.execute(text("DROP FUNCTION slow_update() CASCADE"))  # and its trigger
+
+
+@needs_postgres
+@pytest.mark.usefixtures("slow_updates")
+def test_a_slow_database_that_answers_is_not_a_stuck_loop(
+    redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every UPDATE takes 0.2 s, far within its limit, and the batch takes
+    longer than ALIVE_SECONDS in all. The worker is getting on, a chunk at a
+    time, so the watchdog must leave it alone. Shrunk to run in about two
+    seconds: ALIVE_SECONDS is 1 s, and a chunk is one UPDATE."""
+    for module in (heartbeat_module, worker_module):
+        monkeypatch.setattr(module, "ALIVE_SECONDS", 1.0)
+    monkeypatch.setattr(worker_module, "WATCHDOG_SECONDS", 0.05)
+    monkeypatch.setattr(worker_module, "CHUNK_SIZE", 1)
+    codes = [f"slow{number}" for number in range(8)]  # 8 UPDATEs: 1.6 s
+    more_links(*codes)
+    click(redis_client, *codes)
+    worker = ClickWorker(redis_client, SessionLocal, wait_ms=None)
+    stop = threading.Event()
+    count_one_batch = worker.process_batch
+
+    def count_one_batch_then_stop(on_step: Callable[[], object]) -> int:
+        try:
+            return count_one_batch(on_step)
+        finally:
+            stop.set()  # run() and the watchdog end here
+
+    monkeypatch.setattr(worker, "process_batch", count_one_batch_then_stop)
+    exits: list[int] = []
+    watchdog = Watchdog(tmp_path / "alive", exit_process=exits.append)
+    thread = threading.Thread(target=watchdog.watch, args=(stop,), daemon=True)
+    thread.start()
+    started = time.monotonic()
+    run(worker, stop, tmp_path / "alive")
+    took = time.monotonic() - started
+    thread.join(timeout=5)
+    assert took > 1.0  # longer than ALIVE_SECONDS: one heartbeat a round would be late
+    assert exits == []  # but the watchdog never took the loop for stuck
+    assert all(clicks()[code] == 1 for code in codes)
 
 
 def test_a_new_worker_has_time_for_its_first_heartbeat(tmp_path: Path) -> None:

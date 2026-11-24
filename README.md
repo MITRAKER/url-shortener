@@ -54,10 +54,10 @@ A redirect doesn't write to PostgreSQL: it appends the click to a Redis
 stream, and the click worker counts the clicks in batches, each click in the
 stream exactly once. Click counts can lag a moment behind; measured back to
 back, redirects went from 583 to 905 per second (16 clients, one popular
-link). Around the stream, a click can still be counted twice (when Nginx
-retries a redirect, or when the click reached Redis but the reply didn't),
-and a crash of the whole machine can lose up to about a second of clicks
-(LEARNING.md, lesson 5).
+link). Around the stream, a click can still be counted more than once: when
+Nginx retries a redirect (lesson 4 in LEARNING.md gives the bound), or twice
+when the click reached Redis but the reply didn't. And a crash of the whole
+machine can lose up to about a second of clicks (LEARNING.md, lesson 5).
 
 ## Run it
 
@@ -170,9 +170,9 @@ make help      # all commands
 
 Tests run on SQLite and an in-memory fake Redis by default. To use the real ones:
 `TEST_DATABASE_URL=postgresql+psycopg://app:app@localhost:5432/shortener_test TEST_REDIS_URL=redis://localhost:6379/15 pytest`.
-The tests empty that Redis database (number 15, not the app's 0) and drop and recreate
-the app's tables and its migration history in `TEST_DATABASE_URL`, so never point them at
-data you want to keep.
+The tests empty that Redis database (number 15, not the app's 0), and they drop every
+table in `TEST_DATABASE_URL`, not only the app's, before creating the app's again. Give
+them a database of their own, and never point them at data you want to keep.
 Some tests (instance number leases, the migration lock) need PostgreSQL and are
 skipped on SQLite.
 
