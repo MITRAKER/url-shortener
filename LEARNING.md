@@ -1840,7 +1840,7 @@ GET /abc1234 ─▶ Nginx ─▶ app ── XADD clicks:v1 * code abc1234 ──
 | `app/models.py`, migration `0003` | `click_checkpoints`: how far the worker got |
 | `docker-compose.yml` | The `worker` service; Redis keeps the stream on disk and never evicts it |
 | `scripts/check_clicks.py` | For CI: clicks wait while the worker is stopped, and survive a Redis restart |
-| `tests/test_clicks.py`, `tests/test_worker.py` | 43 tests: the redirect path, batching, every failure in between, two workers at once |
+| `tests/test_clicks.py`, `tests/test_worker.py` | 50 tests: the redirect path, batching, every failure in between, two workers at once |
 
 ### Part 1: Why take work off the request path?
 
@@ -2016,9 +2016,11 @@ turns, but the habit costs nothing.)
 
 A batch of 1000 clicks on one viral link becomes **one** `UPDATE ... + 1000`
 and **one** commit, instead of 1000 of each. That's **write coalescing**:
-batching turns a thousand row locks and WAL flushes into one. All the
-`UPDATE`s of a batch go to PostgreSQL in one go (an *executemany*, which
-psycopg 3 sends as a pipeline, without waiting for each answer).
+batching turns a thousand row locks and WAL flushes into one. A batch with
+many links still runs one `UPDATE` per link. They go to PostgreSQL in chunks
+of 3, all in the batch's one transaction: each chunk is an *executemany*,
+which psycopg 3 sends as a pipeline, without waiting for each answer. (Why
+chunks, and not all of them in one go: Part 4, on the worker's heartbeat.)
 
 #### Junk in the stream: poison messages
 

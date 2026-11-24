@@ -269,22 +269,34 @@ def test_a_batch_read_again_skips_its_junk_only_once(
     assert caplog.text.count("not clicks on a valid code") == 1
 
 
+# The steps of a batch of three links, with a chunk per link: the checkpoint
+# read, the stream read, the checkpoint moved, then the three chunks.
+@pytest.mark.parametrize(
+    "last_step",
+    [3, 4, 5, 6],
+    ids=["checkpoint moved", "first chunk", "second chunk", "last chunk"],
+)
 def test_the_chunks_of_a_batch_are_one_transaction(
-    redis_client: redis.Redis, click_worker: ClickWorker, monkeypatch: pytest.MonkeyPatch
+    redis_client: redis.Redis,
+    click_worker: ClickWorker,
+    monkeypatch: pytest.MonkeyPatch,
+    last_step: int,
 ) -> None:
-    """A worker that dies between two chunks of UPDATEs has counted nothing:
-    the checkpoint and all the chunks are committed together, or not at all."""
+    """A worker that dies after any step of count() has counted nothing:
+    the checkpoint and all the chunks are committed together, or not at all.
+    (A commit slipped in just before a step fails the case that dies after
+    that step; one just after it fails the next case.)"""
     monkeypatch.setattr(worker_module, "CHUNK_SIZE", 1)  # a chunk per link
     click(redis_client, FIRST, SECOND, THIRD)
     steps: list[None] = []
 
-    def die_after_the_first_chunk() -> None:
+    def die_after_the_last_step() -> None:
         steps.append(None)
-        if len(steps) == 4:  # the checkpoint read, the stream read, it moved, a chunk
+        if len(steps) == last_step:
             raise RuntimeError("the worker died")
 
     with pytest.raises(RuntimeError, match="died"):
-        click_worker.process_batch(die_after_the_first_chunk)
+        click_worker.process_batch(die_after_the_last_step)
     assert checkpoint() == START
     assert clicks() == {FIRST: 0, SECOND: 0, THIRD: 0}
     assert click_worker.process_batch() == 3  # a new worker: the same clicks, once
