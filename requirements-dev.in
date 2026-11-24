@@ -10,10 +10,10 @@ pytest==9.2.0
 pytest-cov==7.1.0
 httpx2==2.16.2  # used by FastAPI's TestClient
 fakeredis[lua]==2.40.0  # in-memory Redis for tests, with Lua scripting
-types-PyYAML==6.0.12.20261030  # type hints for PyYAML (tests/test_monitoring.py)
+types-PyYAML==6.0.12.20261113  # type hints for PyYAML (tests/test_monitoring.py)
 
 # Code quality (same versions locally, in pre-commit and in CI)
-ruff==0.17.5
+ruff==0.17.6
 mypy==2.4.1
 pre-commit==4.7.0
 # The file hygiene hooks in .pre-commit-config.yaml (trailing whitespace,
